@@ -1,0 +1,40 @@
+total_iters: 3000
+print_interval: 10
+save_interval: 1000
+vis_interval: 1000
+
+min_azi: 0.39269908169872414
+max_azi: 1.1780972450961724
+ 
+ransac_iteration: 1000
+ransac_threshold: 0.1
+ransac_sample: 3
+
+noise_start: 0.5
+noise_end: 0.8
+refine_noise: 0.5
+expand_iteration: 100
+expand_threshold_base: 0.5
+expand_threshold_prismatic: 0.45
+expand_threshold_revolute: 0.45
+large_iteration_base: 50
+large_iteration_prismatic: 30
+large_iteration_revolute: 30
+
+batch_size: 1
+base_lr: 0.01
+art_lr: 0.01
+pivot_lr: 0.1
+scale_lr_prismatic: 0.005
+scale_lr_revolute: 0.01
+qpos_lr: 0.01
+
+sds_weight: 0.1
+voxel_weight: 1
+intersect_weight: 1e-7
+cfg_strength: 3
+sample_interval: 0.5
+sample_coeff: 2.0
+
+train_num_state: 6
+inference_num_state: 6

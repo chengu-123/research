@@ -1,0 +1,74 @@
+{   
+    "Box": {
+        "joint_tags": ["rotation_lid"],
+        "joint_type": "revolute"
+    },
+    "Dishwasher": {
+        "joint_tags": ["door"],
+        "joint_type": "revolute"
+    },
+    "Display": {
+        "joint_tags": ["display_screen"],
+        "joint_type": "revolute"
+    },
+    "Eyeglasses": {
+        "joint_tags": ["leg"],
+        "joint_type": "revolute"
+    },
+    "FoldingChair": {
+        "joint_tags": ["seat"],
+        "joint_type": "revolute"
+    },
+    "Kettle": {
+        "joint_tags": ["handle", "body_handle"],
+        "joint_type": "revolute"
+    },
+    "Laptop": {
+        "joint_tags": ["screen_side", "screen"],
+        "joint_type": "revolute"
+    },
+    "Lighter": {
+        "joint_tags": ["lid"],
+        "joint_type": "revolute"
+    },
+    "Microwave": {
+        "joint_tags": ["door"],
+        "joint_type": "revolute"
+    },
+    "Oven": {
+        "joint_tags": ["door"],
+        "joint_type": "revolute"
+    },
+    "Phone": {
+        "joint_tags": ["flipping_lid"],
+        "joint_type": "revolute"
+    },
+    "Safe": {
+        "joint_tags": ["door"],
+        "joint_type": "revolute"
+    },
+    "StorageFurniture": {
+        "joint_tags": ["drawer"],
+        "joint_type": "prismatic"
+    },
+    "Stapler": {
+        "joint_tags": ["lid"],
+        "joint_type": "revolute"
+    },
+    "Table": {
+        "joint_tags": ["handle", "drawer"],
+        "joint_type": "prismatic"
+    },
+    "TrashCan": {
+        "joint_tags": ["cover", "cover_lid"],
+        "joint_type": "revolute"
+    },
+    "Refrigerator": {
+        "joint_tags": ["door", "door_frame"],
+        "joint_type": "revolute"
+    },
+    "WashingMachine": {
+        "joint_tags": ["door"],
+        "joint_type": "revolute"
+    }
+}

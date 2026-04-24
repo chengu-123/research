@@ -1,0 +1,230 @@
+# v1 config: VGCF + SAJO + URDF placeholder pipeline
+# Stages implemented: B (VGCF) + C (SAJO) + F (URDF assembly)
+# Stages deferred: A (Wan2.2 video), D (dual Stage-2), E (ACTF fusion)
+#
+# Stage D is replaced by a single standard TRELLIS Stage-2 call on O_0.
+# Stage E is replaced by a vertex-level split using SAJO masks.
+
+io:
+  K: 6                              # number of articulation states
+  seed: 0
+  image_pattern: "rendering_joint_00_state_{i:02d}.png"  # resolved against --input_dir
+
+stage_b:
+  remove_disk: true                 # strip grounding disk/carpet from the post-VGCF occupancy
+                                    # (FreeArt3D convention; cheap no-op if inputs have no disk)
+  sampler: scar                     # "scar" (recommended), "bcac", or "vgcf" (legacy)
+
+bcac:
+  # Block selection (of 12 total in TRELLIS Stage-1 DiT)
+  block_start: 4                    # first block to patch (inclusive)
+  block_end: 9                      # last block to patch (exclusive) → blocks 4,5,6,7,8
+  # Three-phase time schedule
+  t_full: 0.7                       # above this t: α=1, M=1 (full consensus, safe for move)
+  t_release: 0.3                    # below this t: α=0 (free evolution for move differentiation)
+  alpha_max: 1.0                    # peak blending strength
+  # Mask (reuses P0's log-space percentile approach)
+  tau_percentile: 0.65
+  active_fraction: 0.8
+  eps_log: 1.0e-6
+  eta: 0.5                          # sigmoid temperature in log-sigma2 space
+
+scar:
+  # Stage B v3 (2026-04-18): symmetric mix only, push disabled.
+  # Pass 1 (this SCAR sampler): symmetric mix for K=6 rough alignment.
+  # Pass 2 (SDEdit block below): augmented-intersection guide + state 0 refinement.
+  # See record/2026-04-18-stageb-v3-sdedit-design.md for the full design.
+  #
+  # Mix (latent blending): active in steps 0..mix_steps-1.
+  # Push DISABLED (alpha_peak=0); historic push branches are inert.
+  #
+  # steps: not set here -> inherits TRELLIS-image-large default of 25
+  # (matches FreeArt3D baseline).
+  mix_steps: 8                            # number of early steps to mix x_t (0 disables)
+  mix_weights: [0.3, 0.4, 0.3]            # (w_first, w_self, w_last)
+  extreme_mix_mode: symmetric             # "symmetric" (per-state formula: mixed^k =
+                                          # 0.3*s0 + 0.4*s_k + 0.3*s5, each state keeps
+                                          # 0.4 of itself, anchored 0.3 to s0 and 0.3 to
+                                          # s_{K-1}). Returning to symmetric because v3's
+                                          # Pass 2 SDEdit handles state 0 refinement;
+                                          # Pass 1 only needs rough K-parallel alignment.
+                                          # "mean_of_middles" kept for legacy ablation.
+  # Push schedule is generated as alpha(s) = alpha_peak * f(s/(total_steps-1)),
+  # with f defined by alpha_decay. If alpha_schedule is also set (list of
+  # numbers), it overrides alpha_peak + alpha_decay.
+  alpha_peak: 0.0                         # PUSH DISABLED in v3 (set to 0.0). Historic
+                                          # 0.5 kept as comment for reference. Any value
+                                          # > 0 re-enables the legacy Tweedie push.
+  alpha_decay: quadratic                  # linear | quadratic | cosine
+                                          # NOTE (2026-04-18): push now uses α·t (σ_t normalized)
+                                          # instead of α/t. Effective push shapes:
+                                          #   linear   : α·t = peak·(1-s/(N-1))       → linear decay
+                                          #   quadratic: α·t = peak·(1-s/(N-1))^3     → cubic decay
+                                          #   cosine   : α·t smooth tapers at both ends
+  w_floor: 0.2                            # soft-mask floor: at move voxels (M=0) the push
+                                          # is still applied at w_floor^2 = 4% strength
+                                          # instead of 0. Rescues base-interior-noise and
+                                          # state-0 drift voxels that the hard mask wrongly
+                                          # classifies as move. Contamination on true-move
+                                          # voxels is bounded by w_floor^2 * alpha.
+  active_fraction: 0.1                    # keep top-10% latent voxels by energy as "object"
+                                          # (16^3 = 4096 voxels, typical object occupies
+                                          # 5-15% of latent volume). Old 0.8 was wrong --
+                                          # it kept mostly air voxels and drowned the
+                                          # base/move variance signal.
+  tau_percentile: 0.65                    # log-variance percentile threshold
+  eps_log: 1.0e-6                         # numerical stability in log
+  eta: 0.5                                # sigmoid sharpness in log-variance
+  # Post-hoc ICP is DISABLED (removed from Stage B main path).
+  # Rationale:
+  #   (1) Rigid translation on binary 64^3 voxel grid via trilinear resample
+  #       introduces artifacts that can be worse than the sub-voxel drift
+  #       it tries to correct.
+  #   (2) ICP target (state 0) may itself be the outlier (weaker image
+  #       constraint in closed state) -- aligning 1..K-1 to state 0 pulls
+  #       them toward the outlier.
+  #   (3) With `mean_of_middles` mix wiping out latent-init bias, residual
+  #       rigid drift after SCAR should already be minimal; if any remains,
+  #       Stage C's canonical aggregation handles it in the EM.
+  icp_enabled: false
+  icp_max_translation: 1.5                # kept for legacy ablation (icp_enabled=true)
+  icp_vote_threshold: 0.83                # kept for legacy ablation
+  remove_disk: true
+
+  # v8 (2026-04-24): capture SS-DiT 1024-dim hidden states at mid-late blocks ×
+  # mid-flow timestep for downstream Stage C articulated-part discrimination.
+  # Saved as ``dit_hidden.pt`` = {"hidden_states": {idx: Tensor(K, L=4096, C=1024)},
+  # "meta": {...}} in fp16. Disabled by default to preserve legacy run shape;
+  # set to true when preparing data for Stage C v8+ experiments.
+  capture_dit_hidden: true
+  dit_hook_blocks: [14, 16, 18]           # DIFT-analogous semantic mid-late blocks
+  dit_hook_t_star: 0.3                    # flow-time sweet spot (0=clean, 1=noise)
+
+stage_b_sdedit:
+  # Pass 2 refinement. Activates after Pass 1 (the `scar` block above) completes.
+  # Two modes:
+  #   - bmcsa (v4, default, 2026-04-18): Pass 2 is K=6 SDEdit from per-state guide
+  #     + BMCSA (Base-Masked Cross-State Attention) inside DiT at every self-attn
+  #     layer. All K states are refined and replaced. See spec v4.
+  #   - v3 (legacy): Pass 2 is K=6 SDEdit without BMCSA; only states in
+  #     refine_states are replaced (middles kept from Pass 1). Kept as ablation.
+  enabled: true                           # false -> Pass 2 skipped, Stage B = Pass 1 only
+  mode: bmcsa                             # bmcsa | v3
+
+  # ---- SDEdit starting point (both modes) ----
+  t_star: 0.5                             # noise level at Pass 2 start;
+                                          # x_{t*} = (1-t*)*z_guide + sigma_{t*}*eps_shared
+  guide_mode: augmented_intersection      # "augmented_intersection" or "pure_intersection"
+
+  # ---- BMCSA (v4 only; ignored when mode=v3) ----
+  pass2_steps: 12                         # fixed Euler step count for Pass 2;
+                                          # independent of t_star. v3 uses
+                                          # ceil(total_steps * t_star) instead.
+  tau_M: 0.05                             # sigmoid sharpness for M_base(P_base_shared)
+  token_resolution: 16                    # DiT token res/axis. TRELLIS-image-large has
+                                          # resolution=16, patch_size=1, so tokens = 16^3
+                                          # = 4096. Must match flow_model.resolution /
+                                          # flow_model.patch_size. Pool kernel = 64 / this.
+  exclude_state_0: false                  # v4.1 canonical: P_base_shared = mean over ALL K states
+                                          # (incl. state 0). At K=6, state 0's closed-state shrink
+                                          # bias is diluted to 1/6 of the mean, which keeps cabinet
+                                          # outer-shell voxels above the 0.5 threshold. Set true to
+                                          # revert to mean over s1-5 only (ablation).
+  bmcsa_blocks: all                       # "all" or list of block indices (e.g. [4,5,6,7,8]);
+                                          # which DiT self-attn layers get BMCSA
+  bmcsa_strength: 1.0                     # effective M_blend = clamp(strength*M_base, 0, 1)
+
+  # ---- v4.2 Plan 3: attention-driven M_attn (optional) ----
+  # When enabled, BMCSA blend uses M_effective = M_base × M_attn (element-wise).
+  # M_attn is built from cross-state cosine similarity of z_final's per-token
+  # features: high similarity → cabinet-like → M_attn high; low similarity →
+  # move-like → M_attn low. Rejects "drawer trajectory middle" voxels that
+  # have high geometric consensus but divergent semantic features.
+  attn_m_enabled: true                    # false: legacy v4.1 (M_base only). true: v4.2/v4.3.
+  # v4.3 (2026-04-18): where to apply the M_attn semantic filter:
+  #   "guide" (default) : upsample M_attn to 64^3 via trilinear interp, filter
+  #                       P_base_shared_64 BEFORE guide construction. Single
+  #                       source of truth; fixes "guide over-large base"
+  #                       problem observed on sample 26525 (Problem 13 in
+  #                       record/stageb_detail.md).
+  #   "bmcsa"           : legacy v4.2 behaviour: M_attn applied at BMCSA blend
+  #                       time only (M_effective = M_base × M_attn inside each
+  #                       DiT self-attn layer). Leaves guide unfiltered; known
+  #                       to collapse under long-drawer prismatic joints.
+  #   "both"            : apply at BOTH guide and BMCSA (defensive; usually
+  #                       equivalent to "guide" since M_attn is idempotent).
+  attn_m_apply_at: guide
+  # Synthetic-test sweep (separation Δ=shell-drawer):
+  #   thresh=0.5, tau=0.10 → Δ=0.24  (too loose, drawer M_attn=0.75)
+  #   thresh=0.7, tau=0.05 → Δ=0.86  (recommended default)
+  #   thresh=0.8, tau=0.05 → Δ=0.96  (aggressive; may filter too much)
+  # Real DiT feature distribution may differ; tune on real data.
+  attn_m_threshold: 0.7                   # sigmoid center for agreement → M_attn
+  attn_m_tau: 0.05                        # sigmoid sharpness; smaller = sharper transition
+
+  # ---- v3 legacy (ignored when mode=bmcsa) ----
+  # Which states v3 replaces with Pass 2 output (middles kept from Pass 1).
+  # Negative indices are normalised (-1 -> K-1). bmcsa mode always replaces all K.
+  refine_states: [0]
+  guide_eta: 1.0e-4                       # logit clip for pre-encode binarise (legacy)
+
+vgcf:
+  enabled: true                     # set false to get plain TRELLIS Stage-1 behavior
+  steps: 12                         # Stage-1 Euler integration steps
+  cfg_strength: 7.5                 # classifier-free guidance weight
+  cfg_interval: [0.0, 1.0]          # apply CFG across the full trajectory
+  rescale_t: 1.0                    # flow schedule rescale (TRELLIS default)
+  lambda_max: 1.0                   # max consensus-guidance strength
+  t_stop: 0.2                       # below this t, guidance is disabled (noise -> data direction)
+  eta: 0.5                          # sigmoid temperature in log-sigma2 space (P0 fix)
+  seed: 0                           # shared-noise seed for cross-state coupling
+
+  # --- P0 mask-quality fixes (diagnostic upgrade) ---
+  # Raw sigma2 is 5+ orders of magnitude long-tail; median threshold +
+  # fixed 1e-8 active filter leaves M_mean ~= 0.4 which is too low for
+  # doors/cabinets. The three knobs below should lift M_mean to ~0.65.
+  active_fraction: 0.8              # keep top fraction of voxels by ||x0_bar||^2 energy
+  tau_percentile: 0.65              # 65th percentile of log-sigma2 as base threshold
+  eps_log: 1.0e-6                   # log(sigma2 + eps_log) numerical stability
+  lambda_schedule: warmup           # "warmup" (sin-peaked at middle) or "cosine" (legacy)
+
+sajo:
+  split:                            # joint-free soft base/move split (C1)
+    sigma_b: 0.25
+    sigma_m: 0.15
+    tau_b: 0.05
+    tau_m: 0.05
+  anchors:                          # 26-connectivity contact anchor extraction (C2)
+    min_component_size: 8
+    max_components: 2
+    binarize_threshold: 0.5
+  em:                               # EM optimization (C4)
+    n_outer: 20
+    n_inner: 10
+    lr_S: 1.0e-2
+    lr_phi: 5.0e-3
+    alpha: 0.1                      # anchor-term weight
+    beta: 1.0e-4                    # prior (Tikhonov) weight on phi_k
+    eta_r: 0.05                     # sigmoid temperature for M_move E-step
+    tol: 1.0e-4                     # relative convergence on L_reg
+    active_voxel_thresh: 0.1        # threshold for "active move voxel" count
+  bic:                              # dual-model BIC selection (C5)
+    k_rev: 4                        # revolute constant complexity (+ K added in code)
+    k_pris: 2                       # prismatic constant complexity (+ K added in code)
+    min_N: 50                       # if N < min_N, suppress confidence reporting
+
+stage_d:
+  use_vgcf_O_0: true                # if false, re-run Stage-1 without VGCF for the Stage-2 input
+  simplify: 0.95
+  texture_size: 1024
+  baking_mode: fast
+
+pybullet:
+  n_samples: 20
+  epsilon: 1.0e-3                   # penetration depth tolerance (meters in URDF scale)
+
+trellis:
+  stage2_sampler_params:            # reused for the placeholder single Stage-2 call
+    steps: 25
+    cfg_strength: 10
+    cfg_interval: [0.5, 1.0]
