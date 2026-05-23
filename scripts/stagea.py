@@ -9,7 +9,7 @@ Wan2.2-I2V-A14B once (single fixed seed), runs the background-static
 optical-flow sanity check, and writes the Stage A artifact bundle:
 
     <output_dir>/
-        input_s_0_with_carpet.png         resized input fed to Wan
+        00_pure.png         resized input fed to Wan
         wan_video_target.mp4              the generated 16 fps video
         wan_video_grid.png                all 21 frames as a labelled grid
         keyframes_6.png                   states [0,4,8,12,16,20] for Stage B

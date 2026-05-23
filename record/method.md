@@ -53,7 +53,7 @@
 ### 1.1 任务定义
 
 **输入**：
-- `s_0_with_carpet` (RGB 闭合状态图, **已含 FreeArt3D grounding disk**) — 用户在输入端合成 carpet，pipeline 不再 add
+- `00_seg` (RGB 闭合状态图, **已含 FreeArt3D grounding disk**) — 用户在输入端合成 carpet，pipeline 不再 add
 - `prompt` (自然语言铰接描述)
 
 **输出**：`base.glb` (carpet 剔除), `move.glb`, `joint.json`, `atlas.png`, `supervision_provenance.json` (v3.3 改名), `object.urdf`

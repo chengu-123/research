@@ -180,61 +180,120 @@ class ModulatedTransformerCrossBlock(nn.Module):
         h = self.norm1(x)
         h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
 
-        # --- BMCSA self-attention branch ---
+        # --- BMCSA self-attention branch (v3.3.2 multi-gate) ---
+        # v3.3.2 redesign: the BMCSA gate M_eff is composed of multiple
+        # disentangled signals, not a single unified mask. The dynamic-M
+        # signal is an *attenuator* (only reduces sharing), never a sole
+        # classifier of base vs move:
+        #
+        #   M_eff = M_base_geom * M_attn * (1 - M_motion_corridor) * M_dynamic
+        #
+        # Where each gate has an independent role:
+        #   M_base_geom       : Pass-1 K-mean occupancy decoded -> geometric
+        #                       prior. The proven v4.3 signal.
+        #   M_attn            : cross-state agreement on the 8-channel SS
+        #                       latent z_final. Semantic agreement.
+        #   M_motion_corridor : footprint * (1 - shared). Swept volume of
+        #                       the moving part. (1 - M_motion) gates OUT
+        #                       voxels in the move trajectory.
+        #   M_dynamic         : optional step-adaptive attenuator. Computed
+        #                       from prev_x_0_pred (8-channel SS latent,
+        #                       NOT 1024-channel hidden). v3.3 used hidden
+        #                       cosine which saturated to ~1; v3.3.2 uses
+        #                       the same 8-channel representation that the
+        #                       static M_attn proved usable.
+        #
+        # Each gate is optional. Missing gates default to 1 (no contribution)
+        # so the framework gracefully degrades.
         bmcsa_flag = bool(kwargs.get("bmcsa_flag", False))
         bmcsa_blocks = kwargs.get("bmcsa_blocks", None)
         bmcsa_active = bmcsa_flag and (bmcsa_blocks is None or (block_idx is not None and block_idx in bmcsa_blocks))
         if bmcsa_active and h.shape[0] > 1:
             y_self = self.self_attn(h)
             y_shared = self.self_attn(h, share_kv_across_batch=True)
+            K_b, L_b, D_b = h.shape
+            device_M = h.device
+            dtype_M = y_self.dtype
 
+            # ---- Gate 1: M_base_geom (static, Pass-1 P_base derived) ----
+            M_base_geom = kwargs.get("M_base", None)
+
+            # ---- Gate 2: M_attn (static, semantic agreement on z_final) ----
+            M_attn_t = kwargs.get("M_attn", None)
+
+            # ---- Gate 3: NOT motion corridor (static, swept volume) ----
+            M_motion = kwargs.get("M_motion_corridor", None)
+
+            # ---- Gate 4: M_dynamic (optional attenuator) ----
+            # Computed only when prev_x_0_pred (8-channel) is provided.
+            M_dyn = None
             M_mode = str(kwargs.get("M_compute_mode", "static")).lower()
-
-            if M_mode == "static":
-                if "M_base" not in kwargs:
-                    raise KeyError("BMCSA static mode requires kwargs['M_base'] (1, L, 1)")
-                M = kwargs["M_base"].to(y_self.dtype)
-            elif M_mode == "dynamic":
-                # Compute M per block from CURRENT modulated hidden h.
-                # h: (K, L, D). Pairwise cross-state cosine per token.
-                # Defaults from method.md section 5.2 (tau_M=0.7, kappa_M=0.05).
-                K_b, L_b, D_b = h.shape
+            prev_x0 = kwargs.get("prev_x_0_pred", None)
+            if M_mode == "dynamic" and prev_x0 is not None:
+                # prev_x0: (K, C, D, H, W) where C=8 for TRELLIS SS latent.
+                # Token order matches DiT patchify (row-major over D,H,W).
+                K_x, C_x, D_x, H_x, W_x = prev_x0.shape
+                if K_x != K_b:
+                    raise ValueError(
+                        f"prev_x_0_pred K={K_x} mismatches hidden batch K={K_b}"
+                    )
+                # Reshape to (K, L, C) per-token view
+                x_tok = prev_x0.view(K_x, C_x, -1).permute(0, 2, 1).to(torch.float32)  # (K, L, C)
+                x_norm = torch.nn.functional.normalize(x_tok, dim=-1, eps=1e-6)        # (K, L, C)
+                pairwise = torch.einsum("klc,jlc->kjl", x_norm, x_norm)                # (K, K, L)
+                eye_K = torch.eye(K_x, device=device_M, dtype=torch.bool)
+                pairwise = pairwise.masked_fill(eye_K.unsqueeze(-1), 0.0)
+                if K_x > 1:
+                    agree = pairwise.sum(dim=(0, 1)) / (K_x * (K_x - 1))               # (L_x,)
+                else:
+                    agree = pairwise.sum(dim=(0, 1))
                 tau_M = float(kwargs.get("tau_M_dynamic", 0.7))
                 kappa_M = float(kwargs.get("kappa_M_dynamic", 0.05))
-
-                # L2-normalize over channel; fp32 cosine for numerical stability.
-                h_fp32 = h.to(torch.float32)
-                h_normed = h_fp32 / (h_fp32.norm(dim=-1, keepdim=True) + 1e-6)
-                # Pairwise: (K, K, L)
-                pairwise = torch.einsum("kld,jld->kjl", h_normed, h_normed)
-                eye_K = torch.eye(K_b, device=h.device, dtype=torch.bool)
-                pairwise = pairwise.masked_fill(eye_K.unsqueeze(-1), 0.0)
-                # Off-diagonal mean per token (denominator K*(K-1) since diagonal zeroed)
-                if K_b > 1:
-                    agree = pairwise.sum(dim=(0, 1)) / (K_b * (K_b - 1))    # (L,)
-                else:
-                    agree = pairwise.sum(dim=(0, 1))                        # (L,) zeros
-
-                M_dyn = torch.sigmoid((agree - tau_M) / max(kappa_M, 1e-8))  # (L,)
-                M = M_dyn.view(1, -1, 1).to(y_self.dtype)
-
-                # Optional logging hook for downstream viz / debug.
-                dyn_M_log = kwargs.get("dynamic_M_log", None)
-                if dyn_M_log is not None and block_idx is not None:
-                    # Store fp16 CPU copy per block (overwrites previous step's
-                    # entry, which is the convention: caller resets the dict
-                    # before each sample_once call if per-step history is wanted).
-                    dyn_M_log[int(block_idx)] = M_dyn.detach().to(torch.float16).cpu()
+                M_dyn_flat = torch.sigmoid((agree - tau_M) / max(kappa_M, 1e-8))       # (L_x,)
+                # L_x = D_x*H_x*W_x (token resolution of x_0); L_b = hidden tokens.
+                # In TRELLIS-image-large both are 16^3 = 4096, so L_x == L_b.
+                if M_dyn_flat.numel() != L_b:
+                    raise ValueError(
+                        f"prev_x_0_pred token count {M_dyn_flat.numel()} mismatches "
+                        f"hidden token count {L_b}; ensure x_0 resolution matches DiT"
+                    )
+                M_dyn = M_dyn_flat.view(1, -1, 1).to(dtype_M)
+            elif M_mode == "dynamic" and prev_x0 is None:
+                # Dynamic mode requested but no prev_x_0_pred provided
+                # (e.g. first step). Attenuator defaults to 1 -> no effect.
+                M_dyn = None
+            elif M_mode == "static":
+                M_dyn = None    # static: no dynamic attenuator
             else:
                 raise ValueError(
                     f"BMCSA M_compute_mode must be 'static' or 'dynamic'; got {M_mode!r}"
                 )
 
-            # Optional semantic gate (v4.2: M_effective = M_geom * M_attn).
-            M_attn_arg = kwargs.get("M_attn", None)
-            if M_attn_arg is not None:
-                M_attn_t = M_attn_arg.to(y_self.dtype)
-                M = M * M_attn_t
+            # ---- Compose M_eff = product of available gates ----
+            M = torch.ones(1, L_b, 1, device=device_M, dtype=dtype_M)
+            gate_contributions = {}
+            if M_base_geom is not None:
+                m_geom = M_base_geom.to(device=device_M, dtype=dtype_M)
+                M = M * m_geom
+                gate_contributions["M_base_geom"] = m_geom
+            if M_attn_t is not None:
+                m_attn = M_attn_t.to(device=device_M, dtype=dtype_M)
+                M = M * m_attn
+                gate_contributions["M_attn"] = m_attn
+            if M_motion is not None:
+                m_not_motion = (1.0 - M_motion.to(device=device_M, dtype=dtype_M)).clamp(0.0, 1.0)
+                M = M * m_not_motion
+                gate_contributions["M_not_motion"] = m_not_motion
+            if M_dyn is not None:
+                M = M * M_dyn
+                gate_contributions["M_dynamic"] = M_dyn
+
+            # ---- Optional logging of per-block M_eff for viz ----
+            dyn_M_log = kwargs.get("dynamic_M_log", None)
+            if dyn_M_log is not None and block_idx is not None:
+                # Store fp16 CPU copy of FINAL M_eff per block (overwrites
+                # previous step's entry within the same step's sub-pass).
+                dyn_M_log[int(block_idx)] = M.squeeze().detach().to(torch.float16).cpu()
 
             strength = float(kwargs.get("bmcsa_strength", 1.0))
             eff_M = torch.clamp(strength * M, 0.0, 1.0)

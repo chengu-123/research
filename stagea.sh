@@ -42,7 +42,7 @@ fi
 # -------------------------- paths (env-overridable) -------------------------
 WAN_CKPT="${WAN_CKPT:-${HOME}/hf_models/Wan2.2-I2V-A14B}"
 INPUT_DIR="${INPUT_DIR:-${HOME}/hf_models/PartNet/${OBJECT_ID}}"
-IMAGE_BASENAME="${IMAGE_BASENAME:-s_0_with_carpet.png}"
+IMAGE_BASENAME="${IMAGE_BASENAME:-00_seg.png}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs}"
 
 # -------------------------- pipeline v3.3.1 fixed defaults ------------------

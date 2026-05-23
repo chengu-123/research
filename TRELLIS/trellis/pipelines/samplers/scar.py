@@ -388,37 +388,90 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
             mixed = w_first * sample[0:1] + w_self * sample + w_last * sample[-1:]
         return mixed, True
 
-    def _mix_x_0(
-        self, pred_x_0: torch.Tensor, step_idx: int,
-    ) -> Tuple[torch.Tensor, bool]:
-        """v3.3 mix: blend the model's CLEAN-SIGNAL estimate x_0_pred across K
-        states. Same per-state symmetric formula as ``_mix_x_t`` but applied
-        to ``pred_x_0`` after the model forward, not to ``z_t`` before it.
+    def _compute_base_mask_from_x_0(
+        self,
+        pred_x_0: torch.Tensor,
+        base_quantile: float = 0.5,
+    ) -> torch.Tensor:
+        """Per-step in-flight base mask from the K-state agreement of
+        ``pred_x_0`` (8-channel SS latent).
 
-        After this call, the caller is expected to reconstruct ``z_{t_next}``
-        from ``x_0_mixed`` and the ORIGINAL per-state ``eps_pred`` so that
-        per-sample noise variance is preserved (ODE consistency).
+        For each spatial voxel v, compute the cross-state residual energy:
+            div(v) = mean_k ||x_0^(k)(v) - mean_k x_0^(k)(v)||^2 / C
+        Voxels with low cross-state divergence (K-state in latent agreement)
+        are candidate **base voxels**; high divergence are candidate **move**
+        voxels. The cut-off is a per-step quantile of ``div(v)`` over all
+        voxels in the 16^3 latent (default ``base_quantile=0.5`` -> median).
+
+        Note this uses the 8-channel SS latent (not the 1024-channel DiT
+        hidden state). 8-channel cosine / variance is NOT subject to the
+        hypersphere saturation that plagues 1024-channel hidden cosine, and
+        is the same representation v4.3 M_attn proved usable.
 
         Parameters
         ----------
         pred_x_0 : torch.Tensor
-            Shape ``(K, C, D, H, W)``, Tweedie clean estimate at the current step.
-        step_idx : int
-            Current Euler step index. Mix is active only when ``step_idx <
-            self.mix_steps`` and ``scar_enabled`` and ``K >= 2``.
+            Shape ``(K, C, D, H, W)`` Tweedie clean estimate at current step.
+        base_quantile : float, default 0.5
+            Voxels with divergence below this quantile are base.
+
+        Returns
+        -------
+        base_mask : torch.Tensor
+            Shape ``(D, H, W)`` float in {0, 1}. 1 = base voxel.
+        """
+        if pred_x_0.shape[0] < 2:
+            return torch.ones(
+                pred_x_0.shape[2:], device=pred_x_0.device, dtype=pred_x_0.dtype,
+            )
+        x_0_mean = pred_x_0.mean(dim=0, keepdim=True)                       # (1, C, D, H, W)
+        diff = pred_x_0 - x_0_mean
+        # mean over K and channel -> per-voxel divergence (D, H, W)
+        div = diff.pow(2).mean(dim=(0, 1))                                  # (D, H, W)
+        threshold = torch.quantile(div.flatten(), float(base_quantile))
+        base_mask = (div <= threshold).to(pred_x_0.dtype)                    # (D, H, W)
+        return base_mask
+
+    def _mix_x_0(
+        self,
+        pred_x_0: torch.Tensor,
+        step_idx: int,
+        base_quantile: float = 0.5,
+    ) -> Tuple[torch.Tensor, bool, float, Optional[torch.Tensor]]:
+        """v3.3.2 **base-masked** mix on x_0_pred. Solves the s0/s5 "two-drawer"
+        mode-duplication problem of v3.3 by mixing ONLY in K-state-consensus
+        (candidate base) voxels.
+
+        Mechanism:
+          1. Compute per-step base mask from K-state divergence of pred_x_0
+             (see :meth:`_compute_base_mask_from_x_0`).
+          2. For BASE voxels: apply symmetric mix
+                 mixed^(k) = w_first*x_0^(0) + w_self*x_0^(k) + w_last*x_0^(K-1)
+             (anchors s0/sK-1 share their geometry agreement with all K).
+          3. For MOVE voxels: KEEP self (no mix, no mode duplication).
+
+        Why this matters: at extreme states k=0 and k=K-1, naive symmetric mix
+        becomes ``0.7*self + 0.3*other_endpoint``. Latent-space midpoints
+        decode to "two modes simultaneously" when s0 and s_{K-1} encode
+        physically distinct drawer positions — exactly the "s0 双桌" failure
+        observed in the v3.3 first run. Restricting the mix to base voxels
+        eliminates this while keeping the middle-state edge-sharpening benefit.
 
         Returns
         -------
         mixed : torch.Tensor
-            Same shape as ``pred_x_0``. Identity when mix is inactive.
+            Same shape as pred_x_0.
         was_mixed : bool
-            Whether the mix was applied.
+            True if mix was applied (step_idx < mix_steps).
+        base_frac : float
+            Fraction of voxels classified as base this step (diagnostic).
         """
         if not self.scar_enabled or step_idx >= self.mix_steps or pred_x_0.shape[0] < 2:
-            return pred_x_0, False
+            return pred_x_0, False, 0.0, None
         K = pred_x_0.shape[0]
         w_first, w_self, w_last = self.mix_weights
 
+        # ---- Full symmetric mix (will be applied only to base voxels) ----
         if self.extreme_mix_mode == "mean_of_middles" and K >= 4:
             middle_mean = pred_x_0[1:K - 1].mean(dim=0, keepdim=True)
             mixed_single = (
@@ -426,14 +479,26 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
                 + w_self * middle_mean
                 + w_last * pred_x_0[-1:]
             )
-            mixed = mixed_single.expand(K, -1, -1, -1, -1).contiguous()
+            full_mix = mixed_single.expand(K, -1, -1, -1, -1).contiguous()
         else:
-            mixed = (
+            full_mix = (
                 w_first * pred_x_0[0:1]
                 + w_self * pred_x_0
                 + w_last * pred_x_0[-1:]
             )
-        return mixed, True
+
+        # ---- Per-step base mask from x_0_pred K-state divergence ----
+        base_mask_3d = self._compute_base_mask_from_x_0(
+            pred_x_0, base_quantile=base_quantile,
+        )                                                                  # (D, H, W)
+        # Broadcast to (1, 1, D, H, W) for elementwise blend with (K, C, D, H, W)
+        base_mask = base_mask_3d.view(1, 1, *base_mask_3d.shape)            # (1, 1, D, H, W)
+
+        # ---- Blend: base voxel uses full_mix, move voxel keeps self ----
+        mixed = base_mask * full_mix + (1.0 - base_mask) * pred_x_0
+
+        base_frac = float(base_mask_3d.mean().item())
+        return mixed, True, base_frac, base_mask_3d
 
     @torch.no_grad()
     def sample(
@@ -462,6 +527,10 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
             "pred_x_t": [],
             "pred_x_0": [],
             "scar_diagnostics": [],
+            # v3.3.2: per-step base mask captured during mix_space='x_0' base-masked mix.
+            # Each entry is (D, H, W) bool tensor on CPU fp16. Empty list when
+            # mix_space='z_t' or mix not active.
+            "base_mask_per_step": [],
         })
 
         pbar = tqdm(
@@ -520,7 +589,9 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
 
             # ----- Mix in x_0 (v3.3 default) AFTER model forward -----
             if self.mix_space == "x_0":
-                x_0_mixed, x0_was_mixed = self._mix_x_0(pred_x_0, step_idx)
+                x_0_mixed, x0_was_mixed, base_frac, base_mask_3d = self._mix_x_0(
+                    pred_x_0, step_idx,
+                )
                 if x0_was_mixed:
                     # Reconstruct z_{t_next} from mixed x_0 and ORIGINAL per-state eps.
                     # Mean = mean of z_t-mix formulation (position alignment preserved).
@@ -533,6 +604,12 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
                     diag["mix_x0_l2_change"] = float(
                         (x_0_mixed - pred_x_0).norm().item()
                     )
+                    diag["base_frac"] = float(base_frac)        # ★ v3.3.2 diagnostic
+                    # Persist per-step base mask for viz / debug.
+                    if base_mask_3d is not None:
+                        ret.base_mask_per_step.append(
+                            base_mask_3d.detach().to(torch.float16).cpu()
+                        )
                 else:
                     # No mix this step: plain Euler step with (optional) augmented v.
                     pred_x_prev = sample - dt * v_aug

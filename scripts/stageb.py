@@ -33,13 +33,11 @@ Usage:
     python scripts/stageb.py \\
         --input      outputs/30857/stage_a/wan_video_target_3FHW_uint8.pt \\
         --output_dir outputs/30857/stage_b \\
-        --config     configs/v1.yaml
 
     # Or with 6 segmented images:
     python scripts/stageb.py \\
         --input      example/30857 \\
         --output_dir outputs/30857/stage_b \\
-        --config     configs/v1.yaml
 """
 
 from __future__ import annotations

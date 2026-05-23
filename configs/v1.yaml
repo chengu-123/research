@@ -155,28 +155,35 @@ stage_b_sdedit:
   #                       to collapse under long-drawer prismatic joints.
   #   "both"            : apply at BOTH guide and BMCSA (defensive; usually
   #                       equivalent to "guide" since M_attn is idempotent).
-  attn_m_apply_at: guide
+  # ★ v3.3.2: M_attn must apply at BOTH guide AND BMCSA blend.
+  # 'guide' alone (v3.3 default) filtered the Pass-2 starting point but
+  # did NOT prevent BMCSA from globally synchronizing K-state K/V on move
+  # voxels at inference time. With 'both', M_attn enters the BMCSA gate
+  # composition as an independent semantic gate.
+  attn_m_apply_at: both
   # Synthetic-test sweep (separation Δ=shell-drawer):
   #   thresh=0.5, tau=0.10 → Δ=0.24  (too loose, drawer M_attn=0.75)
   #   thresh=0.7, tau=0.05 → Δ=0.86  (recommended default)
   #   thresh=0.8, tau=0.05 → Δ=0.96  (aggressive; may filter too much)
-  # Real DiT feature distribution may differ; tune on real data.
   attn_m_threshold: 0.7                   # sigmoid center for agreement → M_attn
   attn_m_tau: 0.05                        # sigmoid sharpness; smaller = sharper transition
 
-  # ---- v3.3 BMCSA M-compute mode (method.md section 5.2) ----
-  # 'dynamic' (default): each DiT block computes its M from the CURRENT
-  #     modulated hidden h via pairwise cross-state cosine agreement
-  #     (per-token). Eliminates the "stale M_base" problem of static mode
-  #     where M_base computed from Pass-1 end becomes outdated as Pass-2
-  #     hidden states evolve under SDEdit denoising.
-  # 'static' (legacy v4.3): use a single M_base precomputed in 64^3 from
-  #     Pass-1 P_base_shared and pooled to token space. Same M reused at
-  #     every step and every block. Kept for ablation.
-  M_compute_mode: dynamic
-  tau_M_dynamic: 0.7                      # sigmoid center for cross-state cosine agreement
+  # ---- v3.3.2 Multi-gate BMCSA (method.md section 5.2 + GPT review) ----
+  # The BMCSA per-token gate M_eff is a PRODUCT of independent signals:
+  #   M_eff = M_base_geom        # static, Pass-1 P_base_shared (v4.3 proven)
+  #         * M_attn             # static, 8-channel z_final agreement (v4.3 proven)
+  #         * (1 - M_motion)     # static, swept-volume reversal (v3.3.2 NEW)
+  #         * M_dynamic          # optional step-adaptive attenuator
+  # Critical design: dynamic-M is an ATTENUATOR (can only reduce sharing,
+  # never single-handedly classify a voxel as base). Empirical v3.3 failure
+  # mode (M ≈ 1 saturated, move smeared by K-state averaging) is prevented
+  # by the multi-gate product: even if M_dynamic saturates, M_motion -> 0
+  # on move voxels and the product kills sharing there.
+  M_compute_mode: dynamic                 # 'dynamic' (default) | 'static' (ablation)
+  tau_M_dynamic: 0.7                      # sigmoid center for 8-channel x_0_pred cosine
   kappa_M_dynamic: 0.05                   # sigmoid sharpness
-  capture_dynamic_M: true                 # log per-step per-block M maps for diagnostics
+  capture_dynamic_M: true                 # log per-step per-block M_eff for diagnostics
+  use_motion_corridor: true               # ★ v3.3.2 Gate 3 (NEW)
 
   # ---- v3 legacy (ignored when mode=bmcsa) ----
   # Which states v3 replaces with Pass 2 output (middles kept from Pass 1).
