@@ -40,15 +40,17 @@ scar:
   #
   # steps: not set here -> inherits TRELLIS-image-large default of 25
   # (matches FreeArt3D baseline).
-  mix_steps: 8                            # number of early steps to mix x_t (0 disables)
+  mix_steps: 8                            # number of early steps to mix (0 disables)
   mix_weights: [0.3, 0.4, 0.3]            # (w_first, w_self, w_last)
   extreme_mix_mode: symmetric             # "symmetric" (per-state formula: mixed^k =
-                                          # 0.3*s0 + 0.4*s_k + 0.3*s5, each state keeps
-                                          # 0.4 of itself, anchored 0.3 to s0 and 0.3 to
-                                          # s_{K-1}). Returning to symmetric because v3's
-                                          # Pass 2 SDEdit handles state 0 refinement;
-                                          # Pass 1 only needs rough K-parallel alignment.
-                                          # "mean_of_middles" kept for legacy ablation.
+                                          # 0.3*s0 + 0.4*s_k + 0.3*s5) | "mean_of_middles"
+  # v3.3 (2026-05-23, method.md section 5.2): mix in clean-signal space.
+  # 'x_0' (default) mixes pred_x_0 after model forward, then rebuilds z_{t_next}
+  #     using ORIGINAL per-state pred_eps -> noise variance preserved (ODE
+  #     consistent), spatial position alignment retained.
+  # 'z_t' (legacy v4.3) mixes the noisy latent before model forward; kept for
+  #     ablation parity with the 4/4 sample-id experiments.
+  mix_space: x_0
   # Push schedule is generated as alpha(s) = alpha_peak * f(s/(total_steps-1)),
   # with f defined by alpha_decay. If alpha_schedule is also set (list of
   # numbers), it overrides alpha_peak + alpha_decay.
@@ -161,6 +163,20 @@ stage_b_sdedit:
   # Real DiT feature distribution may differ; tune on real data.
   attn_m_threshold: 0.7                   # sigmoid center for agreement → M_attn
   attn_m_tau: 0.05                        # sigmoid sharpness; smaller = sharper transition
+
+  # ---- v3.3 BMCSA M-compute mode (method.md section 5.2) ----
+  # 'dynamic' (default): each DiT block computes its M from the CURRENT
+  #     modulated hidden h via pairwise cross-state cosine agreement
+  #     (per-token). Eliminates the "stale M_base" problem of static mode
+  #     where M_base computed from Pass-1 end becomes outdated as Pass-2
+  #     hidden states evolve under SDEdit denoising.
+  # 'static' (legacy v4.3): use a single M_base precomputed in 64^3 from
+  #     Pass-1 P_base_shared and pooled to token space. Same M reused at
+  #     every step and every block. Kept for ablation.
+  M_compute_mode: dynamic
+  tau_M_dynamic: 0.7                      # sigmoid center for cross-state cosine agreement
+  kappa_M_dynamic: 0.05                   # sigmoid sharpness
+  capture_dynamic_M: true                 # log per-step per-block M maps for diagnostics
 
   # ---- v3 legacy (ignored when mode=bmcsa) ----
   # Which states v3 replaces with Pass 2 output (middles kept from Pass 1).

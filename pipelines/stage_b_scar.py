@@ -614,13 +614,17 @@ def _sdedit_refine_k6_bmcsa(
     rescale_t: float,
     cfg_strength: float,
     cfg_interval: tuple,
-    M_base: torch.Tensor,
+    M_base: Optional[torch.Tensor] = None,
     bmcsa_blocks: Optional[List[int]] = None,
     bmcsa_strength: float = 1.0,
     shared_noise: Optional[torch.Tensor] = None,
     M_attn: Optional[torch.Tensor] = None,
     verbose: bool = True,
     collect_per_step: bool = False,
+    M_compute_mode: str = "static",
+    tau_M_dynamic: float = 0.7,
+    kappa_M_dynamic: float = 0.05,
+    capture_dynamic_M: bool = False,
 ) -> Any:
     """Pass 2 SDEdit refinement with Base-Masked Cross-State Attention (BMCSA).
 
@@ -628,9 +632,21 @@ def _sdedit_refine_k6_bmcsa(
     call to ``sampler.sample_once``, which in turn passes them into
     ``model(x_t, t, cond, **kwargs)``. The edited DiT block
     (``ModulatedTransformerCrossBlock._forward``) consumes ``bmcsa_flag``,
-    ``bmcsa_blocks``, ``bmcsa_strength`` and ``M_base`` to blend a per-state
-    self-attention output with a cross-batch-mean K/V attention output at
-    each eligible self-attention layer.
+    ``bmcsa_blocks``, ``bmcsa_strength`` and the M-mask described below.
+
+    Two M-computation modes:
+
+    - ``M_compute_mode='static'`` (v4.3 legacy): pass in ``M_base`` of shape
+      ``(1, L, 1)`` precomputed from Pass-1 ``P_base_shared``. Same M used at
+      every Euler step and every block.
+
+    - ``M_compute_mode='dynamic'`` (v3.3 default): each block computes its
+      own M from the current modulated hidden state h via pairwise
+      cross-state cosine agreement (per-token). ``M_base`` is ignored. Uses
+      ``tau_M_dynamic`` and ``kappa_M_dynamic`` to control the sigmoid gate.
+
+    When ``capture_dynamic_M=True`` (dynamic mode only) the per-step
+    per-block M maps are returned in the result edict under ``dynamic_M``.
 
     Parameters
     ----------
@@ -641,31 +657,41 @@ def _sdedit_refine_k6_bmcsa(
         SDEdit noise level (0 < t_star < 1).
     pass2_steps : int
         Fixed Euler step count for Pass 2, independent of ``t_star``.
-        ``t_seq = np.linspace(t_star, 0, pass2_steps + 1)`` (after rescale_t
-        reshape).
-    M_base : torch.Tensor
-        Shape ``(1, L, 1)`` token-space base mask built by
-        :func:`_compute_M_base_tokenspace`.
+    M_base : torch.Tensor or None
+        Required when ``M_compute_mode='static'``. Shape ``(1, L, 1)``.
     bmcsa_blocks : list of int, optional
         DiT block indices to apply BMCSA on. None means all blocks.
     bmcsa_strength : float, default 1.0
-        Overall multiplier on the shared-attention branch; effective blend
-        weight = clamp(strength * M_base, 0, 1). 0 disables BMCSA; 1 full.
+        Overall multiplier on the shared-attention branch.
+    M_compute_mode : str
+        'static' or 'dynamic'. See above.
+    tau_M_dynamic : float, default 0.6
+        Sigmoid center for dynamic-M (cosine agreement threshold).
+    kappa_M_dynamic : float, default 0.1
+        Sigmoid sharpness for dynamic-M.
+    capture_dynamic_M : bool, default False
+        When True (and dynamic mode), each step's per-block M map is captured
+        for diagnostics and returned in the result edict.
 
     Returns
     -------
     torch.Tensor or edict
         ``(K, 8, 16, 16, 16)`` refined latents, or an edict with per-step
-        trajectories when ``collect_per_step=True``.
+        trajectories (and ``dynamic_M`` log) when ``collect_per_step=True``.
     """
     if not (0.0 < t_star < 1.0):
         raise ValueError(f"t_star must be in (0, 1); got {t_star}")
     if pass2_steps < 1:
         raise ValueError(f"pass2_steps must be >= 1; got {pass2_steps}")
+    if M_compute_mode not in ("static", "dynamic"):
+        raise ValueError(
+            f"M_compute_mode must be 'static' or 'dynamic'; got {M_compute_mode!r}"
+        )
+    if M_compute_mode == "static" and M_base is None:
+        raise ValueError("M_compute_mode='static' requires M_base to be provided")
     sigma_min = sampler.sigma_min
 
-    # Forward-noise to t_star (reuse shared noise when provided; see rationale
-    # in _sdedit_refine_k6).
+    # Forward-noise to t_star.
     if shared_noise is None:
         noise_term = torch.randn_like(guides)
     else:
@@ -676,56 +702,73 @@ def _sdedit_refine_k6_bmcsa(
         noise_term = noise_term.to(device=guides.device, dtype=guides.dtype)
     x_t = (1.0 - t_star) * guides + (sigma_min + (1.0 - sigma_min) * t_star) * noise_term
 
-    # Fixed-length schedule: pass2_steps pairs from t_star to 0, rescale_t-shaped.
+    # Fixed-length schedule.
     t_seq = np.linspace(float(t_star), 0.0, pass2_steps + 1)
     t_seq = rescale_t * t_seq / (1.0 + (rescale_t - 1.0) * t_seq)
     t_pairs = list(zip(t_seq[:-1], t_seq[1:]))
 
-    # Normalise bmcsa_blocks to a set for fast membership test.
     bmcsa_blocks_set: Optional[set] = None
     if bmcsa_blocks is not None:
         bmcsa_blocks_set = set(int(i) for i in bmcsa_blocks)
 
-    # Local edict import (matches _sdedit_refine_k6 pattern; kept local so the
-    # module-level deps don't grow).
     from easydict import EasyDict as edict
 
-    # BMCSA kwargs: forwarded into sampler.sample_once → _get_model_prediction
-    # → model(x_t, t, cond, **kwargs). DiT blocks consume these.
-    bmcsa_kwargs = dict(
+    # Base BMCSA kwargs (constant across steps).
+    base_kwargs = dict(
         bmcsa_flag=True,
         bmcsa_blocks=bmcsa_blocks_set,
         bmcsa_strength=float(bmcsa_strength),
-        M_base=M_base.to(device=guides.device),
+        M_compute_mode=M_compute_mode,
     )
-    # v4.2: optional M_attn (attention-driven semantic consensus gate).
-    # When present, BMCSA uses M_effective = M_base * M_attn.
+    if M_compute_mode == "static":
+        base_kwargs["M_base"] = M_base.to(device=guides.device)
+    else:
+        base_kwargs["tau_M_dynamic"] = float(tau_M_dynamic)
+        base_kwargs["kappa_M_dynamic"] = float(kappa_M_dynamic)
     if M_attn is not None:
-        bmcsa_kwargs["M_attn"] = M_attn.to(device=guides.device)
+        base_kwargs["M_attn"] = M_attn.to(device=guides.device)
+
+    # Dynamic-M log: dict {step_idx: {block_idx: (L,) fp16}}; only populated when
+    # M_compute_mode='dynamic' and capture_dynamic_M=True.
+    dynamic_M_log: Dict[int, Dict[int, torch.Tensor]] = {}
 
     from tqdm import tqdm
     pbar = tqdm(
         t_pairs,
-        desc=f"SDEdit+BMCSA refine (t*={t_star:.2f}, steps={pass2_steps})",
+        desc=(
+            f"SDEdit+BMCSA refine (t*={t_star:.2f}, steps={pass2_steps}, "
+            f"M_mode={M_compute_mode})"
+        ),
         disable=not verbose,
     )
 
     pred_x_0_list: List[torch.Tensor] = []
     pred_x_t_list: List[torch.Tensor] = []
     sample = x_t
-    for t, t_prev in pbar:
+    for step_idx, (t, t_prev) in enumerate(pbar):
         t = float(t)
         t_prev = float(t_prev)
+
+        # Per-step capture hook for dynamic-M.
+        step_kwargs = dict(base_kwargs)
+        if M_compute_mode == "dynamic" and capture_dynamic_M:
+            this_step_log: Dict[int, torch.Tensor] = {}
+            step_kwargs["dynamic_M_log"] = this_step_log
+        else:
+            this_step_log = None
+
         out = sampler.sample_once(
             flow_model, sample, t, t_prev,
             cond=cond, neg_cond=neg_cond,
             cfg_strength=cfg_strength, cfg_interval=cfg_interval,
-            **bmcsa_kwargs,
+            **step_kwargs,
         )
         sample = out.pred_x_prev
         if collect_per_step:
             pred_x_0_list.append(out.pred_x_0.detach())
             pred_x_t_list.append(sample.detach())
+        if this_step_log is not None and len(this_step_log) > 0:
+            dynamic_M_log[step_idx] = this_step_log
 
     if collect_per_step:
         return edict({
@@ -733,6 +776,7 @@ def _sdedit_refine_k6_bmcsa(
             "pred_x_t": pred_x_t_list,
             "pred_x_0": pred_x_0_list,
             "t_seq": t_seq.tolist() if hasattr(t_seq, "tolist") else list(t_seq),
+            "dynamic_M": dynamic_M_log,
         })
     return sample
 
@@ -1006,6 +1050,14 @@ def run_scar(
                 bmcsa_blocks = [int(i) for i in bmcsa_blocks_cfg]
             bmcsa_strength_cfg = float(cfg_sdedit.get("bmcsa_strength", 1.0))
 
+            # v3.3 default: dynamic-M (per-block, computed from current hidden).
+            # v4.3 legacy: static M_base (precomputed from Pass-1 P_base_shared).
+            # Defaults follow method.md section 5.2.
+            M_compute_mode = str(cfg_sdedit.get("M_compute_mode", "dynamic")).lower()
+            tau_M_dyn = float(cfg_sdedit.get("tau_M_dynamic", 0.7))
+            kappa_M_dyn = float(cfg_sdedit.get("kappa_M_dynamic", 0.05))
+            capture_dyn_M = bool(cfg_sdedit.get("capture_dynamic_M", True))
+
             sdedit_out = _sdedit_refine_k6_bmcsa(
                 sampler=sampler,
                 flow_model=flow_model,
@@ -1017,13 +1069,17 @@ def run_scar(
                 rescale_t=rescale_t_p2,
                 cfg_strength=cfg_strength_p2,
                 cfg_interval=cfg_interval_p2,
-                M_base=M_base_flat,
+                M_base=M_base_flat if M_compute_mode == "static" else None,
                 bmcsa_blocks=bmcsa_blocks,
                 bmcsa_strength=bmcsa_strength_cfg,
                 shared_noise=noise,
                 M_attn=M_attn_flat_for_bmcsa,               # None when apply_at="guide"
                 verbose=True,
                 collect_per_step=True,
+                M_compute_mode=M_compute_mode,
+                tau_M_dynamic=tau_M_dyn,
+                kappa_M_dynamic=kappa_M_dyn,
+                capture_dynamic_M=capture_dyn_M,
             )
         else:
             # v3 legacy: variable-length Pass 2 by ceil(total_steps * t_star).
@@ -1095,6 +1151,23 @@ def run_scar(
             "replaced_states": replaced_states,
             **voxel_deltas,
         })
+        # v3.3 BMCSA M-compute mode
+        if mode == "bmcsa":
+            sdedit_report["M_compute_mode"] = str(cfg_sdedit.get("M_compute_mode", "dynamic"))
+            if sdedit_report["M_compute_mode"] == "dynamic":
+                sdedit_report["tau_M_dynamic"] = float(cfg_sdedit.get("tau_M_dynamic", 0.6))
+                sdedit_report["kappa_M_dynamic"] = float(cfg_sdedit.get("kappa_M_dynamic", 0.1))
+                # Store the captured dynamic_M log to disk for viz / debug.
+                dyn_M_payload = getattr(sdedit_out, "dynamic_M", {})
+                if dyn_M_payload:
+                    n_steps_logged = len(dyn_M_payload)
+                    n_blocks_logged = (
+                        len(next(iter(dyn_M_payload.values()))) if n_steps_logged > 0 else 0
+                    )
+                    sdedit_report["dynamic_M_captured"] = {
+                        "n_steps_logged": int(n_steps_logged),
+                        "n_blocks_logged": int(n_blocks_logged),
+                    }
         # v4.2 / v4.3 M_attn report
         if mode == "bmcsa" and bool(cfg_sdedit.get("attn_m_enabled", False)):
             sdedit_report["attn_m_enabled"] = True
@@ -1204,6 +1277,38 @@ def run_scar(
         save_voxel_grid(os.path.join(out_dir, "O_stack_pass1_soft.npy"),
                         soft_p1.detach().cpu().numpy().astype(np.float16))
 
+    # ---- v3.3 Dynamic-M BMCSA: persist per-step per-block M log to disk ----
+    # The log is {step_idx: {block_idx: (L,) fp16}} where L = token_resolution^3
+    # (4096 for TRELLIS-image-large). Used by viz code below and downstream
+    # diagnostic scripts.
+    if (
+        sdedit_report.get("enabled", False)
+        and sdedit_report.get("mode") == "bmcsa"
+        and sdedit_report.get("M_compute_mode") == "dynamic"
+    ):
+        dyn_M_payload = getattr(sdedit_out, "dynamic_M", {})
+        if dyn_M_payload:
+            # Convert nested dict to a plain torch tensor stack for compact storage.
+            # Sort step indices and block indices for deterministic ordering.
+            step_ids = sorted(dyn_M_payload.keys())
+            block_ids = sorted(dyn_M_payload[step_ids[0]].keys())
+            # Stack into (n_steps, n_blocks, L) fp16.
+            M_stack = torch.stack([
+                torch.stack([dyn_M_payload[s][b] for b in block_ids], dim=0)
+                for s in step_ids
+            ], dim=0)                                                    # (S, B, L)
+            torch.save(
+                {
+                    "M_stack": M_stack,                                  # (S, B, L) fp16
+                    "step_ids": [int(x) for x in step_ids],
+                    "block_ids": [int(x) for x in block_ids],
+                    "tau_M_dynamic": float(sdedit_report.get("tau_M_dynamic", 0.6)),
+                    "kappa_M_dynamic": float(sdedit_report.get("kappa_M_dynamic", 0.1)),
+                    "token_resolution": int(round(M_stack.shape[-1] ** (1.0 / 3.0))),
+                },
+                os.path.join(out_dir, "dynamic_M_log.pt"),
+            )
+
     # ------------- Pass 2 Guide visualisations + s1..K-1 overlap -------------
     # Always emit the "s1..K-1 intersection" (state-0 reference overlap)
     # regardless of Pass 2 status, since it's useful for Pass 1 diagnostics.
@@ -1271,6 +1376,168 @@ def run_scar(
             os.path.join(viz_bmcsa_dir, "M_base_64.npy"),
             M_base_64_np.astype(np.float16),
         )
+
+        # ---- v3.3 Dynamic-M visualisation ----
+        # When M_compute_mode='dynamic', emit:
+        #   1) Per-block mean M (token-space 16^3): how each block sees "base"
+        #   2) Per-step mean M (across blocks)
+        #   3) Step-by-block M_mean heatmap PNG
+        #   4) Block-pair similarity (verifies per-block M is actually different)
+        if sdedit_report.get("M_compute_mode") == "dynamic":
+            dyn_M_payload = getattr(sdedit_out, "dynamic_M", {})
+            if dyn_M_payload:
+                step_ids = sorted(dyn_M_payload.keys())
+                block_ids = sorted(dyn_M_payload[step_ids[0]].keys())
+                M_stack_np = np.stack([
+                    np.stack(
+                        [dyn_M_payload[s][b].numpy().astype(np.float32) for b in block_ids],
+                        axis=0,
+                    )
+                    for s in step_ids
+                ], axis=0)                                              # (S, B, L)
+                S, B, L = M_stack_np.shape
+                token_res = int(round(L ** (1.0 / 3.0)))
+                assert token_res ** 3 == L, (
+                    f"dynamic_M L={L} is not a perfect cube; got token_res={token_res}"
+                )
+
+                # 1) Per-block mean M, reshape to (token_res, token_res, token_res)
+                # and upsample to 64^3 for direct comparison with M_base_64.
+                M_per_block_mean = M_stack_np.mean(axis=0)              # (B, L)
+                M_per_block_mean_3d = M_per_block_mean.reshape(B, token_res, token_res, token_res)
+
+                from pipelines.utils.voxel_viz import save_soft_voxel_html as _save_soft_v
+                for idx, blk in enumerate(block_ids):
+                    # Upsample 16^3 -> 64^3 for visual consistency with M_base_64.
+                    m_blk_16 = torch.from_numpy(M_per_block_mean_3d[idx])
+                    m_blk_64 = torch.nn.functional.interpolate(
+                        m_blk_16.unsqueeze(0).unsqueeze(0),
+                        size=(64, 64, 64),
+                        mode="trilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0).numpy().astype(np.float32)
+                    _save_soft_v(
+                        m_blk_64,
+                        os.path.join(
+                            viz_bmcsa_dir,
+                            f"M_dynamic_block_{blk:02d}_mean_64.html",
+                        ),
+                        title=(
+                            f"M_dynamic block={blk}, mean over {S} steps "
+                            f"(upsampled 16->64, base-likelihood gate)"
+                        ),
+                        threshold=0.15,
+                    )
+
+                # 2) Per-step mean M (across blocks), also upsampled.
+                M_per_step_mean = M_stack_np.mean(axis=1)               # (S, L)
+                M_per_step_mean_3d = M_per_step_mean.reshape(S, token_res, token_res, token_res)
+                for idx, step in enumerate(step_ids):
+                    m_step_16 = torch.from_numpy(M_per_step_mean_3d[idx])
+                    m_step_64 = torch.nn.functional.interpolate(
+                        m_step_16.unsqueeze(0).unsqueeze(0),
+                        size=(64, 64, 64),
+                        mode="trilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0).numpy().astype(np.float32)
+                    _save_soft_v(
+                        m_step_64,
+                        os.path.join(
+                            viz_bmcsa_dir,
+                            f"M_dynamic_step_{step:02d}_mean_64.html",
+                        ),
+                        title=(
+                            f"M_dynamic step={step}, mean over {B} blocks "
+                            f"(upsampled 16->64)"
+                        ),
+                        threshold=0.15,
+                    )
+
+                # 3) (S, B) heatmap of M_mean — scalar per (step, block).
+                M_scalar_sb = M_stack_np.mean(axis=-1)                  # (S, B)
+                # 4) Block-pair similarity: cos(M_block_i_mean_over_step, M_block_j_mean_over_step)
+                # Verifies that dynamic-M actually differs across blocks (not collapsed
+                # to identical maps).
+                M_block_l2 = M_per_block_mean / (
+                    np.linalg.norm(M_per_block_mean, axis=-1, keepdims=True) + 1e-8
+                )
+                block_pairwise_cos = M_block_l2 @ M_block_l2.T          # (B, B) in [-1, 1]
+
+                # Write summary plotly HTML (S-B heatmap + B-B cosine heatmap +
+                # M_mean over steps per block line plot).
+                from pipelines.utils.voxel_viz import _PLOTLY_OK
+                if _PLOTLY_OK:
+                    import plotly.graph_objects as go
+                    from plotly.subplots import make_subplots
+
+                    fig = make_subplots(
+                        rows=3, cols=1,
+                        subplot_titles=(
+                            f"Dynamic-M mean per (step, block) — token-space avg "
+                            f"(S={S}, B={B})",
+                            f"Pairwise cosine between block-M maps "
+                            f"(M_dynamic block i vs block j, mean over steps)",
+                            "Per-block M_mean evolution over steps",
+                        ),
+                        vertical_spacing=0.08,
+                    )
+                    fig.add_trace(
+                        go.Heatmap(
+                            z=M_scalar_sb,
+                            x=[f"blk{b}" for b in block_ids],
+                            y=[f"step{s}" for s in step_ids],
+                            colorscale="Viridis",
+                            zmin=0.0, zmax=1.0,
+                            colorbar=dict(title="M_mean", y=0.85, len=0.25),
+                        ),
+                        row=1, col=1,
+                    )
+                    fig.add_trace(
+                        go.Heatmap(
+                            z=block_pairwise_cos,
+                            x=[f"blk{b}" for b in block_ids],
+                            y=[f"blk{b}" for b in block_ids],
+                            colorscale="RdBu", reversescale=True,
+                            zmin=-1.0, zmax=1.0,
+                            colorbar=dict(title="cos(M_i, M_j)", y=0.5, len=0.25),
+                        ),
+                        row=2, col=1,
+                    )
+                    for idx, blk in enumerate(block_ids):
+                        fig.add_trace(
+                            go.Scatter(
+                                x=step_ids,
+                                y=M_scalar_sb[:, idx],
+                                mode="lines+markers",
+                                name=f"blk{blk}",
+                            ),
+                            row=3, col=1,
+                        )
+                    fig.update_xaxes(title_text="block", row=1, col=1)
+                    fig.update_yaxes(title_text="step", row=1, col=1)
+                    fig.update_xaxes(title_text="block j", row=2, col=1)
+                    fig.update_yaxes(title_text="block i", row=2, col=1)
+                    fig.update_xaxes(title_text="step", row=3, col=1)
+                    fig.update_yaxes(title_text="M_mean", row=3, col=1)
+                    fig.update_layout(
+                        title=(
+                            f"v3.3 Dynamic-M BMCSA diagnostics — "
+                            f"tau_M={sdedit_report.get('tau_M_dynamic', 0.6)}, "
+                            f"kappa_M={sdedit_report.get('kappa_M_dynamic', 0.1)}"
+                        ),
+                        height=1200,
+                    )
+                    fig.write_html(
+                        os.path.join(viz_bmcsa_dir, "dynamic_M_diagnostics.html"),
+                        include_plotlyjs="cdn",
+                    )
+
+                # Also save the (S, B) scalar heatmap as numpy for downstream
+                # ablation / inspection.
+                save_voxel_grid(
+                    os.path.join(viz_bmcsa_dir, "M_dynamic_scalar_step_block.npy"),
+                    M_scalar_sb.astype(np.float16),
+                )
 
         # v4.2/v4.3: M_attn viz (only when attn_m_enabled)
         if sdedit_report.get("attn_m_enabled", False) and attn_agreement_16 is not None:

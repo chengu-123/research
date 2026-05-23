@@ -2,7 +2,6 @@
 outputs/
 outputs_fa3d/
 
-# Third-party repo with its own git history (keep on disk, don't track)
 Wan2.2/
 
 # Python bytecode and caches

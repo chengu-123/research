@@ -228,32 +228,40 @@ def apply_scar_gradient_push(
 
 
 class SCARSampler(FlowEulerGuidanceIntervalSampler):
-    """Stage-1 sampler with two-phase cross-state coupling: latent x_t
-    mixing (big-frame alignment) followed by Tweedie-space gradient push
-    (detail refinement).
+    """Stage-1 sampler with cross-state coupling. v3.3 (default) mixes in
+    x_0 space; v4.3 legacy mixes in z_t space. Both keep the optional
+    Tweedie-space gradient push as a separate mechanism that operates on
+    the velocity prediction.
 
-    Two independent mechanisms that can overlap in time:
+    Two independent cross-state mechanisms:
 
-      Mix (steps 0..mix_steps-1): blend x_t across K states
-         x_in^(k) = w_first * x_t^(0) + w_self * x_t^(k) + w_last * x_t^(K-1)
-         The mixed latent is used as DiT input AND propagated as the next
-         step's x_t. Coarsely aligns the "big frame" while x_t is still
-         dominated by noise.
+      Mix (steps 0..mix_steps-1): blend across K states.
+         ``mix_space='x_0'`` (v3.3 default, method.md section 5.2):
+            1) run model forward to obtain (x_0_pred, eps_pred, v_pred)
+            2) mix x_0_pred per-state:
+                  x_0_mixed^(k) = w_first * x_0^(0) + w_self * x_0^(k)
+                                + w_last * x_0^(K-1)
+            3) rebuild z_{t_next} from mixed x_0 and ORIGINAL per-state eps:
+                  z_{t_next} = (1 - t_next) * x_0_mixed
+                             + (sigma_min + (1 - sigma_min) * t_next) * eps_pred
+            Mean is identical to the z_t-mix formulation, so spatial-position
+            alignment is preserved; noise variance is preserved (not reduced
+            by ||w||^2 < 1), so the model sees in-distribution z at the next
+            step. This is the form that matches CHORD's W-RFSDS derivation.
+
+         ``mix_space='z_t'`` (v4.3 legacy):
+            mixed^(k) = w_first * z_t^(0) + w_self * z_t^(k) + w_last * z_t^(K-1)
+            The mixed z_t is fed to the model forward AND propagated as the
+            next step's z_t. Noise variance after mix shrinks by ||w||^2
+            = 0.34 (for default weights), so the model sees slightly OOD
+            inputs. Kept for ablation parity with the v4.3 experiments.
 
       Push (steps 0..len(alpha_schedule)-1, indexed directly): Tweedie
-         gradient push
-         v_aug^(k) = v_cfg^(k) + (alpha(s) * t) * M(x)^2 * (x_0^(k) - x0_bar)
-         Refines base-region consistency at the velocity level. alpha(s)
-         typically peaks at step 0 (where the cross-state Tweedie variance
-         mask M is most discriminative, bimodal) and decays toward 0 over
-         total_steps (where mix-induced homogenisation makes the mask less
-         reliable). Generate via :func:`generate_alpha_schedule`.
-         The `* t` factor is σ_t normalization (rectified flow σ_t ≈ t),
-         replacing the earlier `/ t` which diverged as t→0.
-
-    Push and mix overlap in early steps by design: the mask is strongest
-    then, and push does its most reliable work before mix flattens the
-    variance distribution.
+         gradient push on the velocity prediction
+            v_aug^(k) = v_cfg^(k) + (alpha(s) * t) * M(x)^2 * (x_0^(k) - x0_bar)
+         Refines base-region consistency at the velocity level. Push is
+         independent of mix_space; with ``alpha_peak=0`` (current default),
+         push is disabled and the augmented velocity equals the CFG velocity.
 
     Mask mechanism: Tweedie variance + log-space percentile + sigmoid +
     active energy filter (inherited from VGCF, unchanged).
@@ -275,6 +283,7 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
         extreme_mix_mode: str = "symmetric",
         w_floor: float = 0.0,
         scar_enabled: bool = True,
+        mix_space: str = "x_0",
     ) -> None:
         super().__init__(sigma_min=sigma_min)
         self.alpha_schedule = tuple(alpha_schedule)
@@ -301,6 +310,12 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
         # that the hard mask misclassifies. See apply_scar_gradient_push.
         self.w_floor = float(w_floor)
         self.scar_enabled = bool(scar_enabled)
+        # Mix space: "x_0" (v3.3 default, mix clean signal estimate, preserves
+        # noise variance via per-state eps reconstruction) or "z_t" (v4.3
+        # legacy, mix noisy latent directly).
+        if mix_space not in ("x_0", "z_t"):
+            raise ValueError(f"mix_space must be 'x_0' or 'z_t', got {mix_space!r}")
+        self.mix_space = mix_space
 
     def _alpha_for_step(self, step_idx: int) -> float:
         """Push alpha for step_idx. ``alpha_schedule`` is indexed by
@@ -373,6 +388,53 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
             mixed = w_first * sample[0:1] + w_self * sample + w_last * sample[-1:]
         return mixed, True
 
+    def _mix_x_0(
+        self, pred_x_0: torch.Tensor, step_idx: int,
+    ) -> Tuple[torch.Tensor, bool]:
+        """v3.3 mix: blend the model's CLEAN-SIGNAL estimate x_0_pred across K
+        states. Same per-state symmetric formula as ``_mix_x_t`` but applied
+        to ``pred_x_0`` after the model forward, not to ``z_t`` before it.
+
+        After this call, the caller is expected to reconstruct ``z_{t_next}``
+        from ``x_0_mixed`` and the ORIGINAL per-state ``eps_pred`` so that
+        per-sample noise variance is preserved (ODE consistency).
+
+        Parameters
+        ----------
+        pred_x_0 : torch.Tensor
+            Shape ``(K, C, D, H, W)``, Tweedie clean estimate at the current step.
+        step_idx : int
+            Current Euler step index. Mix is active only when ``step_idx <
+            self.mix_steps`` and ``scar_enabled`` and ``K >= 2``.
+
+        Returns
+        -------
+        mixed : torch.Tensor
+            Same shape as ``pred_x_0``. Identity when mix is inactive.
+        was_mixed : bool
+            Whether the mix was applied.
+        """
+        if not self.scar_enabled or step_idx >= self.mix_steps or pred_x_0.shape[0] < 2:
+            return pred_x_0, False
+        K = pred_x_0.shape[0]
+        w_first, w_self, w_last = self.mix_weights
+
+        if self.extreme_mix_mode == "mean_of_middles" and K >= 4:
+            middle_mean = pred_x_0[1:K - 1].mean(dim=0, keepdim=True)
+            mixed_single = (
+                w_first * pred_x_0[0:1]
+                + w_self * middle_mean
+                + w_last * pred_x_0[-1:]
+            )
+            mixed = mixed_single.expand(K, -1, -1, -1, -1).contiguous()
+        else:
+            mixed = (
+                w_first * pred_x_0[0:1]
+                + w_self * pred_x_0
+                + w_last * pred_x_0[-1:]
+            )
+        return mixed, True
+
     @torch.no_grad()
     def sample(
         self,
@@ -389,6 +451,7 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
     ) -> edict:
         K = noise.shape[0]
         sample = noise.clone()
+        sigma_min = self.sigma_min
 
         t_seq = np.linspace(1.0, 0.0, steps + 1)
         t_seq = rescale_t * t_seq / (1.0 + (rescale_t - 1.0) * t_seq)
@@ -401,19 +464,24 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
             "scar_diagnostics": [],
         })
 
-        pbar = tqdm(t_pairs, desc="SCAR sampling", disable=not verbose)
+        pbar = tqdm(
+            t_pairs,
+            desc=f"SCAR sampling (mix_space={self.mix_space})",
+            disable=not verbose,
+        )
         for step_idx, (t, t_prev) in enumerate(pbar):
             t = float(t)
             t_prev = float(t_prev)
             dt = t - t_prev
 
-            # Phase 1: latent-space mixing (early steps, big-frame alignment).
-            # The mixed sample is propagated: DiT forward sees mixed x_t, and
-            # the Euler update starts from the mixed x_t, so subsequent steps
-            # inherit the mixed trajectory.
-            sample, was_mixed = self._mix_x_t(sample, step_idx)
+            # ----- Mix in z_t (legacy v4.3) BEFORE model forward -----
+            zt_was_mixed = False
+            if self.mix_space == "z_t":
+                # The mixed z_t is fed to the model AND propagated.
+                sample, zt_was_mixed = self._mix_x_t(sample, step_idx)
 
-            pred_x_0, _pred_eps, pred_v = self._get_model_prediction(
+            # ----- Model forward -----
+            pred_x_0, pred_eps, pred_v = self._get_model_prediction(
                 model, sample, t,
                 cond=cond, neg_cond=neg_cond,
                 cfg_strength=cfg_strength,
@@ -421,10 +489,14 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
                 **kwargs,
             )
 
+            # ----- Optional Tweedie-space gradient push on velocity -----
             alpha = self._alpha_for_step(step_idx) if self.scar_enabled else 0.0
             v_aug = pred_v
             diag: Dict[str, Any] = {
-                "step": step_idx, "t": t, "alpha": alpha, "mixed": was_mixed,
+                "step": step_idx, "t": t, "t_prev": t_prev,
+                "alpha": alpha,
+                "mix_space": self.mix_space,
+                "mixed": False,
             }
 
             if alpha > 0.0 and K >= 2:
@@ -446,7 +518,29 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
                     "push_norm": float((v_aug - pred_v).norm().item()),
                 })
 
-            pred_x_prev = sample - dt * v_aug
+            # ----- Mix in x_0 (v3.3 default) AFTER model forward -----
+            if self.mix_space == "x_0":
+                x_0_mixed, x0_was_mixed = self._mix_x_0(pred_x_0, step_idx)
+                if x0_was_mixed:
+                    # Reconstruct z_{t_next} from mixed x_0 and ORIGINAL per-state eps.
+                    # Mean = mean of z_t-mix formulation (position alignment preserved).
+                    # Variance: pred_eps unchanged -> noise variance preserved.
+                    pred_x_prev = (
+                        (1.0 - t_prev) * x_0_mixed
+                        + (sigma_min + (1.0 - sigma_min) * t_prev) * pred_eps
+                    )
+                    diag["mixed"] = True
+                    diag["mix_x0_l2_change"] = float(
+                        (x_0_mixed - pred_x_0).norm().item()
+                    )
+                else:
+                    # No mix this step: plain Euler step with (optional) augmented v.
+                    pred_x_prev = sample - dt * v_aug
+            else:
+                # mix_space == "z_t" — mix already happened pre-forward.
+                pred_x_prev = sample - dt * v_aug
+                diag["mixed"] = bool(zt_was_mixed)
+
             sample = pred_x_prev
 
             ret.pred_x_t.append(pred_x_prev)

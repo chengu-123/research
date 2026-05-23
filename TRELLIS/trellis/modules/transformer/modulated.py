@@ -143,13 +143,32 @@ class ModulatedTransformerCrossBlock(nn.Module):
         is in ``kwargs['bmcsa_blocks']`` (or ``bmcsa_blocks`` is None meaning
         all blocks), the self-attention output is blended between a per-state
         path (normal self_attn) and a cross-state-shared path (self_attn with
-        ``share_kv_across_batch=True``), gated per-token by ``M_base``.
+        ``share_kv_across_batch=True``), gated per-token by a mask M.
+
+        Two M-computation modes (controlled by ``M_compute_mode``):
+
+        - ``"static"`` (v4.3 legacy): M = M_base, a precomputed (1, L, 1)
+          geometric gate passed in via kwargs. Same M reused at every Euler
+          step and every block.
+
+        - ``"dynamic"`` (v3.3 default, method.md section 5.2): M is computed
+          per block from the CURRENT modulated hidden state h via
+          pairwise cross-state cosine agreement. This eliminates the
+          "stale M_base" problem of static mode (M_base from Pass-1 end vs
+          Pass-2 evolving hidden) at the cost of K^2 * L * D ops per block.
 
         kwargs schema (only consulted when bmcsa_flag is True):
             bmcsa_flag : bool
             bmcsa_blocks : Optional[Iterable[int]]  -- None means all
             bmcsa_strength : float, default 1.0
-            M_base : torch.Tensor of shape (1, L, 1), values in [0, 1]
+            M_compute_mode : str, "static" or "dynamic", default "static"
+            M_base : (1, L, 1) -- required when M_compute_mode == "static"
+            tau_M_dynamic : float, default 0.6 -- sigmoid center for dynamic-M
+            kappa_M_dynamic : float, default 0.1 -- sigmoid sharpness
+            M_attn : Optional (1, L, 1) -- optional semantic gate multiplier
+            dynamic_M_log : Optional[Dict[int, torch.Tensor]] -- when given
+                            (and dynamic mode), each visited block writes its
+                            M into log[block_idx] for diagnostics / viz.
 
         When bmcsa_flag is False or this block is not in bmcsa_blocks, the
         forward is identical to the unmodified TRELLIS block.
@@ -168,18 +187,55 @@ class ModulatedTransformerCrossBlock(nn.Module):
         if bmcsa_active and h.shape[0] > 1:
             y_self = self.self_attn(h)
             y_shared = self.self_attn(h, share_kv_across_batch=True)
-            M = kwargs["M_base"].to(y_self.dtype)                  # (1, L, 1) geometric mask
-            # v4.2 addition: optional semantic mask from cross-state feature
-            # agreement. When provided, M_effective = M_geometric * M_attn.
-            # Only voxels that pass BOTH geometric (consensus occupancy) and
-            # semantic (consistent DiT features) thresholds get blended toward
-            # shared attention. This rules out drawer-trajectory voxels that
-            # geometrically look like base (mean > 0.5) but have divergent
-            # cross-state semantic features (state 0's air vs state k's drawer).
+
+            M_mode = str(kwargs.get("M_compute_mode", "static")).lower()
+
+            if M_mode == "static":
+                if "M_base" not in kwargs:
+                    raise KeyError("BMCSA static mode requires kwargs['M_base'] (1, L, 1)")
+                M = kwargs["M_base"].to(y_self.dtype)
+            elif M_mode == "dynamic":
+                # Compute M per block from CURRENT modulated hidden h.
+                # h: (K, L, D). Pairwise cross-state cosine per token.
+                # Defaults from method.md section 5.2 (tau_M=0.7, kappa_M=0.05).
+                K_b, L_b, D_b = h.shape
+                tau_M = float(kwargs.get("tau_M_dynamic", 0.7))
+                kappa_M = float(kwargs.get("kappa_M_dynamic", 0.05))
+
+                # L2-normalize over channel; fp32 cosine for numerical stability.
+                h_fp32 = h.to(torch.float32)
+                h_normed = h_fp32 / (h_fp32.norm(dim=-1, keepdim=True) + 1e-6)
+                # Pairwise: (K, K, L)
+                pairwise = torch.einsum("kld,jld->kjl", h_normed, h_normed)
+                eye_K = torch.eye(K_b, device=h.device, dtype=torch.bool)
+                pairwise = pairwise.masked_fill(eye_K.unsqueeze(-1), 0.0)
+                # Off-diagonal mean per token (denominator K*(K-1) since diagonal zeroed)
+                if K_b > 1:
+                    agree = pairwise.sum(dim=(0, 1)) / (K_b * (K_b - 1))    # (L,)
+                else:
+                    agree = pairwise.sum(dim=(0, 1))                        # (L,) zeros
+
+                M_dyn = torch.sigmoid((agree - tau_M) / max(kappa_M, 1e-8))  # (L,)
+                M = M_dyn.view(1, -1, 1).to(y_self.dtype)
+
+                # Optional logging hook for downstream viz / debug.
+                dyn_M_log = kwargs.get("dynamic_M_log", None)
+                if dyn_M_log is not None and block_idx is not None:
+                    # Store fp16 CPU copy per block (overwrites previous step's
+                    # entry, which is the convention: caller resets the dict
+                    # before each sample_once call if per-step history is wanted).
+                    dyn_M_log[int(block_idx)] = M_dyn.detach().to(torch.float16).cpu()
+            else:
+                raise ValueError(
+                    f"BMCSA M_compute_mode must be 'static' or 'dynamic'; got {M_mode!r}"
+                )
+
+            # Optional semantic gate (v4.2: M_effective = M_geom * M_attn).
             M_attn_arg = kwargs.get("M_attn", None)
             if M_attn_arg is not None:
-                M_attn = M_attn_arg.to(y_self.dtype)
-                M = M * M_attn                                      # (1, L, 1) element-wise
+                M_attn_t = M_attn_arg.to(y_self.dtype)
+                M = M * M_attn_t
+
             strength = float(kwargs.get("bmcsa_strength", 1.0))
             eff_M = torch.clamp(strength * M, 0.0, 1.0)
             h = (1.0 - eff_M) * y_self + eff_M * y_shared
