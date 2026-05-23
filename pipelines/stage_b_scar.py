@@ -1703,13 +1703,13 @@ def run_scar(
                 )                                                  # (1, L, 1)
                 M_motion_tok_np = M_motion_token_flat.view(-1).detach().cpu().numpy().astype(np.float32)
 
-                # Upsample to 64^3 for viz
+                # Upsample to 64^3 for viz (force fp32 CPU before numpy)
                 m_motion_64 = torch.nn.functional.interpolate(
-                    M_motion_token_flat.view(1, 1, token_resolution, token_resolution, token_resolution),
+                    M_motion_token_flat.view(1, 1, token_resolution, token_resolution, token_resolution).float(),
                     size=(64, 64, 64),
                     mode="trilinear",
                     align_corners=False,
-                ).squeeze().numpy().astype(np.float32)
+                ).squeeze().detach().cpu().numpy().astype(np.float32)
                 _save_soft(
                     m_motion_64,
                     os.path.join(viz_bmcsa_dir, "M_motion_corridor_64.html"),
