@@ -20,7 +20,7 @@
 #
 # Usage:
 #   cd /path/to/mine        # sbatch must be invoked from repo root
-#   sbatch stagea.sh 30857 outputs/30857/stage_a "A brown wooden desk. The right drawer slides open..."
+#   sbatch stagea.sh 30857 outputs/30857/stage_a "A brown wooden desk. The right drawer slides open, smoothly and completely pulling outward. "
 
 set -euo pipefail
 
@@ -45,11 +45,6 @@ PROMPT="$3"
 
 WAN_CKPT=~/hf_models/Wan2.2-I2V-A14B
 IMAGE_PATH=~/hf_models/PartNet/${OBJECT_ID}/00_seg.png
-
-# sbatch runs from $SLURM_SUBMIT_DIR (where sbatch was called from), not from
-# the script's source location. Require user to sbatch from repo root so
-# `scripts/stagea.py` resolves; fall back to $(pwd) under direct bash.
-cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 mkdir -p "${OUTPUT_DIR}"
 
