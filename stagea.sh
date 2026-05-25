@@ -17,7 +17,17 @@
 
 set -euo pipefail
 
+# NOTE: `~/env/mine` is a conda env that ships intel-mkl, whose
+# conda-activate hook `libblas_mkl_activate.sh` references the unset
+# variable $MKL_INTERFACE_LAYER on line 1. Under `-u` (nounset) that
+# aborts the whole script before any of our code runs. Disable `-u`
+# locally around the activate, then re-enable. This is an upstream
+# conda package bug; the `~/env/fa3d2` env used by Wan2.2/30857.sh
+# happens not to ship this hook, which is why that script does not
+# trip the same issue despite also using `set -euo pipefail`.
+set +u
 source ~/env/mine/bin/activate
+set -u
 
 export TORCH_HOME=~/.cache/torch
 export HF_HUB_OFFLINE=1
