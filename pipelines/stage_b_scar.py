@@ -1,78 +1,59 @@
-"""Stage B driver: SCAR v3.3.2 sampling + multi-gate BMCSA Pass-2.
+"""Stage B driver: SCAR v3.3.3 (z_t mix + saturated BMCSA + hard K-vote PRIMARY).
 
 Replaces `stage_b_vgcf.py` as the main driver for base-consistent Stage-1
 sampling. The VGCF driver is preserved in the tree as a legacy ablation.
 
-Pipeline (v3.3.2 reframe, 2026-05-23):
+DESIGN PHILOSOPHY (post-empirical iteration, 2026-05-23):
 
-  Pass 1 — K-parallel SCAR-x_0 (Pass-1 contract: per-state move evidence):
-    1. K-parallel SS sampling with base-masked symmetric mix on x_0_pred
-       (8-channel SS latent). Per-step base mask = K-state divergence
-       median threshold. Base voxels get full symmetric mix (s0/s5 anchors
-       sharpen middle states' edges). Move voxels keep self (no s0/s5
-       mode duplication / "two-drawer ghost").
-    2. Decode K latents to 64^3 occupancy via SS VAE decoder.
-    3. Optional: remove grounding disk/carpet voxels.
-    -> O_stack_pass1, soft_p1: K-state Pass-1 occupancy that PRESERVES
-       per-state move geometry.
+Stage B's job is K-state base consensus extraction. The K=6 state images
+encode the same physical base + different drawer positions. By forcing
+K-parallel sampling under cross-state coupling (mix + BMCSA), the model
+converges to a base-consistent solution. Two outputs:
 
-  Pass 2 — SDEdit + multi-gate BMCSA (Pass-2 contract: base extractor):
-    4. Build augmented intersection guide using shared P_base from Pass-1
-       K-mean (+ optional M_attn semantic filter at the guide source).
-    5. Encode guide -> SS latent via frozen SparseStructureEncoder.
-    6. Re-sample K=6 from t_star=0.5 with BMCSA on all 24 DiT self-attn
-       layers. BMCSA gate is a multi-gate product:
-            M_eff = M_base_geom * M_attn * (1 - M_motion_corridor) * M_dyn
-       Dynamic-M is an attenuator (signal: 8-channel prev_x_0_pred K-state
-       cosine), not a classifier. Saturated dynamic-M is harmless thanks
-       to the multi-gate composition (M_motion -> 0 on move voxels kills
-       sharing regardless of M_dyn).
-    7. Decode all K. The K-state occupancies are HIGHLY CONSISTENT here
-       — Pass-2 acts as a base extractor.
+  Pass 1 (move evidence): K-parallel SCAR z_t mix retains state-specific
+    drawer positions. Mix anchors s0/s5 mid-trajectory to sharpen middle-
+    state edges. Model's conditional denoising under per-state cond c_k
+    naturally pulls each state's trajectory back to its correct clean
+    geometry (z_t mix is SELF-CORRECTING; x_0 mix is self-reinforcing
+    and was empirically worse).
 
-  Output contract (v3.3.2 PRIMARY = soft fields):
+  Pass 2 (base extractor): SDEdit from t*=0.5 with BMCSA. dynamic-M
+    naturally saturates to ~1 (1024-d DiT hidden cosine on K-state of the
+    same object is high), turning every DiT self-attn into K/V averaging
+    across K states. This averaging IS the base extractor — base voxels
+    where K agree get reinforced, move voxels where K differ get
+    smoothed away. The K-state Pass-2 occupancies are highly consistent;
+    a strict K-vote (>= ceil(0.83*K)) extracts the canonical base.
 
-      P_base_canonical (64, 64, 64) float in [0, 1]
-          mean_K(soft_p2) * var_penalty(soft_p2). High = high-confidence
-          base voxel. Variance-weighted to reject Pass-2 hallucinated
-          common envelopes whose K-state agreement is shaky.
+Output contract (v3.3.3 PRIMARY = hard K-vote, SECONDARY = soft):
 
-      base_confidence (64, 64, 64) float in [0, 1]
-          Alias for P_base_canonical. Stage C unary input.
+  PRIMARY (hard binary, the user-confirmed "very good base"):
+    O_base_canonical (64, 64, 64) uint8: votes_p2 >= ceil(0.83 * K).
+    O_move_per_state (K, 64, 64, 64) uint8: binary_p1 AND NOT O_base.
+    O_stack          (K, 64, 64, 64) uint8: Pass-2 K-state (base consensus).
+    O_stack_pass1    (K, 64, 64, 64) uint8: Pass-1 K-state (move-bearing).
 
-      P_move_evidence_per_state (K, 64, 64, 64) float in [0, 1]
-          max(soft_p1[k] - 0.8 * P_base_canonical, 0). Per-state CANDIDATE
-          motion evidence. NOT final move geometry: Stage C must still
-          apply component filtering, swept-corridor validation, joint-
-          consistency checks. s0 ghosts may survive; that's a downstream
-          job.
+  SECONDARY (soft, for Stage C MRF unary; NOT used to derive primary):
+    P_base_canonical (64, 64, 64) float: mean_K(soft_p2). NO var_penalty
+                       (was multiplicative attenuator on edges, hurt base).
+    P_move_evidence_per_state (K, 64, 64, 64) float:
+                       max(soft_p1[k] - 0.8 * P_base, 0).
+    base_confidence, move_confidence: aliases of the soft fields.
 
-      move_confidence (K, 64, 64, 64) float in [0, 1]
-          Alias for P_move_evidence_per_state. Stage C unary input.
+Multi-gate BMCSA (M_base*M_attn*(1-M_motion)*M_dyn) is RETAINED IN CODE
+but OFF by default in yaml: `use_motion_corridor: false`,
+`attn_m_apply_at: guide`. With both off, M_eff defaults to M_base * M_dyn,
+where M_dyn saturates to ~1 and M_base contains the same K-mean geometric
+prior — net effect is "mostly K/V averaging", matching the v4.3 saturated
+behaviour that produces good base. Multi-gate is kept as ablation switch
+(turn use_motion_corridor on / attn_m_apply_at to 'both' to study how
+disentangled gates affect base/move trade-off — expected: hurts base).
 
-  Legacy hard binary aliases (back-compat for existing Stage C):
+Pass 1 mix_space defaults to 'z_t' (v4.3 self-correcting). 'x_0' mix
+(v3.3 SCAR-x_0) retained as ablation (empirically worse on base).
 
-      O_base_canonical = (P_base_canonical > 0.4)   # uint8 (64, 64, 64)
-      O_move_per_state = (P_move_evidence > 0.4)    # uint8 (K, 64, 64, 64)
-      O_stack          = Pass-2 K-state binary       # uint8 (K, 64, 64, 64)
-      O_stack_pass1    = Pass-1 K-state binary       # uint8 (K, 64, 64, 64)
-
-  Other artifacts: dit_hidden.pt, dynamic_M_log.pt (multi-gate M_eff),
-  scar_diagnostics.json (per-step mix/push/base_frac), sdedit_report.json,
-  viz/{O_stack,P_base_canonical,P_move_evidence_per_state,...}.html,
-  viz/bmcsa/{M_base_64,M_motion_corridor_64,M_attn_*,M_dynamic_*,
-  dynamic_M_diagnostics,multi_gate_decomposition}.html,
-  viz/scar_base_mask/base_mask_step_*.html.
-
-  Downstream Stage C consumption pattern:
-    - canonical base anchor    <- P_base_canonical (soft) or O_base_canonical (hard)
-    - per-state motion residual <- P_move_evidence_per_state (soft), then filter
-    - joint init               <- M_attn for graph-cut unary, swept volume from
-                                  P_move_evidence union
-    - move part canonical      <- DO NOT use mean of P_move_evidence; must align
-                                  per-state residuals via fitted joint first
-
-See record/method.md section 5.2 and record/2026-04-18-stageb-v3-sdedit-design.md.
+See record/method.md section 5.2; v3.3.3 yaml defaults override
+method.md's v3.3 recommendations based on empirical 30857 results.
 """
 
 from __future__ import annotations
@@ -201,11 +182,7 @@ def capture_dit_hidden_states(
     # Timestep tensor — SS-DiT expects t scaled by 1000 (see flow_euler.py:39).
     t_tensor = torch.full((K,), 1000.0 * t_star, device=device, dtype=torch.float32)
 
-    try:
-        _ = flow_model(x_t, t_tensor, cond)
-    except TypeError:
-        # Some flow model wrappers take kwargs; attempt common alternates.
-        _ = flow_model(x_t, t=t_tensor, cond=cond)
+    _ = flow_model(x_t, t_tensor, cond)
 
     for h in handles:
         h.remove()
@@ -466,6 +443,170 @@ def _compute_motion_corridor_tokenspace(
     )
     L = token_resolution ** 3
     return M_tok.view(1, L, 1)
+
+
+def _normalise_via_log_quantile(
+    raw: torch.Tensor,
+    percentile: float = 0.5,
+    eta: float = 0.5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Auto-normalise a non-negative scalar field to [0, 1] via log + in-batch
+    quantile sigmoid. Same math as SCAR.compute_tweedie_variance_mask and the
+    F1 dynamic-M fix — reused here for cross-source consistency.
+
+    Output high at HIGH input (motion-like); low at LOW input (base-like).
+
+    raw : non-negative tensor of any shape (variance-like or motion-strength).
+    percentile : quantile of log(raw) used as sigmoid center.
+    eta : sigmoid sharpness in log space.
+    """
+    log_raw = torch.log(raw.clamp_min(0.0) + eps)
+    tau = torch.quantile(log_raw.flatten(), float(percentile))
+    return torch.sigmoid((log_raw - tau) / max(eta, eps))
+
+
+def _compute_motion_corridor_multi_source(
+    soft_p1: torch.Tensor,
+    z_final: torch.Tensor,
+    dit_hidden: Optional[Dict[int, torch.Tensor]] = None,
+    occupancy_weight: float = 1.0,
+    zfinal_percentile: float = 0.55,
+    zfinal_eta: float = 0.5,
+    hidden_percentile: float = 0.55,
+    hidden_eta: float = 0.5,
+    upsample_mode: str = "trilinear",
+) -> Dict[str, torch.Tensor]:
+    """v3.3.4 Plan C+: multi-source motion corridor in 64^3 voxel space.
+
+    OR-composes three cross-state motion signals to overcome SCAR Pass-1
+    alignment squashing the single-source `footprint*(1-shared)` signal.
+
+    Source A (occupancy):  footprint*(1-shared) from soft_p1 — current
+                           method, weakened by SCAR z_t mix alignment.
+    Source B (z_final):    cross-state variance of the 8-d SS latent at 16^3.
+                           Captures structural per-state divergence missed
+                           by occupancy mean.
+    Source C (dit_hidden): cross-state variance of 1024-d DiT mid-late
+                           hidden (block 14/16/18 averaged) at 16^3.
+                           Encodes DINOv2 patch + 3D voxel signal fused
+                           through 24 layers of cross-attention — the
+                           richest cross-state-relationship signal
+                           available (per user direction: motion lives in
+                           cross-state latent relations, not only DINOv2).
+
+    Each source is auto-normalised via log + in-batch quantile sigmoid (the
+    SAME math as the F1 variance dynamic-M fix and SCAR's Pass-1 mask),
+    then upsampled to 64^3 (16->64 trilinear) where needed. OR composition
+    (voxel-wise max) is conservative for physical-realism preservation: any
+    one source flagging motion is sufficient to preserve per-state attention.
+
+    Parameters
+    ----------
+    soft_p1 : (K, 64, 64, 64) Pass-1 sigmoid occupancies.
+    z_final : (K, 8, 16, 16, 16) Pass-1 SS latent.
+    dit_hidden : optional dict {block_idx: (K, L=4096, 1024)} fp16.
+                 When None, source C is skipped.
+    occupancy_weight : scalar multiplier on source A (default 1.0).
+    zfinal_percentile / zfinal_eta : source B normalisation params.
+    hidden_percentile / hidden_eta : source C normalisation params.
+                 0.55 default is slightly above median so corridor voxels
+                 (top ~45% by variance) get >0.5 sigmoid output.
+
+    Returns
+    -------
+    dict with keys:
+        M_motion_enhanced_64 : (64, 64, 64) OR-composed final mask
+        M_motion_occ_64      : (64, 64, 64) source A
+        M_motion_zfinal_64   : (64, 64, 64) source B
+        M_motion_hidden_64   : (64, 64, 64) source C (or None)
+        sources_used         : list of strings indicating which sources fired
+    """
+    if soft_p1.ndim != 4:
+        raise ValueError(f"soft_p1 must be (K, D, H, W); got {tuple(soft_p1.shape)}")
+    K = soft_p1.shape[0]
+    res64 = soft_p1.shape[-1]
+    device = soft_p1.device
+    work_dtype = torch.float32
+
+    # ---- Source A: occupancy footprint*(1-shared) (existing) ----
+    footprint = soft_p1.max(dim=0).values.to(work_dtype)
+    shared = soft_p1.mean(dim=0).to(work_dtype)
+    M_occ_64 = (footprint * (1.0 - shared)).clamp(0.0, 1.0)
+    # Apply log-quantile normalise to make sparse weak signal usable: voxels
+    # with any nontrivial (1-shared) >0 get pushed up via in-batch quantile.
+    # Default percentile 0.55 means: ~45% of voxels (those above median
+    # occupancy variance) get sigmoid > 0.5.
+    M_occ_norm_64 = _normalise_via_log_quantile(
+        M_occ_64, percentile=zfinal_percentile, eta=zfinal_eta,
+    )
+    # Linear blend with raw for "any occupancy motion is real" preservation:
+    # at voxels with raw M_occ very low, normalised may overamplify; mix.
+    M_occ_final_64 = (occupancy_weight * 0.5 * (M_occ_64 + M_occ_norm_64)).clamp(0.0, 1.0)
+
+    sources_used: List[str] = ["occupancy"]
+
+    # ---- Source B: z_final cross-state variance (8-d SS latent at 16^3) ----
+    if z_final.ndim != 5 or z_final.shape[0] != K:
+        raise ValueError(
+            f"z_final must be (K, C, D, H, W) with K={K}; got {tuple(z_final.shape)}"
+        )
+    z_f = z_final.to(work_dtype)
+    z_mean = z_f.mean(dim=0, keepdim=True)                              # (1, C, D, H, W)
+    z_var_per_voxel = ((z_f - z_mean) ** 2).sum(dim=(0, 1)) / max(K, 1)  # (D, H, W) at 16^3
+    M_z_motion_16 = _normalise_via_log_quantile(
+        z_var_per_voxel, percentile=zfinal_percentile, eta=zfinal_eta,
+    )
+    M_z_motion_64 = torch.nn.functional.interpolate(
+        M_z_motion_16.unsqueeze(0).unsqueeze(0),
+        size=(res64, res64, res64),
+        mode=upsample_mode, align_corners=False,
+    ).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+    sources_used.append("zfinal_variance")
+
+    # ---- Source C: dit_hidden cross-state variance (1024-d at 16^3) ----
+    M_h_motion_64: Optional[torch.Tensor] = None
+    if dit_hidden is not None and len(dit_hidden) > 0:
+        # Average hidden over capture blocks (e.g. 14, 16, 18).
+        hidden_list = [
+            v.to(device=device, dtype=work_dtype) for v in dit_hidden.values()
+        ]
+        hidden_avg = torch.stack(hidden_list, dim=0).mean(dim=0)         # (K, L, 1024)
+        h_mean = hidden_avg.mean(dim=0, keepdim=True)                    # (1, L, 1024)
+        # Variance summed over channels = un-normalised cross-state divergence
+        h_var = ((hidden_avg - h_mean) ** 2).sum(dim=-1).mean(dim=0)     # (L,)
+        L = h_var.numel()
+        token_res = int(round(L ** (1.0 / 3.0)))
+        if token_res ** 3 != L:
+            raise ValueError(
+                f"dit_hidden token count {L} is not a perfect cube; got {token_res}^3"
+            )
+        M_h_motion_flat = _normalise_via_log_quantile(
+            h_var, percentile=hidden_percentile, eta=hidden_eta,
+        )
+        M_h_motion_grid = M_h_motion_flat.view(token_res, token_res, token_res)
+        M_h_motion_64 = torch.nn.functional.interpolate(
+            M_h_motion_grid.unsqueeze(0).unsqueeze(0),
+            size=(res64, res64, res64),
+            mode=upsample_mode, align_corners=False,
+        ).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+        sources_used.append("dit_hidden_variance")
+
+    # ---- OR composition (voxel-wise max) ----
+    M_motion_enhanced_64 = torch.maximum(M_occ_final_64, M_z_motion_64)
+    if M_h_motion_64 is not None:
+        M_motion_enhanced_64 = torch.maximum(M_motion_enhanced_64, M_h_motion_64)
+    M_motion_enhanced_64 = M_motion_enhanced_64.clamp(0.0, 1.0).to(soft_p1.dtype)
+
+    return {
+        "M_motion_enhanced_64": M_motion_enhanced_64,
+        "M_motion_occ_64": M_occ_final_64.to(soft_p1.dtype),
+        "M_motion_zfinal_64": M_z_motion_64.to(soft_p1.dtype),
+        "M_motion_hidden_64": (
+            M_h_motion_64.to(soft_p1.dtype) if M_h_motion_64 is not None else None
+        ),
+        "sources_used": sources_used,
+    }
 
 
 def _build_augmented_intersection_guide(
@@ -738,6 +879,12 @@ def _sdedit_refine_k6_bmcsa(
     M_compute_mode: str = "static",
     tau_M_dynamic: float = 0.7,
     kappa_M_dynamic: float = 0.05,
+    M_dynamic_signal: str = "variance",
+    var_percentile: float = 0.65,
+    var_eta: float = 0.5,
+    kv_floor: float = 0.2,
+    base_kshare_alpha: float = 0.9,
+    bmcsa_composition: str = "v334",
     capture_dynamic_M: bool = False,
 ) -> Any:
     """Pass 2 SDEdit refinement with Base-Masked Cross-State Attention (BMCSA).
@@ -754,10 +901,25 @@ def _sdedit_refine_k6_bmcsa(
       ``(1, L, 1)`` precomputed from Pass-1 ``P_base_shared``. Same M used at
       every Euler step and every block.
 
-    - ``M_compute_mode='dynamic'`` (v3.3 default): each block computes its
-      own M from the current modulated hidden state h via pairwise
-      cross-state cosine agreement (per-token). ``M_base`` is ignored. Uses
-      ``tau_M_dynamic`` and ``kappa_M_dynamic`` to control the sigmoid gate.
+    - ``M_compute_mode='dynamic'`` (v3.3.4 default): each block computes its
+      own M from the current step's ``prev_x_0_pred`` via cross-state signal.
+      ``M_base`` is still threaded through and composed with M_dyn in the
+      block. The signal source is selected by ``M_dynamic_signal``:
+
+        * ``'variance'`` (v3.3.4 default, root-cause fix for stageB.md
+          Problem 2): un-normalised cross-state log-variance + in-batch
+          quantile sigmoid. Preserves the latent-MAGNITUDE channel that
+          carries the strongest base/move discriminator (occupied vs empty
+          voxels differ primarily in norm). Identical math to the
+          empirically validated SCAR Pass-1 variance mask. Uses
+          ``var_percentile`` (default 0.65) and ``var_eta`` (default 0.5).
+
+        * ``'cosine'`` (legacy v3.3.x ablation): pairwise cosine on
+          L2-normalised 8-channel ``prev_x_0_pred``. Saturates to ~1
+          universally in production runs because L2-normalise discards the
+          magnitude signal AND the K-state direction-only signal is
+          near-collinear under shared-noise K-parallel sampling.
+          Uses ``tau_M_dynamic`` and ``kappa_M_dynamic``.
 
     When ``capture_dynamic_M=True`` (dynamic mode only) the per-step
     per-block M maps are returned in the result edict under ``dynamic_M``.
@@ -830,21 +992,42 @@ def _sdedit_refine_k6_bmcsa(
     # Base BMCSA kwargs (constant across steps).
     # v3.3.2 multi-gate: M_eff = M_base * M_attn * (1 - M_motion) * M_dyn.
     # Each component is independent; missing gates default to 1 (no effect).
+    # v3.3.4 BMCSA kwargs (motion-aware decisive composition):
+    #   M_move = clamp(max(M_motion_static, M_motion_dynamic) * (1 - M_base),
+    #                  0, 1 - kv_floor)
+    #   h = M_move * y_self + (1 - M_move) * y_avg
+    # See modulated.py ModulatedTransformerCrossBlock._forward v3.3.4 header.
     base_kwargs = dict(
         bmcsa_flag=True,
         bmcsa_blocks=bmcsa_blocks_set,
         bmcsa_strength=float(bmcsa_strength),
         M_compute_mode=M_compute_mode,
+        kv_floor=float(kv_floor),                # v3.3.4 K-redundancy floor (s3 mitigation)
+        base_kshare_alpha=float(base_kshare_alpha),  # v3.3.5 K-share strength at confident base
+        bmcsa_composition=str(bmcsa_composition),    # v3.3.6 composition mode: v334 (default) | v335
     )
     if M_base is not None:
         base_kwargs["M_base"] = M_base.to(device=guides.device)
     if M_attn is not None:
+        # M_attn typically NOT threaded into BMCSA (lives at guide stage only).
+        # If passed, acts as semantic floor reducing M_move where K-state
+        # latent agrees.
         base_kwargs["M_attn"] = M_attn.to(device=guides.device)
     if M_motion_corridor is not None:
         base_kwargs["M_motion_corridor"] = M_motion_corridor.to(device=guides.device)
     if M_compute_mode == "dynamic":
-        base_kwargs["tau_M_dynamic"] = float(tau_M_dynamic)
-        base_kwargs["kappa_M_dynamic"] = float(kappa_M_dynamic)
+        signal_norm = str(M_dynamic_signal).lower()
+        if signal_norm not in ("variance", "cosine"):
+            raise ValueError(
+                f"M_dynamic_signal must be 'variance' or 'cosine'; got {M_dynamic_signal!r}"
+            )
+        base_kwargs["M_dynamic_signal"] = signal_norm
+        if signal_norm == "cosine":
+            base_kwargs["tau_M_dynamic"] = float(tau_M_dynamic)
+            base_kwargs["kappa_M_dynamic"] = float(kappa_M_dynamic)
+        else:  # variance
+            base_kwargs["var_percentile"] = float(var_percentile)
+            base_kwargs["var_eta"] = float(var_eta)
 
     # Dynamic-M log: dict {step_idx: {block_idx: (L,) fp16}}; only populated when
     # M_compute_mode='dynamic' and capture_dynamic_M=True.
@@ -1013,6 +1196,27 @@ def run_scar(
             device=soft_p1.device, dtype=soft_p1.dtype,
         )
         soft_p1 = soft_p1 * binary_p1
+
+    # ---- v3.3.4 Plan C+ EARLY dit_hidden capture (was at end of run_scar) ----
+    # Moved here so dit_hidden is available BEFORE Pass-2 BMCSA, enabling
+    # use as a motion-corridor source (the user's "cross-state latent
+    # relationship" signal). Same forward pass + same storage cost as before;
+    # only the EXECUTION POINT changes (earlier instead of after Pass-2).
+    dit_hidden_store: Optional[Dict[int, torch.Tensor]] = None
+    if bool(cfg_scar.get("capture_dit_hidden", False)):
+        dit_blocks_cfg = [int(b) for b in cfg_scar.get("dit_hook_blocks", [14, 16, 18])]
+        dit_t_star_cfg = float(cfg_scar.get("dit_hook_t_star", 0.3))
+        dit_hidden_store = capture_dit_hidden_states(
+            flow_model=flow_model,
+            z_final=z_final,
+            cond=cond["cond"],
+            target_blocks=dit_blocks_cfg,
+            t_star=dit_t_star_cfg,
+        )
+        print(
+            f"[run_scar] captured DiT hidden states (early, for motion source): "
+            f"blocks={sorted(dit_hidden_store.keys())} t_star={dit_t_star_cfg}"
+        )
 
     # ---- Pass 2: SDEdit state-0 refinement ----
     # Defaults to disabled if cfg_sdedit is None or enabled=False.
@@ -1195,25 +1399,112 @@ def run_scar(
                 bmcsa_blocks = [int(i) for i in bmcsa_blocks_cfg]
             bmcsa_strength_cfg = float(cfg_sdedit.get("bmcsa_strength", 1.0))
 
-            # v3.3.2 multi-gate BMCSA: M_eff = M_base_geom * M_attn *
-            # (1 - M_motion_corridor) * M_dynamic. Each gate is optional;
-            # missing gates default to 1 (no effect). See modulated.py
-            # ModulatedTransformerCrossBlock._forward for the composition.
+            # v3.3.4 motion-aware decisive BMCSA composition. See modulated.py
+            # ModulatedTransformerCrossBlock._forward v3.3.4 header for the
+            # full design. Summary:
+            #   M_move = clamp(max(M_motion_static, M_motion_dynamic) *
+            #                  (1 - M_base_geom), 0, 1 - kv_floor)
+            #   h = M_move * y_self + (1 - M_move) * y_avg
+            # M_motion_corridor is the static-source signal; the dynamic source
+            # is computed inside the DiT block from prev_x_0_pred variance.
+            # M_attn is NOT threaded here (lives at guide stage; see above).
             M_compute_mode = str(cfg_sdedit.get("M_compute_mode", "dynamic")).lower()
             tau_M_dyn = float(cfg_sdedit.get("tau_M_dynamic", 0.7))
             kappa_M_dyn = float(cfg_sdedit.get("kappa_M_dynamic", 0.05))
+            # v3.3.4: dynamic-M signal source. 'variance' is the root-cause
+            # fix for stageB.md Problem 2 (cosine saturation). See
+            # _sdedit_refine_k6_bmcsa docstring + modulated.py Gate 4 comment.
+            M_dyn_signal = str(cfg_sdedit.get("M_dynamic_signal", "variance")).lower()
+            var_pct = float(cfg_sdedit.get("var_percentile", 0.65))
+            var_eta_cfg = float(cfg_sdedit.get("var_eta", 0.5))
+            # v3.3.4 K-redundancy floor: minimum K/V averaging share at all
+            # voxels to dampen single-state TRELLIS instability (s3-loss
+            # mitigation). Default 0.2 -> per-state branch capped at 80%.
+            kv_floor_cfg = float(cfg_sdedit.get("kv_floor", 0.2))
+            # v3.3.5: K-share strength at confident-base-far-from-motion voxels.
+            # Effective only when bmcsa_composition='v335'. alpha=0.9 default.
+            base_kshare_alpha_cfg = float(cfg_sdedit.get("base_kshare_alpha", 0.9))
+            # v3.3.6 FINAL: composition mode selector.
+            #   'v334' (default): M_move = motion * (1 - M_base_geom)
+            #          Empirically validated; base completeness + base/move
+            #          separation are best. THE FINAL Stage B design.
+            #   'v335' (ablation): M_move = 1 - alpha * M_base * (1 - motion)
+            #          Default-per-state composition (reverse-engineered from
+            #          v3.3.2 dynamic-M saturation accident). Did not produce
+            #          the drawer-above-cabinet physical effect on 30857. Kept
+            #          as ablation switch for AAAI paper.
+            bmcsa_composition_cfg = str(cfg_sdedit.get("bmcsa_composition", "v334")).lower()
             capture_dyn_M = bool(cfg_sdedit.get("capture_dynamic_M", True))
 
-            # ★ v3.3.2 Gate 3: motion corridor mask
-            # P_motion = footprint * (1 - shared); voxels in the swept volume
-            # of the moving part. (1 - M_motion) gates OUT cross-state K/V
-            # sharing here, so move voxels keep state-specific representations.
+            # ★ v3.3.4 motion corridor: ALWAYS computed in bmcsa mode.
+            # The new composition uses (1 - M_base_geom) safety floor so
+            # base regions are protected even when M_motion_corridor is on;
+            # there is no longer a multiplicative attenuation chain
+            # (M_base * M_attn * (1-M_motion) * M_dyn) that hurt base edges
+            # in v3.3.2. The `use_motion_corridor` flag is therefore default
+            # true (kept as kill-switch for ablation only).
+            #
+            # v3.3.4 Plan C+: motion corridor SOURCE selectable:
+            #   'enhanced' (default): OR-compose occupancy + z_final variance
+            #                         + dit_hidden variance. The richest
+            #                         cross-state-relationship signal,
+            #                         not subject to SCAR Pass-1 alignment
+            #                         squashing the single-source approach.
+            #   'occupancy_only' (legacy): footprint*(1-shared) from soft_p1.
+            #                              Same as v3.3.x; weakened by SCAR.
+            motion_corridor_source = str(
+                cfg_sdedit.get("motion_corridor_source", "occupancy_only")
+            ).lower()
+            motion_sources_dict: Optional[Dict[str, Any]] = None
+            M_motion_enhanced_64: Optional[torch.Tensor] = None
             M_motion_corridor_flat: Optional[torch.Tensor] = None
             if bool(cfg_sdedit.get("use_motion_corridor", True)):
-                M_motion_corridor_flat = _compute_motion_corridor_tokenspace(
-                    soft_p1=soft_p1,
-                    token_resolution=token_resolution,
-                )
+                if motion_corridor_source == "enhanced":
+                    motion_sources_dict = _compute_motion_corridor_multi_source(
+                        soft_p1=soft_p1,
+                        z_final=z_final,
+                        dit_hidden=dit_hidden_store,
+                        zfinal_percentile=float(
+                            cfg_sdedit.get("motion_zfinal_percentile", 0.55)
+                        ),
+                        zfinal_eta=float(
+                            cfg_sdedit.get("motion_zfinal_eta", 0.5)
+                        ),
+                        hidden_percentile=float(
+                            cfg_sdedit.get("motion_hidden_percentile", 0.55)
+                        ),
+                        hidden_eta=float(
+                            cfg_sdedit.get("motion_hidden_eta", 0.5)
+                        ),
+                    )
+                    M_motion_enhanced_64 = motion_sources_dict["M_motion_enhanced_64"]
+                    # Pool to token space (16^3) for BMCSA gate input.
+                    src_res = M_motion_enhanced_64.shape[-1]
+                    pool_kernel = src_res // token_resolution
+                    M_tok = torch.nn.functional.avg_pool3d(
+                        M_motion_enhanced_64.unsqueeze(0).unsqueeze(0),
+                        kernel_size=pool_kernel,
+                        stride=pool_kernel,
+                    )
+                    L_tok = token_resolution ** 3
+                    M_motion_corridor_flat = M_tok.view(1, L_tok, 1)
+                    print(
+                        f"[run_scar] v3.3.4 Plan C+ motion corridor: "
+                        f"sources={motion_sources_dict['sources_used']}; "
+                        f"enhanced_64 max={float(M_motion_enhanced_64.max()):.3f}, "
+                        f"mean={float(M_motion_enhanced_64.mean()):.4f}, "
+                        f">0.3 count={int((M_motion_enhanced_64 > 0.3).sum())}"
+                    )
+                elif motion_corridor_source == "occupancy_only":
+                    M_motion_corridor_flat = _compute_motion_corridor_tokenspace(
+                        soft_p1=soft_p1,
+                        token_resolution=token_resolution,
+                    )
+                else:
+                    raise ValueError(
+                        f"motion_corridor_source must be 'enhanced' or "
+                        f"'occupancy_only'; got {motion_corridor_source!r}"
+                    )
 
             sdedit_out = _sdedit_refine_k6_bmcsa(
                 sampler=sampler,
@@ -1234,9 +1525,15 @@ def run_scar(
                 M_motion_corridor=M_motion_corridor_flat,   # Gate 3 (NOT motion)
                 verbose=True,
                 collect_per_step=True,
-                M_compute_mode=M_compute_mode,              # Gate 4 (dynamic attenuator)
+                M_compute_mode=M_compute_mode,              # static | dynamic
                 tau_M_dynamic=tau_M_dyn,
                 kappa_M_dynamic=kappa_M_dyn,
+                M_dynamic_signal=M_dyn_signal,              # v3.3.4: variance | cosine
+                var_percentile=var_pct,
+                var_eta=var_eta_cfg,
+                kv_floor=kv_floor_cfg,                       # v3.3.4: K-redundancy floor
+                base_kshare_alpha=base_kshare_alpha_cfg,     # v3.3.5: K-share strength
+                bmcsa_composition=bmcsa_composition_cfg,     # v3.3.6: composition mode
                 capture_dynamic_M=capture_dyn_M,
             )
         else:
@@ -1312,9 +1609,18 @@ def run_scar(
         # v3.3 BMCSA M-compute mode
         if mode == "bmcsa":
             sdedit_report["M_compute_mode"] = str(cfg_sdedit.get("M_compute_mode", "dynamic"))
+            sdedit_report["kv_floor"] = float(cfg_sdedit.get("kv_floor", 0.2))   # v3.3.4
+            sdedit_report["base_kshare_alpha"] = float(cfg_sdedit.get("base_kshare_alpha", 0.9))   # v3.3.5
+            sdedit_report["bmcsa_composition"] = str(cfg_sdedit.get("bmcsa_composition", "v334"))   # v3.3.6 FINAL selector
+            sdedit_report["use_motion_corridor"] = bool(cfg_sdedit.get("use_motion_corridor", True))
             if sdedit_report["M_compute_mode"] == "dynamic":
-                sdedit_report["tau_M_dynamic"] = float(cfg_sdedit.get("tau_M_dynamic", 0.7))
-                sdedit_report["kappa_M_dynamic"] = float(cfg_sdedit.get("kappa_M_dynamic", 0.05))
+                sdedit_report["M_dynamic_signal"] = str(cfg_sdedit.get("M_dynamic_signal", "variance"))
+                if sdedit_report["M_dynamic_signal"] == "cosine":
+                    sdedit_report["tau_M_dynamic"] = float(cfg_sdedit.get("tau_M_dynamic", 0.7))
+                    sdedit_report["kappa_M_dynamic"] = float(cfg_sdedit.get("kappa_M_dynamic", 0.05))
+                else:  # variance
+                    sdedit_report["var_percentile"] = float(cfg_sdedit.get("var_percentile", 0.65))
+                    sdedit_report["var_eta"] = float(cfg_sdedit.get("var_eta", 0.5))
                 # Dynamic-M log is returned as a (S, B, L) stack + parallel
                 # int lists (see _sdedit_refine_k6_bmcsa). Record presence + dims.
                 dyn_M_stack = getattr(sdedit_out, "dynamic_M_stack", None)
@@ -1369,47 +1675,36 @@ def run_scar(
                     soft.detach().cpu().numpy().astype(np.float16))
     torch.save(z_final.detach().cpu(), os.path.join(out_dir, "z_final.pt"))
 
-    # v8 (2026-04-24): optionally capture 1024-dim SS-DiT hidden states at
-    # DIFT-analogous mid-late blocks × mid-t. Used by Stage C SegMatch v8 as
-    # articulated-part discriminator (replaces the 8-dim z_final classifier
-    # that collapsed to EDT-equivalent). Controlled by cfg_scar key:
-    #   "capture_dit_hidden": true/false (default false to preserve legacy runs)
-    #   "dit_hook_blocks": list[int] (default [14, 16, 18])
-    #   "dit_hook_t_star": float (default 0.3)
-    if bool(cfg_scar.get("capture_dit_hidden", False)):
-        dit_blocks_cfg = cfg_scar.get("dit_hook_blocks", [14, 16, 18])
-        dit_blocks_cfg = [int(b) for b in dit_blocks_cfg]
+    # v8 (2026-04-24): persist 1024-dim SS-DiT hidden states at DIFT-analogous
+    # mid-late blocks x mid-t for downstream Stage C SegMatch v8.
+    # ★ v3.3.4 Plan C+: the capture itself was moved up (right after Pass-1
+    # decode) so dit_hidden is available for the multi-source motion corridor.
+    # This block now only PERSISTS the previously-captured store (no second
+    # forward).
+    if bool(cfg_scar.get("capture_dit_hidden", False)) and dit_hidden_store is not None:
+        dit_blocks_cfg = [int(b) for b in cfg_scar.get("dit_hook_blocks", [14, 16, 18])]
         dit_t_star_cfg = float(cfg_scar.get("dit_hook_t_star", 0.3))
-        try:
-            dit_hidden_store = capture_dit_hidden_states(
-                flow_model=flow_model,
-                z_final=z_final,
-                cond=cond["cond"],
-                target_blocks=dit_blocks_cfg,
-                t_star=dit_t_star_cfg,
-            )
-            meta_blob = {
-                "target_blocks": dit_blocks_cfg,
-                "t_star": dit_t_star_cfg,
-                "blocks_captured": sorted(list(dit_hidden_store.keys())),
-                "shape_per_block": (
-                    list(dit_hidden_store[dit_blocks_cfg[0]].shape)
-                    if dit_blocks_cfg and dit_blocks_cfg[0] in dit_hidden_store
-                    else None
-                ),
-                "dtype": "float16",
-            }
-            torch.save(
-                {"hidden_states": dit_hidden_store, "meta": meta_blob},
-                os.path.join(out_dir, "dit_hidden.pt"),
-            )
-            print(
-                f"[run_scar] saved DiT hidden states: "
-                f"blocks={meta_blob['blocks_captured']} t_star={dit_t_star_cfg} "
-                f"shape_per_block={meta_blob['shape_per_block']}"
-            )
-        except Exception as e:
-            print(f"[run_scar] WARNING: DiT hidden state capture failed: {e}")
+        meta_blob = {
+            "target_blocks": dit_blocks_cfg,
+            "t_star": dit_t_star_cfg,
+            "blocks_captured": sorted(list(dit_hidden_store.keys())),
+            "shape_per_block": (
+                list(dit_hidden_store[dit_blocks_cfg[0]].shape)
+                if dit_blocks_cfg and dit_blocks_cfg[0] in dit_hidden_store
+                else None
+            ),
+            "dtype": "float16",
+            "capture_position": "early (pre-Pass-2, for Plan C+ motion source)",
+        }
+        torch.save(
+            {"hidden_states": dit_hidden_store, "meta": meta_blob},
+            os.path.join(out_dir, "dit_hidden.pt"),
+        )
+        print(
+            f"[run_scar] saved DiT hidden states: "
+            f"blocks={meta_blob['blocks_captured']} t_star={dit_t_star_cfg} "
+            f"shape_per_block={meta_blob['shape_per_block']}"
+        )
 
     diag = list(getattr(out, "scar_diagnostics", None) or [])
     with open(os.path.join(out_dir, "scar_diagnostics.json"), "w") as f:
@@ -1694,16 +1989,20 @@ def run_scar(
         # composition produces a SPARSE base mask (not all-1 as in v3.3).
         if sdedit_report.get("M_compute_mode") in ("dynamic", "static"):
             from pipelines.utils.voxel_viz import _PLOTLY_OK as _PLOTLY_OK_MG
-            # M_motion_corridor we computed before Pass 2 (only when active)
+            # M_motion_corridor we computed before Pass 2 (only when active).
+            # v3.3.4 Plan C+: save ALL motion sources separately + the
+            # OR-composed enhanced field, plus the legacy occupancy-only
+            # field for direct comparison.
             motion_use = bool(cfg_sdedit.get("use_motion_corridor", True))
             if motion_use:
+                # Legacy occupancy-only field (for back-compat + comparison).
                 M_motion_token_flat = _compute_motion_corridor_tokenspace(
                     soft_p1=soft_p1,
                     token_resolution=token_resolution,
                 )                                                  # (1, L, 1)
                 M_motion_tok_np = M_motion_token_flat.view(-1).detach().cpu().numpy().astype(np.float32)
 
-                # Upsample to 64^3 for viz (force fp32 CPU before numpy)
+                # Upsample to 64^3 for viz.
                 m_motion_64 = torch.nn.functional.interpolate(
                     M_motion_token_flat.view(1, 1, token_resolution, token_resolution, token_resolution).float(),
                     size=(64, 64, 64),
@@ -1714,8 +2013,9 @@ def run_scar(
                     m_motion_64,
                     os.path.join(viz_bmcsa_dir, "M_motion_corridor_64.html"),
                     title=(
-                        "M_motion_corridor (64³, footprint*(1-shared)) — "
-                        "high = in swept volume of moving part, NOT base"
+                        "M_motion_corridor LEGACY (64^3, footprint*(1-shared) "
+                        "pooled-then-upsampled) -- high = swept volume; "
+                        "weakened by SCAR Pass-1 alignment"
                     ),
                     threshold=0.15,
                 )
@@ -1723,6 +2023,52 @@ def run_scar(
                     os.path.join(viz_bmcsa_dir, "M_motion_corridor_64.npy"),
                     m_motion_64.astype(np.float16),
                 )
+
+                # ★ v3.3.4 Plan C+ multi-source decomposition viz (when active).
+                if motion_sources_dict is not None:
+                    def _to_np(t):
+                        return t.detach().cpu().to(torch.float32).numpy() if t is not None else None
+
+                    sources_viz = {
+                        "M_motion_occ_64": (
+                            _to_np(motion_sources_dict["M_motion_occ_64"]),
+                            "Source A: occupancy footprint*(1-shared) normalised "
+                            "(soft_p1-derived; weakened by SCAR Pass-1 alignment)",
+                        ),
+                        "M_motion_zfinal_64": (
+                            _to_np(motion_sources_dict["M_motion_zfinal_64"]),
+                            "Source B: z_final cross-state variance (8-d SS latent at 16^3 -> 64^3); "
+                            "captures structural per-state divergence missed by occupancy mean",
+                        ),
+                        "M_motion_hidden_64": (
+                            _to_np(motion_sources_dict["M_motion_hidden_64"]),
+                            "Source C: dit_hidden cross-state variance (1024-d "
+                            "block 14/16/18 avg at 16^3 -> 64^3); DINOv2 patch + "
+                            "3D voxel signal fused through 24 layers of cross-attn",
+                        ),
+                        "M_motion_enhanced_64": (
+                            _to_np(motion_sources_dict["M_motion_enhanced_64"]),
+                            "Plan C+ FINAL: OR-composed multi-source motion corridor "
+                            "(max across all available sources)",
+                        ),
+                    }
+                    for key, (arr, title) in sources_viz.items():
+                        if arr is None:
+                            continue
+                        _save_soft(
+                            arr.astype(np.float32),
+                            os.path.join(viz_bmcsa_dir, f"{key}.html"),
+                            title=title,
+                            threshold=0.15,
+                        )
+                        save_voxel_grid(
+                            os.path.join(viz_bmcsa_dir, f"{key}.npy"),
+                            arr.astype(np.float16),
+                        )
+                    print(
+                        f"[run_scar] Plan C+ motion sources viz saved: "
+                        f"sources_used={motion_sources_dict['sources_used']}"
+                    )
 
             # Multi-gate decomposition dashboard
             if _PLOTLY_OK_MG:
@@ -2166,127 +2512,134 @@ def run_scar(
             f"viz in {base_mask_dir}"
         )
 
-    # ---- v3.3.2 REFRAME (post GPT review): SOFT dual-channel output ----
+    # ---- v3.3.3 REFRAME (empirical-confirmed): hard K-vote PRIMARY ----
     #
-    # Pass-2 BMCSA with multi-gate (or saturated dynamic-M) acts as a
-    # K-state base extractor. We expose its base consensus as SOFT fields
-    # (not hard binary masks) so Stage C can decide thresholds with full
-    # confidence information:
+    # Empirical evidence from runs after v3.3.2:
+    #   - Soft `mean * var_penalty` LOST voxels at base edges (var_penalty
+    #     was a multiplicative attenuator on minor K-state std).
+    #   - Hard K-vote (>= ceil(0.83*K)) produced the visibly best base in
+    #     prior runs (user-confirmed "保留 base 最好").
     #
-    #   P_base_canonical (1, 64^3) float:
-    #       mean_K(soft_p2) * var_penalty(soft_p2)
-    #       = K-mean occupancy weighted by low-variance confidence.
-    #       This avoids the hard-vote failure mode (a hallucinated common
-    #       envelope present in 5/6 states would falsely count as base).
-    #       High value = high confidence the voxel belongs to the base.
+    # Design: hard K-vote IS the K-state consensus signal. The strictness
+    # of vote (>= 5/6 for K=6) is exactly what filters out hallucinated
+    # common envelopes — they rarely survive 5/6-vote when M_attn / motion
+    # corridor have any independent signal. Soft fields are kept as
+    # SECONDARY outputs for Stage C MRF unary (where soft confidence can
+    # combine with motion residual evidence) but NOT used to derive the
+    # primary base mask.
     #
-    #   P_move_evidence_per_state (K, 64^3) float:
-    #       max(soft_p1[k] - alpha_base * P_base_canonical, 0)
-    #       Per-state Pass-1 occupancy MINUS base evidence (soft subtraction).
-    #       Carries CANDIDATE motion evidence for Stage C. NOT final move
-    #       geometry: Stage C must still apply component filtering, swept-
-    #       corridor validation, joint-consistency checks. s0 ghosts may
-    #       survive this stage; that's the downstream filter's job.
+    # Output contract (v3.3.3 PRIMARY = hard binary, SECONDARY = soft):
     #
-    #   base_confidence (1, 64^3) float = P_base_canonical (alias)
-    #   move_confidence_per_state (K, 64^3) float = P_move_evidence_per_state (alias)
+    #   PRIMARY (hard, the "very good base" from saturated Pass-2):
+    #     O_base_canonical  (64^3) uint8: K-vote >= ceil(0.83*K_v) on
+    #                                     Pass-2 K-state binary.
+    #     O_move_per_state  (K, 64^3) uint8: Pass-1 binary AND NOT
+    #                                     O_base_canonical (per-state
+    #                                     motion candidate; Stage C still
+    #                                     needs component / corridor /
+    #                                     joint-consistency validation).
     #
-    # Hard binary aliases (legacy back-compat for current Stage C):
-    #   O_base_canonical = (P_base_canonical > 0.4)
-    #   O_move_per_state = (P_move_evidence_per_state > 0.4)
+    #   SECONDARY (soft, for Stage C MRF unary):
+    #     P_base_canonical  (64^3) float: mean_K(soft_p2). NO var_penalty
+    #                                     (it attenuated edges and hurt
+    #                                     base extraction).
+    #     P_move_evidence_per_state  (K, 64^3) float:
+    #                                     max(soft_p1 - 0.8*P_base, 0).
+    #     base_confidence / move_confidence: aliases of above soft fields.
     soft_p2_np = soft.detach().cpu().numpy().astype(np.float32)           # (K, 64, 64, 64)
     binary_p2_np = binary.detach().cpu().numpy().astype(bool)
     K_v = int(soft_p2_np.shape[0])
 
-    # K-mean and cross-state std of Pass-2 soft occupancy.
+    # ---- PRIMARY: hard K-vote (the canonical base) ----
+    min_votes = max(1, int(np.ceil(0.83 * K_v)))                          # >=5 of 6 for K=6
+    votes_p2 = binary_p2_np.sum(axis=0)                                   # (64, 64, 64)
+    O_base_canonical = (votes_p2 >= min_votes).astype(np.uint8)           # (64, 64, 64)
+
+    binary_p1_np = binary_p1.detach().cpu().numpy().astype(bool)          # (K, 64, 64, 64)
+    O_move_per_state = (
+        binary_p1_np & ~O_base_canonical[None].astype(bool)
+    ).astype(np.uint8)                                                    # (K, 64, 64, 64)
+
+    # ---- SECONDARY: soft fields (no var_penalty; Stage C MRF unary) ----
     mean_p2 = soft_p2_np.mean(axis=0)                                     # (64, 64, 64)
-    std_p2 = soft_p2_np.std(axis=0)                                       # (64, 64, 64)
+    std_p2 = soft_p2_np.std(axis=0)                                       # (64, 64, 64), diagnostic
+    P_base_canonical = mean_p2.clip(0.0, 1.0)                              # SOFT secondary
+    base_confidence = P_base_canonical.copy()                             # alias
 
-    # Variance penalty: low std -> ~1, high std -> ~0.
-    # sigma_var=0.15 means std<=0.10 retains >70% confidence; std=0.25 -> ~26%.
-    # This downweights hallucinated common envelopes whose K-state agreement is shaky.
-    sigma_var = 0.15
-    var_penalty = 1.0 / (1.0 + (std_p2 / sigma_var) ** 2)                 # (64, 64, 64)
-
-    # P_base_canonical: K-mean AND low cross-state variance.
-    P_base_canonical = (mean_p2 * var_penalty).clip(0.0, 1.0)             # (64, 64, 64)
-    base_confidence = P_base_canonical.copy()                             # alias for downstream
-
-    # Hard alias for legacy callers (threshold 0.4 is intentional: trust soft).
-    O_base_canonical_hard = (P_base_canonical > 0.4).astype(np.uint8)
-
-    # P_move_evidence_per_state from Pass-1 minus weighted base.
     soft_p1_np = soft_p1.detach().cpu().numpy().astype(np.float32)        # (K, 64, 64, 64)
-    binary_p1_np = binary_p1.detach().cpu().numpy().astype(bool)
-    alpha_base = 0.8     # how aggressively to subtract base from move (partial overlap allowed)
+    alpha_base = 0.8
     P_move_evidence_per_state = np.clip(
         soft_p1_np - alpha_base * P_base_canonical[None], 0.0, 1.0,
-    ).astype(np.float32)                                                  # (K, 64, 64, 64)
-    move_confidence_per_state = P_move_evidence_per_state.copy()
-    O_move_per_state_hard = (P_move_evidence_per_state > 0.4).astype(np.uint8)
+    ).astype(np.float32)                                                  # SOFT secondary
+    move_confidence_per_state = P_move_evidence_per_state.copy()          # alias
 
-    # Save soft fields (PRIMARY contract for v3.3.2):
+    # ---- Save: hard PRIMARY first, soft SECONDARY second ----
+    save_voxel_grid(os.path.join(out_dir, "O_base_canonical.npy"), O_base_canonical)
+    save_voxel_grid(os.path.join(out_dir, "O_move_per_state.npy"), O_move_per_state)
     save_voxel_grid(os.path.join(out_dir, "P_base_canonical.npy"), P_base_canonical)
     save_voxel_grid(os.path.join(out_dir, "base_confidence.npy"), base_confidence)
-    save_voxel_grid(os.path.join(out_dir, "P_move_evidence_per_state.npy"), P_move_evidence_per_state)
+    save_voxel_grid(
+        os.path.join(out_dir, "P_move_evidence_per_state.npy"),
+        P_move_evidence_per_state,
+    )
     save_voxel_grid(os.path.join(out_dir, "move_confidence.npy"), move_confidence_per_state)
-    # Save hard fields (legacy aliases):
-    save_voxel_grid(os.path.join(out_dir, "O_base_canonical.npy"), O_base_canonical_hard)
-    save_voxel_grid(os.path.join(out_dir, "O_move_per_state.npy"), O_move_per_state_hard)
 
-    base_hard_count = int(O_base_canonical_hard.sum())
-    move_hard_counts = [int(O_move_per_state_hard[k].sum()) for k in range(K_v)]
-    base_soft_sum = float(P_base_canonical.sum())
-    move_soft_sums = [float(P_move_evidence_per_state[k].sum()) for k in range(K_v)]
+    base_hard_count = int(O_base_canonical.sum())
+    move_hard_counts = [int(O_move_per_state[k].sum()) for k in range(K_v)]
+    base_soft_mass = float(P_base_canonical.sum())
+    move_soft_masses = [float(P_move_evidence_per_state[k].sum()) for k in range(K_v)]
     print(
-        f"[run_scar] v3.3.2 soft output:\n"
-        f"  P_base_canonical:    soft_mass={base_soft_sum:.1f} voxels, "
-        f"hard@0.4={base_hard_count}\n"
-        f"  P_move per state:    soft_mass={move_soft_sums}, hard@0.4={move_hard_counts}"
+        f"[run_scar] v3.3.3 output:\n"
+        f"  PRIMARY hard  O_base_canonical = K-vote >= {min_votes}/{K_v} "
+        f"= {base_hard_count} voxels\n"
+        f"  PRIMARY hard  O_move_per_state per K = {move_hard_counts}\n"
+        f"  SECONDARY soft P_base_canonical    soft_mass = {base_soft_mass:.1f}\n"
+        f"  SECONDARY soft P_move_evidence     soft_mass = {move_soft_masses}"
     )
 
-    # ---- Viz ----
+    # ---- Viz: hard PRIMARY first ----
+    save_voxel_html(
+        O_base_canonical.astype(np.float32),
+        os.path.join(viz_dir, "O_base_canonical.html"),
+        title=(
+            f"O_base_canonical (PRIMARY) = Pass-2 K-vote >= {min_votes}/{K_v} "
+            f"— {base_hard_count} voxels (saturated K-state consensus)"
+        ),
+    )
+    save_voxel_stack_html(
+        O_move_per_state.astype(np.float32),
+        os.path.join(viz_dir, "O_move_per_state.html"),
+        title=(
+            f"O_move_per_state (PRIMARY) = Pass-1 raw AND NOT O_base_canonical "
+            f"— per-K motion candidate (Stage C must validate); K={K_v}"
+        ),
+    )
+    # Viz: soft SECONDARY
     save_soft_voxel_html(
         P_base_canonical.astype(np.float32),
         os.path.join(viz_dir, "P_base_canonical.html"),
         title=(
-            f"P_base_canonical = mean_K(soft_p2) * var_penalty (sigma_var={sigma_var}) "
-            f"— SOFT base confidence (Pass-2 K-state consensus, variance-weighted)"
+            "P_base_canonical (SECONDARY soft) = mean_K(soft_p2) "
+            "— for Stage C MRF unary; NOT used to derive primary mask"
         ),
         threshold=0.15,
-    )
-    save_voxel_html(
-        O_base_canonical_hard.astype(np.float32),
-        os.path.join(viz_dir, "O_base_canonical.html"),
-        title=(
-            f"O_base_canonical = P_base > 0.4 (hard legacy alias) "
-            f"— {base_hard_count} voxels"
-        ),
     )
     save_voxel_stack_html(
         P_move_evidence_per_state.astype(np.float32),
         os.path.join(viz_dir, "P_move_evidence_per_state.html"),
         title=(
-            f"P_move_evidence = max(soft_p1[k] - {alpha_base}*P_base, 0) "
-            f"— SOFT per-state motion candidate; Stage C must validate "
-            f"(component filter / swept corridor / temporal counterpart)"
+            f"P_move_evidence (SECONDARY soft) = max(soft_p1[k] - "
+            f"{alpha_base}*P_base, 0); for Stage C MRF unary"
         ),
     )
-    save_voxel_stack_html(
-        O_move_per_state_hard.astype(np.float32),
-        os.path.join(viz_dir, "O_move_per_state.html"),
-        title=(
-            f"O_move_per_state = P_move_evidence > 0.4 (hard legacy alias, K={K_v})"
-        ),
-    )
-    # Cross-state std as separate viz (diagnostics):
+    # Diagnostic: Pass-2 K-state std
     save_soft_voxel_html(
         std_p2.astype(np.float32),
         os.path.join(viz_dir, "P_base_cross_state_std.html"),
         title=(
-            "Pass-2 soft occupancy cross-state std — "
-            "low std = base consensus, high std = K-state disagreement "
-            "(should be high in motion corridor, low in static cabinet)"
+            "Pass-2 soft occupancy cross-state std (DIAGNOSTIC) — "
+            "low std = K-state consensus achieved, high std = K disagreement "
+            "(unused by v3.3.3 primary; kept for inspection only)"
         ),
         threshold=0.05,
     )

@@ -44,13 +44,17 @@ scar:
   mix_weights: [0.3, 0.4, 0.3]            # (w_first, w_self, w_last)
   extreme_mix_mode: symmetric             # "symmetric" (per-state formula: mixed^k =
                                           # 0.3*s0 + 0.4*s_k + 0.3*s5) | "mean_of_middles"
-  # v3.3 (2026-05-23, method.md section 5.2): mix in clean-signal space.
-  # 'x_0' (default) mixes pred_x_0 after model forward, then rebuilds z_{t_next}
-  #     using ORIGINAL per-state pred_eps -> noise variance preserved (ODE
-  #     consistent), spatial position alignment retained.
-  # 'z_t' (legacy v4.3) mixes the noisy latent before model forward; kept for
-  #     ablation parity with the 4/4 sample-id experiments.
-  mix_space: x_0
+  # ★ v3.3.3 (2026-05-23 post-empirical-test): default reverted to z_t.
+  # Empirical finding: x_0 mix lacks model self-correction. z_t mix lets
+  # the model's conditional denoising (cross-attn to per-state c_k)
+  # naturally pull the mixed trajectory back to each state's correct
+  # clean signal — model is self-correcting in z_t space, self-reinforcing
+  # in x_0 space. v4.3 4/4 success was on z_t mix.
+  # 'z_t' (default): mix noisy latent BEFORE model forward.
+  # 'x_0' (ablation): mix clean signal estimate AFTER model forward,
+  #     rebuild z_{t_next} from mixed x_0 + original eps. Mathematically
+  #     equivalent mean alignment, but no in-trajectory self-correction.
+  mix_space: z_t
   # Push schedule is generated as alpha(s) = alpha_peak * f(s/(total_steps-1)),
   # with f defined by alpha_decay. If alpha_schedule is also set (list of
   # numbers), it overrides alpha_peak + alpha_decay.
@@ -155,12 +159,13 @@ stage_b_sdedit:
   #                       to collapse under long-drawer prismatic joints.
   #   "both"            : apply at BOTH guide and BMCSA (defensive; usually
   #                       equivalent to "guide" since M_attn is idempotent).
-  # ★ v3.3.2: M_attn must apply at BOTH guide AND BMCSA blend.
-  # 'guide' alone (v3.3 default) filtered the Pass-2 starting point but
-  # did NOT prevent BMCSA from globally synchronizing K-state K/V on move
-  # voxels at inference time. With 'both', M_attn enters the BMCSA gate
-  # composition as an independent semantic gate.
-  attn_m_apply_at: both
+  # ★ v3.3.3 reverted to 'guide' only. Applying M_attn at BMCSA blend
+  # (multi-gate mode) was a multiplicative attenuator on base voxels —
+  # any K-state semantic ambiguity at edges multiplied M_eff down,
+  # hurting base extraction. 'guide'-only keeps M_attn as a Pass-2
+  # starting-point filter (where it works as intended) without
+  # interfering with the K-state averaging in BMCSA blend.
+  attn_m_apply_at: guide
   # Synthetic-test sweep (separation Δ=shell-drawer):
   #   thresh=0.5, tau=0.10 → Δ=0.24  (too loose, drawer M_attn=0.75)
   #   thresh=0.7, tau=0.05 → Δ=0.86  (recommended default)
@@ -180,10 +185,133 @@ stage_b_sdedit:
   # by the multi-gate product: even if M_dynamic saturates, M_motion -> 0
   # on move voxels and the product kills sharing there.
   M_compute_mode: dynamic                 # 'dynamic' (default) | 'static' (ablation)
+  # ★ v3.3.4 (2026-05-23 post-critical-thinking pass): dynamic-M signal source.
+  # Old default ('cosine' on L2-normalised 8-ch prev_x_0_pred) saturated to
+  # ~0.998 universally (stageB.md Problem 2). Root cause: L2-normalize per-
+  # token discards the latent MAGNITUDE which is the strongest base/move
+  # discriminator (occupied voxels have much larger SS-latent norm than
+  # empty voxels). At intermediate Pass-2 t in (0, 0.5], K-state Tweedie
+  # estimates under shared noise are also direction-near-collinear, so the
+  # remaining cosine signal is wiped out.
+  #
+  # 'variance' (new default): un-normalised cross-state log-variance + in-
+  # batch quantile sigmoid. Identical math to SCAR.compute_tweedie_variance_mask
+  # which is already empirically validated as a Pass-1 mask. Preserves
+  # magnitude, auto-adapts per sample (no global magic threshold).
+  # 'cosine' kept as ablation.
+  M_dynamic_signal: variance              # 'variance' (default, v3.3.4) | 'cosine' (legacy)
+  # variance-path knobs (effective when M_dynamic_signal=variance)
+  var_percentile: 0.65                    # log-variance quantile for sigmoid center
+  var_eta: 0.5                            # sigmoid sharpness in log-variance space
+  # cosine-path knobs (effective when M_dynamic_signal=cosine, legacy)
   tau_M_dynamic: 0.7                      # sigmoid center for 8-channel x_0_pred cosine
   kappa_M_dynamic: 0.05                   # sigmoid sharpness
   capture_dynamic_M: true                 # log per-step per-block M_eff for diagnostics
-  use_motion_corridor: true               # ★ v3.3.2 Gate 3 (NEW)
+  # ★ v3.3.4 re-enabled: motion corridor is now the DECISIVE gate selecting
+  # between K/V-averaged y_shared and per-state y_self. The v3.3.2 base-
+  # attenuation bug came from MULTIPLICATIVE composition M_eff = M_base ×
+  # M_attn × (1-M_motion) × M_dyn (any low gate cascaded the others down at
+  # edges). v3.3.4 redesigns the composition to use M_base as a SAFETY
+  # FLOOR (capping M_move down where base is confident) instead of as a
+  # multiplicative term, plus a kv_floor K-redundancy floor (next block).
+  # Re-enabling motion corridor is what restores the "drawer above floor"
+  # physical realism observed in v3.3.2 s2/s4 but lost in v3.3.3.
+  use_motion_corridor: true               # ★ v3.3.4 ON (was false in v3.3.3, true in v3.3.2)
+
+  # ★ v3.3.4 Plan C+ (2026-05-24): motion corridor SOURCE.
+  # 'enhanced': OR-compose 3 cross-state signals:
+  #   A) occupancy footprint*(1-shared)  (from soft_p1; weakened by SCAR)
+  #   B) z_final 8-d cross-state variance (16^3 -> 64^3 trilinear)
+  #   C) dit_hidden 1024-d cross-state variance at block 14/16/18
+  #      avg (16^3 -> 64^3); requires scar.capture_dit_hidden=true
+  # 'occupancy_only' (legacy v3.3.4 v1): source A only.
+  #
+  # ★ v3.3.4 v2 reverted to 'occupancy_only' (2026-05-24, post Plan C+ test):
+  # Plan C+ multi-source OR-composition was empirically REJECTED — sources
+  # B and C over-saturated to ~1 at 99% of object voxels (1024-d hidden
+  # variance is structurally large everywhere), making M_motion_enhanced
+  # essentially uniform. Combined with v3.3.4's M_base safety floor
+  # (M_move *= (1 - M_base)), this KILLED the per-state signal at the
+  # very base-motion boundary where physical detail would show, because
+  # cabinet floor voxels have HIGH M_base AND HIGH M_motion -> M_move = 0 ->
+  # full K-averaging -> drawer stuck to cabinet floor (the TRELLIS prior).
+  # Plan C+ direction was wrong: stronger motion alone cannot override
+  # v3.3.4 base safety floor at the base-motion BOUNDARY where physical
+  # realism manifests. See diagnostic comparison v1 vs v2 in critical-
+  # thinking session 2026-05-24. Plan C+ code retained as ablation
+  # ('enhanced' switch) for AAAI ablation table.
+  motion_corridor_source: occupancy_only  # ★ v3.3.4 v2 reverted from 'enhanced'
+  motion_zfinal_percentile: 0.55          # source B sigmoid center quantile (when enhanced)
+  motion_zfinal_eta: 0.5                  # source B sigmoid sharpness
+  motion_hidden_percentile: 0.55          # source C sigmoid center quantile
+  motion_hidden_eta: 0.5                  # source C sigmoid sharpness
+
+  # ★ v3.3.4 K-redundancy floor (s3-loss mitigation).
+  # v3.3.2 had per-state branches in corridor with ~100% y_self -> single-
+  # state TRELLIS instability (e.g. s3 corruption) had no K backup. kv_floor
+  # forces M_move <= 1 - kv_floor at every voxel, so K/V averaging always
+  # contributes at least kv_floor fraction. Trades a small amount of
+  # physical-realism preservation for cross-state robustness against
+  # single-state failures.
+  kv_floor: 0.2                           # ★ v3.3.4 NEW (default: 20% K-redundancy)
+
+  # ★ v3.3.5 (2026-05-24): default-per-state K-share composition.
+  # Reverse-engineered from v3.3.2 outputs/30857/stageb_3.3.2 BMCSA gate
+  # analysis. v3.3.2 dynamic-M was saturated to 1 (the cosine bug we identified)
+  # which made M_eff = M_base * M_attn * (1-M_motion) * 1 ~= 0 at 99% voxels
+  # because M_base mean was 0.012. The accidental "M_eff ~= 0 everywhere"
+  # gave per-state attention to 99% of tokens, preserving per-state c_k
+  # driven geometry (drawer z=37 above cabinet z=36, the user-observed
+  # physical effect).
+  #
+  # v3.3.4 v1/v2 inverted this default: M_move = motion * (1 - M_base)
+  # forced M_move=0 at cabinet floor (where M_base*M_motion both high) ->
+  # K-share dominant at the very location where physical detail emerges
+  # -> drawer fused to cabinet floor.
+  #
+  # v3.3.5 restores v3.3.2's default-per-state behaviour WITHOUT the cosine
+  # saturation bug:
+  #   P_definite_base = M_base * (1 - M_motion_combined)
+  #   M_move = 1 - alpha * P_definite_base
+  # At true base far from motion (M_base=1, motion=0): M_move=0.1 -> 90% K-share
+  # At cabinet floor with motion (M_base=1, motion=0.9): M_move=0.91 -> ~per-state
+  # At motion corridor far from base: M_move=1 -> per-state
+  # alpha=0.9 matches v3.3.2's effective K-share strength at confident base.
+  base_kshare_alpha: 0.9                  # ★ v3.3.5 NEW (0=ignore M_base, 1=hard K-share at base)
+                                          # Only effective when bmcsa_composition=v335.
+
+  # ★★★ v3.3.6 FINAL (2026-05-24): Stage B locked design.
+  # After 4 iterations (v3.3.2 / v3.3.3 / v3.3.4 / v3.3.5), the empirically
+  # validated final composition is v3.3.4 motion-aware safety floor:
+  #
+  #   M_motion_combined = max(M_motion_static, M_motion_dynamic)
+  #   M_move = M_motion_combined * (1 - M_base_geom)
+  #   M_move = clamp(M_move, 0, 1 - kv_floor)
+  #
+  # PRODUCTION DEFAULT = 'v334'. Reasoning:
+  #   - Base completeness: STRONG (M_move=0 at confident base -> full K-share)
+  #   - Base/move separation: CLEAR (Plan C+ verified 943x signal strength
+  #     but no visible benefit; v3.3.5 default-per-state likewise no benefit)
+  #   - Physical drawer-above-cabinet effect: NOT achievable at BMCSA level
+  #     in this framework (gave up after v3.3.5; left as future work for
+  #     Stage C/D mesh post-process)
+  #
+  # ABLATIONS (for AAAI paper Table):
+  #   'v335': default-per-state composition (reverse-engineered from
+  #           v3.3.2 dynamic-M cosine saturation accident). Same empirical
+  #           output as v334 on 30857 but different theoretical framing.
+  #
+  # CONFIGURATION COMPATIBILITY (FINAL, all flags below are AT FINAL VALUES):
+  #   scar.mix_space: z_t           (v4.3-validated)
+  #   M_compute_mode: dynamic       (use dynamic-M)
+  #   M_dynamic_signal: variance    (F1, fixed cosine saturation)
+  #   var_percentile: 0.65, var_eta: 0.5  (F1 sigmoid params)
+  #   use_motion_corridor: true     (motion gate active)
+  #   motion_corridor_source: occupancy_only  (Plan C+ off; enhanced as ablation)
+  #   attn_m_apply_at: guide        (M_attn at guide only, not BMCSA)
+  #   kv_floor: 0.2                 (s3-loss safety)
+  #   bmcsa_composition: v334       (THIS DEFAULT)
+  bmcsa_composition: v334                 # ★★★ v3.3.6 FINAL ('v334' | 'v335' ablation)
 
   # ---- v3 legacy (ignored when mode=bmcsa) ----
   # Which states v3 replaces with Pass 2 output (middles kept from Pass 1).

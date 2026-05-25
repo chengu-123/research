@@ -20,6 +20,8 @@
 > 15. **(M3) Bootstrap 删 B7 (SLAT sampler on U_seed)**：13 步 → 12 步；B7 输出 z_slat0_seed 从未被下游使用 (B8 用 z_final，B10 在 U_object 上重采 SLAT 直接覆盖)
 > 16. **(NEW.1) Canonical state = s_c (c=2 默认)**：phi 序列零点从 s_0 移到 s_c。Bootstrap B7 joint init 输出 φ_0 后做 `φ_0 -= φ_0[c]`；Stage D inner loop 在 cumsum + normalize 后做 `u_shifted = u - u[c]`，`phi_render_rev/pri = u_shifted × {theta_max, disp_max}` 可正可负。**Motivation**：TRELLIS 在 s_0 闭合态对 move 几何 underrep (DINOv2 cond 信息少 → SS-DiT 重建偏小)；s_2 半开 drawer 暴露 front face + 部分侧面 → canonical move 重建更稳。**L_first 仍 anchor frame 0 = s_0_with_carpet 真实输入**（不损失真实数据 anchor 强度）。c=2 固定，不自动选 (per-instance auto-select 留作 future work)。
 > 17. **(Q1 增强) B6 加 `O_init_max` 兜底**：`U_seed = {O_mean > 0.3} ∪ {O_max > 0.5} ∪ boundary_band`。原因：大平移 / state 间不重叠时 mean(z_final) 解码出的 trajectory 概率会跌出 boundary band (0.1-0.3) → mean only 漏 voxel；O_max（per-state decode 后 voxel-wise max）兜底"至少一个 state 强占据"的位置。代价：6 次 SS-VAE decode（Bootstrap 一次性）。
+> 18. **(NEW.1-consistency) Bootstrap B9 SLAT cond 改用 `trellis_cond_k[CANONICAL_STATE_IDX]`**：原版用 [0]，与 canonical=s_2 不一致（xyz_canon 受 cond 牵引聚集在 s_0 几何，但 phi_shift 要求 xyz_canon ≈ s_2 几何）。修复后 SLAT 真正在 s_2 状态条件下采样，xyz_canon 与 NEW.1 canonical 约定 self-consistent。trellis_cond_k 全部源自 wan_video_target 抽帧，换索引不引入额外 hallucination；frame 8 (= state 2) 暴露的几何比 frame 0 多，SLAT 重建质量更高。
+> 19. **(Camera) Stage D 默认相机 = FreeArt3D 渲染相机 + iter-0 IoU 自检**：从 `pipelines/render.py:run_rendering()` 提取硬编码 Blender 相机参数（fov=45°，azi=22.5°，ele=45°，distance=2.1·object_scale，**+Z up**）注入 `StageDCameraConfig.freeart3d_canonical()`；新增 `fov_y_deg` 字段处理 stage_a LANCZOS 800×800→480×832 拉伸（保 45/45° 方 FoV 渲到 480×832 非方 pixel grid）。**TRELLIS canonical world up = +Z** 由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(..., [0,0,1])` 直接确认，**与 Blender 完全一致**，无需坐标系转换；以前的 `world_up_axis` 二元 knob 已删除（没有正确性 ablation 必要）。训练 iter 0 加 silhouette IoU 自检（render frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError` + 修复指引，diag PNG 写到 `viz/iter_0_camera_diag.png`）。Real photo 输入超出 v1 实验集范围（需用户自己提供 camera）。
 > 18. **(NEW.2) Stage A 默认分辨率切到官方 480P 横屏 (H=480, W=832)**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B SUPPORTED_SIZES（官方仅 720×1280 / 1280×720 / 480×832 / 832×480 四档），off-distribution area scale → W-RFSDS 用 Wan DiT 时 v_pred 不可靠 (核心创新 2 失效)。改成官方 (480, 832) 后：lat_h=60, lat_w=104, z_wan_target=[16, 6, 60, 104]，wan_video_target_3FHW=[3, 21, 480, 832]，seq_len = 6·60·104/(2·2) = 9360。Stage D backward 计算开销相对旧默认 ↑2.71×（H800 单卡 P1 5000 iter ~7h → ~19h，可接受）。`pipelines/stage_a_wan.py` 新增 SUPPORTED_SIZES 硬校验，不在官方列表的 (H, W) 直接 ValueError。
 
 ---
@@ -608,6 +610,9 @@ if not background_static_check(wan_video_target_3FHW):
 bootstrap/
   z_s0.pt                       [1, 8, 16, 16, 16]
   z_slat0.pt                    [N_obj, 8]   post-norm
+  slat_mean.pt                  [8]   SLAT post-norm mean (★ v3.3.1 added: Stage D / F P2 tanh reparam needs it standalone, so D doesn't need to reload TRELLIS just for this 8-vector)
+  slat_std.pt                   [8]   SLAT post-norm std  (★ v3.3.1 added: same reason; from paper/TRELLIS/configs/.../slat_flow_img_dit_L_64l8p2_fp16.json normalization config)
+  slat_shell_mask.pt            [N_obj] bool  (★ v3.3.1 added: uncertain shell voxels in U_object for L_shell_sparse, computed from boundary_band ∩ U_object)
   dit_hidden_cache.pt           {14, 16, 18}: [1, 4096, 1024]   diagnostic
   O_init.npy                    [1, 1, 64, 64, 64]
   M_attn_boot_64.npy            [64, 64, 64]
@@ -615,7 +620,7 @@ bootstrap/
   U_object.npy                  [N_obj, 3]    int32
   gaussian_parent_idx.npy       [N_gauss]     int32  (verified from D_GS output)
   psi_0.json
-  phi_0.npy                     [6]
+  phi_0.npy                     [6]   ★ canonical-shifted (phi_0[CANONICAL_STATE_IDX]=0 per NEW.1)
   anchors_object.npy            [N_a, 3]
   trellis_cond_can.pt           [1, N_dino, 1024]
   wan_cond_cached.pt            dict (context, context_null, seq_len, y, ...)
@@ -703,6 +708,15 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     U_object_xyz = unique_voxels(torch.cat([U_seed, corridor, anchor_band], dim=0))
     
     # ===== B9: SLAT sampler on U_object (★ 唯一一次 SLAT 采样, M3 修后) =====
+    # ★ v3.3.2 NEW.1-consistency fix: SLAT 采样的 cond 必须与 canonical state c
+    # 一致。SLAT decoder 把 cond 当作 "image evidence", D_GS 解出来的
+    # xyz_canon 自然朝该 cond 所表示的几何状态聚集. canonical=s_c 想成立,
+    # 必须用 trellis_cond_k[c] 而不是 trellis_cond_k[0]; 否则 xyz_canon ≈
+    # s_0 几何, 与 canonical=s_c 的 phi_shift 设计相矛盾, 优化时 ψ 被迫
+    # 浪费 capacity 去 bridge 这个内部 inconsistency.
+    # trellis_cond_k[c] 来源依然是 wan_video_target 抽帧 -> DINOv2 of
+    # state c (默认 c=2, 即 wan_video_target frame 8), 暴露的几何比
+    # state 0 的闭合态更多, SLAT 重建质量更好.
     U_object_with_batch = add_batch_col(U_object_xyz)
     z_slat_raw_obj = slat_sampler.sample(
         slat_flow_model,
@@ -710,7 +724,8 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
             feats=torch.randn(len(U_object_xyz), slat_flow_model.in_channels, device=device),
             coords=U_object_with_batch,
         ),
-        cond=trellis_cond_k[0], neg_cond=neg_trellis_cond,
+        cond=trellis_cond_k[CANONICAL_STATE_IDX],        # ★ v3.3.2: c=2 not 0
+        neg_cond=neg_trellis_cond,
         steps=25, cfg_strength=7.5, verbose=True,
     ).samples
     z_slat0 = z_slat_raw_obj.feats * slat_std + slat_mean
@@ -739,10 +754,38 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     z_wan_target = wan_vae.encode([wan_video_target_float01 * 2.0 - 1.0])[0].detach()
     # z_wan_target: [16, 6, 60, 104]
     
+    # ===== B12.5: ★ v3.3.1 added — derived artifacts for Stage D / F =====
+    # slat_mean / slat_std are the SLAT post-norm constants used at L711 above.
+    # They come from the TRELLIS pipeline's normalization config (see
+    # paper/TRELLIS/configs/generation/slat_flow_img_dit_L_64l8p2_fp16.json
+    # "normalization" block, "mean" and "std" each length 8). Stage D/F P2's
+    # tanh reparameterization
+    #     z_slat = z_slat_init + 3.0 * slat_std * tanh(delta_z)
+    # needs them as standalone tensors so Stage D can start without reloading
+    # the TRELLIS pipeline just to fetch these 8-vectors. Saving them adds
+    # ~64 bytes per object.
+    #
+    # slat_shell_mask: per-voxel bool flag for L_shell_sparse (method.md
+    # D-v3.14): voxels whose mean(z_final)-decoded occupancy falls in the
+    # boundary band (0.1, 0.3), restricted to U_object and excluding carpet.
+    # These are the "uncertain shell" voxels that we encourage to die via the
+    # shell-sparsity term during P1 main_g1.
+    U_flat_idx = (
+        U_object_xyz[:, 0].long() * 64 * 64
+        + U_object_xyz[:, 1].long() * 64
+        + U_object_xyz[:, 2].long()
+    )                                                       # [N_obj]
+    O_at_U = O_init.view(-1)[U_flat_idx]                    # [N_obj]
+    carpet_at_U = is_carpet_mask[U_flat_idx]                # [N_obj] bool
+    slat_shell_mask = (O_at_U > 0.1) & (O_at_U < 0.3) & (~carpet_at_U)
+    
     # ===== Save all =====
     save_to_disk({
         'z_s0': z_s0,
         'z_slat0': z_slat0,
+        'slat_mean': slat_mean,                              # ★ v3.3.1 [8]
+        'slat_std':  slat_std,                               # ★ v3.3.1 [8]
+        'slat_shell_mask': slat_shell_mask.cpu().numpy(),    # ★ v3.3.1 [N_obj] bool
         'dit_hidden_cache': dit_hidden_cache,
         'O_init': O_init.cpu().numpy(),
         'M_attn_boot_64': M_attn_boot_64.cpu().numpy(),
@@ -1685,9 +1728,16 @@ def commit_type_or_dual_clone(p_type_avg, confidence, p1_state, learnable, boots
 
 ---
 
-## 11. Stage F — Texture (v3.2: 直接优化 canonical `z_slat` Parameter)
+## 11. Stage F — Texture (v3.3.2: D_GS-output gradient biasing + ARAP-style spatial smoothness; v3.3.1 S4 tanh reparam 基础上)
 
-### 11.1 唯一可学参数（★ v3.3.1 S4 修：tanh reparameterization）
+> **v3.3.2 工程要点**（与 method.md §11 v3.3.2 增量节对应）：
+> 1. **D_GS-output gradient biasing**（method.md §11.7）：在 `gauss_can = d_gs(...)` 之后立即用 `scale_grad` 包住 `_xyz / _scaling / _rotation / _opacity`，`_features_dc` (SH₀) 不动。`α_geom` 从 cfg 取（default 0.1），扫 ablation [0.0, 0.05, 0.1, 0.2, 0.5, 1.0]。
+> 2. **ARAP-style spatial smoothness on delta_z**（method.md §11.10）：P2 init 时 `precompute_knn_indices(U_object, k=6)` 一次性算 KNN，主循环加 `L_delta_smooth = delta_z_smoothness_loss(...)` (Gaussian-weighted L2 on neighbor diff)，权重 0.5。
+> 3. **Ablation 矩阵纳入 §15 sanity check list**（4-run A1-A4 + 6-value ALPHA_GEOM 扫 + 5-value L_smooth 权重扫）。
+>
+> 不变项：tanh reparameterization (S4) / 单 branch render (S3) / type committed at P1 end / drift monitor (仅 logging) / anchor 三段 confidence-aware weights。
+
+### 11.1 唯一可学参数（★ v3.3.1 S4 修：tanh reparameterization；v3.3.2 不变）
 
 ```python
 # ★ v3.3.1 S4: 学的是 delta_z (residual in tanh-space), 不是 z_slat 本身
@@ -1724,7 +1774,7 @@ type_hard = bootstrap.type_hard                       # bool, fixed for entire P
 # Δz_s, adapter, H_sup, H_part, H_joint 全部 not trainable
 ```
 
-### 11.3 Inner loop（★ v3.3.1 S3 单 branch + S4 tanh reparam）
+### 11.3 Inner loop（★ v3.3.1 S3 单 branch + S4 tanh reparam；v3.3.2 加 gradient biasing + L_delta_smooth）
 
 ```python
 # ★ S4: optimizer 跑在 delta_z 上 (不是 z_slat)
@@ -1734,6 +1784,11 @@ lr_scheduler = CosineAnnealingLR(optimizer, T_max=N_p2, eta_min=1e-5)
 # ★ S3: type committed → T_list 全 P2 不变, 可一次性 cache 21 个 SE(3) 矩阵
 T_list = [SE3_rollout(ψ_pred_p1, phi_render_p1[k], type_hard) for k in range(21)]
 
+# ★ v3.3.2: ARAP-style smoothness 需要 KNN, 一次性算 (U_object 全 P2 不变)
+knn_idx, knn_dist_sq = precompute_knn_indices(
+    bootstrap.U_object, res=64, k=6,
+)    # 各 [N_obj, 6]; cost ~50ms; 整个 P2 复用
+
 for it in range(N_p2):
     # ===== ★ S4: reparameterize z_slat (manifold-bounded) =====
     z_slat = z_slat_init + 3.0 * slat_std_safe.view(1, -1) * torch.tanh(delta_z)
@@ -1741,6 +1796,15 @@ for it in range(N_p2):
     # ===== forward: D_GS 解码 canonical Gaussians (every iter, no detach) =====
     sparse_in = SparseTensor(z_slat, bootstrap.U_object_with_batch)
     gauss_can = d_gs(sparse_in)[0]    # ★ 全通道 grad 回流到 z_slat 再到 delta_z
+    
+    # ===== ★ v3.3.2: D_GS-output gradient biasing (method.md §11.7) =====
+    # 几何属性的反向梯度按 alpha_geom 缩放; SH₀ 保持 full grad.
+    # Forward 100% identity (loss 数值不变); 不引入新可学参数.
+    gauss_can._xyz      = scale_grad(gauss_can._xyz,      cfg.p2_alpha_geom)   # default 0.1
+    gauss_can._scaling  = scale_grad(gauss_can._scaling,  cfg.p2_alpha_geom)
+    gauss_can._rotation = scale_grad(gauss_can._rotation, cfg.p2_alpha_geom)
+    gauss_can._opacity  = scale_grad(gauss_can._opacity,  cfg.p2_alpha_geom)
+    # gauss_can._features_dc (SH₀) 不动, 保持 full grad
     
     # ===== 21-frame render with frozen joint, single branch (★ S3) =====
     rgb_T3HW = render_21_with_warp(
@@ -1779,6 +1843,12 @@ for it in range(N_p2):
     L_move_smooth      = (move_conf  * delta_z_sq_per_voxel).mean()
     L_uncertain_anchor = (uncertain  * delta_z_sq_per_voxel).mean()
     
+    # ★ v3.3.2: ARAP-style spatial smoothness on delta_z (method.md §11.10)
+    # Gaussian-weighted 邻域差分平方; 抑制 D_GS 解码后 voxel-邻域 SH₀ 高频 speckle.
+    L_delta_smooth = delta_z_smoothness_loss(
+        delta_z, knn_idx, knn_dist_sq, sigma=cfg.p2_smooth_sigma,    # default 1.0/64
+    )
+    
     # ★ S4: anchor 权重显著降低 (tanh 已提供硬上界, 软正则只作 prior)
     loss = (
         0.2 * L_sds + 1.0 * L_lat_rec + 1.0 * L_rgb_rec
@@ -1786,6 +1856,7 @@ for it in range(N_p2):
       + 3.0  * L_base_anchor          # ★ v3.3.1: 10.0 → 3.0
       + 0.05 * L_move_smooth          # ★ v3.3.1: 0.1 → 0.05
       + 0.3  * L_uncertain_anchor     # ★ v3.3.1: 1.0 → 0.3
+      + 0.5  * L_delta_smooth         # ★ v3.3.2 NEW (ARAP-style 邻域)
     )
     loss.backward()
     optimizer.step()
@@ -1808,11 +1879,11 @@ for it in range(N_p2):
             logger.warning(f"tanh_sat={tanh_sat:.2%} > 30%; 3σ 上界可能太紧, 参考 ablation 调大 tanh scale 3.0→4.0")
 ```
 
-### 11.4 关键 implementation 约束（★ v3.3.1 S4 更新）
+### 11.4 关键 implementation 约束（★ v3.3.2 更新）
 
 ```
 ✓ gauss_can = d_gs(sparse_in)[0] — NOT .detach()
-✓ delta_z 是 nn.Parameter, requires_grad=True
+✓ delta_z 是 nn.Parameter, requires_grad=True (唯一可学参数, v3.3.2 不变)
 ✓ z_slat 由 z_init + 3·std·tanh(delta_z) 派生, 全程可微
 ✓ z_slat_init 是 .clone().detach(), 不变
 ✓ slat_std_safe = bootstrap.slat_std.clamp_min(1e-3), 不变
@@ -1821,9 +1892,135 @@ for it in range(N_p2):
 ✓ rgb backward 全通道 → gauss_can → z_slat → tanh → delta_z, 完整链路
 ✓ 21 个 state 的梯度 PyTorch 自动 sum 到同一份 delta_z
 ✓ 导出时 D_Mesh 用同一公式: z_slat = z_init + 3·std·tanh(delta_z_final)
+
+★ v3.3.2 新增约束:
+✓ scale_grad 必须在 gauss_can 用于 render 之前 apply (否则 backward chain 已建无法修改)
+✓ scale_grad 只对 _xyz / _scaling / _rotation / _opacity 应用, _features_dc (SH₀) 不动
+✓ Forward 100% identity (loss 数值, render 像素值不变); 反向梯度被缩放
+✓ alpha_geom 默认 0.1, 从 cfg.p2_alpha_geom 读, ablation 必扫
+✓ knn_idx / knn_dist_sq 在 P2 init 一次性算, 不能每 iter 重算 (浪费 ~50ms)
+✓ L_delta_smooth 在 latent space (delta_z) 上做, 不在 Gaussian SH₀ 上做 (避免额外 backward path through D_GS)
+✓ p2_smooth_sigma 默认 1.0/64 (一个 voxel 边长 in world units)
+✓ 不引入新可学参数 (delta_z 仍是唯一; 不让 Gaussian 参数变可学)
 ```
 
-### 11.5 Provenance map
+### 11.5 D_GS-output gradient biasing 工程要点（★ v3.3.2 新增）
+
+method.md §11.7 给设计动机，本节给落地细节。
+
+```python
+# pipelines/stage_d/grad_utils.py  (or stage_f/)
+import torch
+
+class _ScaleGrad(torch.autograd.Function):
+    """Forward identity; backward scales gradient by ctx.alpha."""
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = float(alpha)
+        return x
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.alpha, None    # None for alpha (non-tensor)
+
+
+def scale_grad(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Apply alpha-scaling on backward; forward is identity (returns x unchanged)."""
+    return _ScaleGrad.apply(x, alpha)
+```
+
+**调用约定**：
+```python
+gauss_can = d_gs(sparse_in)[0]              # frozen D_GS forward
+# ★ 立即用 scale_grad 包住几何属性 (写回 _xyz 等 raw attr, 不写 get_xyz)
+gauss_can._xyz      = scale_grad(gauss_can._xyz,      cfg.p2_alpha_geom)
+gauss_can._scaling  = scale_grad(gauss_can._scaling,  cfg.p2_alpha_geom)
+gauss_can._rotation = scale_grad(gauss_can._rotation, cfg.p2_alpha_geom)
+gauss_can._opacity  = scale_grad(gauss_can._opacity,  cfg.p2_alpha_geom)
+# gauss_can._features_dc (SH₀) 不动, 后续 render 通过 get_xyz / get_opacity 等 property 访问.
+# Property layer 会再做 aabb scaling / sigmoid, 不影响 grad path (单 elementwise op).
+```
+
+**为什么写 `._xyz` 而不是 `.get_xyz = ...`**：
+- `get_xyz` 是 property（含 aabb scaling: `_xyz * aabb[3:] + aabb[:3]`），不能被 setattr
+- `_xyz` 是底层 nn.Parameter / Tensor，可 setattr
+- 后续 render 调用 `gauss_can.get_xyz` 时 property 重新算 `_xyz_scaled * aabb_scale + aabb_offset`，scale_grad hook 已埋在 `_xyz` 里，梯度通过 property 的 elementwise op 反向时被正确缩放
+
+**梯度比例监控**（每 100 iter）：
+```python
+if it % 100 == 0:
+    # 不在前向加 hook (会影响 grad 累积), 用 autograd.grad 离线探测一次
+    with torch.enable_grad():
+        z_slat_probe = z_slat_init + 3.0 * slat_std_safe.view(1,-1) * torch.tanh(delta_z.detach().clone().requires_grad_())
+        # ... (一个小 probe forward, 不保留 graph)
+    # 实操简化: 直接读 delta_z.grad 在某 iter 的 norm, 比较 SH₀-only vs full pipeline
+    logger.info(f"P2 it={it} alpha_geom={cfg.p2_alpha_geom} delta_z.grad_norm={delta_z.grad.norm():.4e}")
+```
+
+### 11.6 ARAP-style spatial smoothness 工程要点（★ v3.3.2 新增）
+
+method.md §11.10 给设计动机，本节给落地细节。
+
+```python
+# pipelines/stage_d/p2_losses.py  (or stage_f/)
+import torch
+from .feature_sample import voxel_to_world
+
+@torch.no_grad()
+def precompute_knn_indices(U_object_xyz: torch.Tensor, res: int = 64, k: int = 6):
+    """One-time at P2 init; U_object 不变, 整个训练复用.
+    
+    Args:
+        U_object_xyz: [N_obj, 3] int voxel coords in [0, res)
+        res: voxel grid resolution (default 64)
+        k: number of nearest neighbors (default 6 for face-adjacent)
+    
+    Returns:
+        knn_idx       : [N_obj, k] long, k nearest neighbor voxel indices (排除自身)
+        knn_dist_sq   : [N_obj, k] float, 对应世界空间平方距离
+    """
+    coords_world = voxel_to_world(U_object_xyz, res=res)        # [N_obj, 3] in (-0.5, 0.5)
+    dist = torch.cdist(coords_world.float(), coords_world.float())   # [N_obj, N_obj]
+    dist.fill_diagonal_(float('inf'))                            # 排除自身
+    knn_dist, knn_idx = dist.topk(k, largest=False)              # 各 [N_obj, k]
+    return knn_idx, knn_dist.pow(2)
+
+
+def delta_z_smoothness_loss(
+    delta_z: torch.Tensor,           # [N_obj, 8]
+    knn_idx: torch.Tensor,            # [N_obj, k]
+    knn_dist_sq: torch.Tensor,        # [N_obj, k]
+    sigma: float = 1.0/64,            # Gaussian kernel std in world units
+) -> torch.Tensor:
+    """
+    L_smooth = mean_i mean_k [ w_ij * mean_c(||delta_z_i - delta_z_j||^2) ]
+    w_ij = exp(-||p_i - p_j||^2 / (2 sigma^2))
+    """
+    weights = torch.exp(-knn_dist_sq / (2 * sigma * sigma))      # [N_obj, k]
+    neighbors = delta_z[knn_idx]                                  # [N_obj, k, 8]
+    diff_sq = (delta_z.unsqueeze(1) - neighbors).pow(2).mean(dim=-1)   # [N_obj, k]
+    return (weights * diff_sq).mean()
+```
+
+**关键工程点**：
+- `precompute_knn_indices` 在 P2 init 调用一次，结果 cache 在 P2 训练 state 里
+- `cdist` 在 N_obj = 30k 时占 ~7GB 显存（30k × 30k float），用完即可丢；若 OOM 可改 chunked 计算
+- 默认 `k=6` 对应 voxel 6-邻接结构（front/back/left/right/up/down）；ablation 可扩 `k=26` (face+edge+corner)
+- 默认 `sigma=1.0/64`：一个 voxel 边长，距离 2 voxel 的邻居权重 = `exp(-4/2) ≈ 0.14`，距离 3 voxel 权重 ≈ 0.01（自然截断）
+- 默认权重 0.5；ablation 扫 [0.0, 0.1, 0.5, 1.0, 2.0]
+
+**与 base/move 边界的关系**：
+- base voxel 的 delta_z 被 `L_base_anchor`（权重 3.0）拉向 0
+- 与之相邻的 move voxel 在 smoothness 项作用下也倾向接近 0 → 边界处 move 学得保守
+- 这是想要的行为：边界 voxel 纹理 ambiguous，保守 > 激进
+- 若 ablation 显示边界过保守（move 纹理细节丢失），可在 smoothness 项里乘 `(1 - is_boundary_mask)` 跳过边界（但默认不开）
+
+**与 D_GS 的关系**：
+- smoothness 在 latent space 做（delta_z），不在 Gaussian SH₀ 上做
+- D_GS 是 frozen MLP，相似 latent → 相似 Gaussian → 相似 SH₀ (locally Lipschitz)
+- 这个间接效应是想要的：smoothness 通过 D_GS 自然传到 SH₀，**不需要额外 backward path through D_GS for an SH₀-side loss**
+
+### 11.7 Provenance map
 
 ```python
 @torch.no_grad()
@@ -2191,7 +2388,7 @@ v3.3 不再成立的旧项（应反向）：
 ✗ wan_video_target / s_0_clean / z_wan_target 全 clean → 改：全部含 carpet (一致)
 ```
 
-### 15.10 P2 Texture（★ v3.3.1 S3+S4 重写）
+### 15.10 P2 Texture（★ v3.3.2: 加 gradient biasing + ARAP smoothness; v3.3.1 S3+S4 不变）
 ```
 ✓ P2 唯一可学: delta_z = nn.Parameter(torch.zeros_like(z_slat_init))      # ★ S4
 ✓ Forward 时派生: z_slat = z_slat_init + 3.0 * slat_std.view(1,-1) * tanh(delta_z)   # ★ S4
@@ -2229,6 +2426,33 @@ v3.3 不再成立的旧项（应反向）：
 ✓ supervision_provenance 类别: visible_in_all / visible_in_open / never_visible
 ✓ 不写 "texture source from frame X" 或 "donor fusion" 主张
 ✓ 不再有 type_uncertain / get_p2_render_mode / two_branch_soft 分支 (S3 删除)
+
+★ v3.3.2 新增 (gradient biasing):
+✓ scale_grad 在 gauss_can = d_gs(...) 之后立即 apply, 必须在 render 调用之前
+✓ scale_grad 只对 _xyz / _scaling / _rotation / _opacity 应用, _features_dc (SH₀) 不动
+✓ 写 _xyz 不写 get_xyz (后者是 property, 不可 setattr)
+✓ Forward 100% identity (loss / render 像素值不变); 仅反向梯度被缩放
+✓ alpha_geom 默认 0.1, 从 cfg.p2_alpha_geom 读
+✓ ablation 必扫: alpha_geom ∈ [0.0, 0.05, 0.1, 0.2, 0.5, 1.0] (6 run)
+✓ 不引入新可学参数 (唯一可学仍是 delta_z)
+✓ 与 §11.6 drift monitor 配合: 预期 alpha_geom=0.1 下 xyz_drift_rmse 进一步降低 ~10x
+
+★ v3.3.2 新增 (ARAP-style L_delta_smooth):
+✓ KNN 在 P2 init 时一次性算 (knn_idx, knn_dist_sq), 整个训练复用
+✓ U_object 全 P2 不变是前提; 若 Stage C.5 触发 U expand 必须重算 KNN
+✓ 默认 k=6 (face-adjacent), sigma=1.0/64 (一个 voxel 边长)
+✓ Gaussian-weighted by spatial distance (非均匀), 自然保留 base-move 边界纹理跳变
+✓ L_smooth 在 latent space (delta_z) 做, 不在 Gaussian SH₀ 上做
+✓ loss 权重默认 0.5; ablation 扫 [0.0, 0.1, 0.5, 1.0, 2.0]
+✓ cdist 在 N_obj=30k 时占 ~7GB 显存, 可 chunked 计算; 用完即丢
+
+★ v3.3.2 主 ablation 矩阵 (论文 §4 必跑, 4 run on 同一样本):
+✓ A1 baseline:    L_sds=0.2, L_lat_rec=1.0, L_rgb_rec=1.0, L_first, anchor 全, L_smooth=0.5
+✓ A2 no SDS:      L_sds=0,   L_lat_rec=1.0, L_rgb_rec=1.0, ...  (W-RFSDS 是不是冗余)
+✓ A3 no L_lat:    L_sds=0.2, L_lat_rec=0,   L_rgb_rec=1.0, ...  (L_lat_rec 是不是主导)
+✓ A4 SDS-dominant: L_sds=0.8, L_lat_rec=0,  L_rgb_rec=0.5, ... (W-RFSDS 翻成主导能否成立)
+✓ 判读: A2 显著差于 A1 → W-RFSDS 必要; A4 ≈ A1 或更好 → W-RFSDS 可以主导;
+        若 A2 ≈ A1 → framing 必须降级 (L_lat_rec 是主信号, W-RFSDS 仅 regularizer)
 ```
 
 ### 15.11 v3.3 Staged F resolution / fallback

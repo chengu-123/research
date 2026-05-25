@@ -283,7 +283,7 @@ class SCARSampler(FlowEulerGuidanceIntervalSampler):
         extreme_mix_mode: str = "symmetric",
         w_floor: float = 0.0,
         scar_enabled: bool = True,
-        mix_space: str = "x_0",
+        mix_space: str = "z_t",
     ) -> None:
         super().__init__(sigma_min=sigma_min)
         self.alpha_schedule = tuple(alpha_schedule)

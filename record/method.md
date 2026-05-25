@@ -25,6 +25,8 @@
 > 16. **(伴随 S3) 删除 P2 confidence gate 渲染路径**：P2 inner loop 简化为单 branch。
 > 17. **(NEW.1) Canonical state = s_c（默认 c=2）**：phi 序列零点从 s_0 移到 s_c，即渲染时 `phi_render[c] = 0` 而非 `phi_render[0] = 0`。**Motivation**：TRELLIS 在 s_0 闭合态对 move 部件几何 underrepresent（DINOv2 cond 信息不对称——drawer 完全在 cabinet 内只看到外壳轮廓 → SS-DiT 重建出的"内部 occupancy"偏低 → s_0 实体偏小）；s_2 半开时 drawer 暴露 front face + 部分侧面 → DINOv2 看到更多几何 → canonical move 重建更稳。**L_first 仍 anchor frame 0 = s_0_with_carpet 真实输入**（不损失真实数据 anchor 强度）。**实现**：phi 序列 cumsum + normalize 后做 shift `u_shifted = u - u[c]`，`phi_render_rev/pri = u_shifted × {theta_max, disp_max}` 可正可负（state < c 反向，state > c 正向）。`c = 2` 是 fixed hyperparameter，不自动选（per-instance auto-select c 留作 future work / ablation）。
 > 18. **(Q1 增强) B5 加 `O_init_max` 兜底**：`U_seed = {O_mean > 0.3} ∪ {O_max > 0.5} ∪ boundary_band`，覆盖三种 voxel：mean 高置信主体 ∨ 任一 state 强占据 ∨ mean 中等不确定带。原因：大平移 / K state 间不重叠时 latent-mean 解码出的 trajectory 概率会跌出 boundary band (0.1-0.3) → mean only 漏 voxel；O_max（per-state decode 后 voxel-wise max）兜底"至少一个 state 强占据"的位置。代价：6 次 SS-VAE decode（Bootstrap 一次性，不进训练循环）。
+> 19. **(NEW.1-consistency) Bootstrap SLAT 采样 cond 改用 `trellis_cond_k[CANONICAL_STATE_IDX]`**：旧版本 SLAT sample 用 `cond=trellis_cond_k[0]`（DINOv2 of state 0），但 canonical=s_c=s_2 又指 phi[c]=0，二者冲突 — SLAT decoder 用 s_0 image evidence 解码，xyz_canon ≈ s_0 几何，但 phi_shift 设计要求 xyz_canon ≈ s_2 几何。修复：SLAT cond 与 canonical state 同步，xyz_canon 真正聚集在 s_c 状态附近，T_{c→k} 解出的 frame k 几何无需 ψ 浪费 capacity 去 bridge 内部 inconsistency。trellis_cond_k 全部来自 Wan video 抽帧（包括 [0]），换 [2] 不引入额外 hallucination 来源；frame 8 暴露几何更多 → SLAT 重建更稳。
+> 20. **(Camera convention) Stage D 默认渲染相机 = FreeArt3D rendering 相机**：来源 `mine/pipelines/render.py:run_rendering()` 第 211-285 行硬编码的 Blender 相机：fov=45°（方FoV），azi=π/8=22.5°，elevation=45° (sin(π/4)·distance 推出来)，distance=2.1·object_scale，**+Z up**。**TRELLIS canonical world up = +Z**，由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(orig, [0,0,0], [0,0,1])` 直接证明（line 28-32 球面坐标 `[sin(yaw)cos(pitch), cos(yaw)cos(pitch), sin(pitch)]` 第 3 维 = 高度，与 Blender 完全一致）。无 OpenGL +Y up 转换需求。Stage A LANCZOS-resize 800×800 → 480×832 后 image grid 非正方 pixel：`StageDCameraConfig` 新增 `fov_y_deg: Optional[float]` 字段，`freeart3d_canonical()` 显式设 fov_x=fov_y=45°（square FoV 渲到 480×832 模拟拉伸）。**Stage D 训练循环开头加 iter-0 silhouette IoU 自检**：渲染 frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError`（fail-loud，防止相机不对静默跑废）。Real photo 输入需用户自己提供相机参数（不是 v1 AAAI 实验集设定）。
 > 19. **(NEW.2) Stage A 默认分辨率切到官方 480P 横屏 (H=480, W=832)**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B SUPPORTED_SIZES（仅 720×1280 / 1280×720 / 480×832 / 832×480 四档），是 off-distribution 的 area scale，会让 W-RFSDS 用 Wan DiT 时 v_pred 不可靠（核心创新 2 失效）。改成官方 (480, 832) 后：lat_h=60, lat_w=104, z_wan_target=[16, 6, 60, 104]，wan_video_target_3FHW=[3, 21, 480, 832]，seq_len = 6·60·104/(2·2) = 9360。Stage D backward 计算开销相对旧默认 ↑2.71×（H800 单卡 P1 5000 iter 从 ~7h 涨到 ~19h，可接受）。`pipelines/stage_a_wan.py` 新增 SUPPORTED_SIZES 硬校验，不在官方列表的 (H, W) 直接 ValueError。fast-debug 用 off-distribution 分辨率作 ablation 不进主线。
 
 ---
@@ -717,6 +719,10 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     
     # ===== B8: SLAT sampler on U_object (★ 唯一一次 SLAT 采样) =====
     # 旧 v3 跑过两次 (U_seed 上一次浪费 + U_object 上一次)。M3 删除前者。
+    # ★ v3.3.2 NEW.1-consistency fix: cond 用 trellis_cond_k[CANONICAL_STATE_IDX]
+    # 而不是 [0]. 见 §6 inline 注释 (pipeline.md) 详细动机. 简言之: SLAT decoder
+    # 让 xyz_canon 聚集到 cond 描述的几何状态, canonical=s_c 想真实 self-consistent
+    # 就必须把 cond 也对齐到 c 状态.
     U_object_with_batch = add_batch_col(U_object_xyz)
     z_slat_raw_obj = slat_sampler.sample(
         slat_flow_model,
@@ -724,7 +730,8 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
             feats=torch.randn(len(U_object_xyz), slat_flow_model.in_channels, device=device),
             coords=U_object_with_batch,
         ),
-        cond=trellis_cond_k[0], neg_cond=neg_cond,
+        cond=trellis_cond_k[CANONICAL_STATE_IDX],        # ★ v3.3.2: c=2 not 0
+        neg_cond=neg_cond,
         steps=25, cfg_strength=7.5, verbose=True,
     ).samples
     z_slat0 = z_slat_raw_obj.feats * slat_std + slat_mean
@@ -746,10 +753,34 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     z_wan_target = wan_vae.encode([wan_video_target_3FHW])[0].detach()
     # z_wan_target: [16, 6, 60, 104]
     
+    # ===== B11.5: ★ v3.3.1 added — derived artifacts for Stage D / F =====
+    # slat_mean / slat_std: SLAT post-norm constants (length 8) used above at
+    # `z_slat0 = z_slat_raw_obj.feats * slat_std + slat_mean`. Source: TRELLIS
+    # SLAT VAE normalization config (paper/TRELLIS/configs/generation/
+    # slat_flow_img_dit_L_64l8p2_fp16.json, "normalization" block). Saved so
+    # Stage D / F P2's tanh reparam  z_slat = z_init + 3·slat_std·tanh(delta_z)
+    # can start without reloading the TRELLIS pipeline (~64 bytes overhead).
+    #
+    # slat_shell_mask: per-voxel bool flag for L_shell_sparse (D-v3.14). Voxels
+    # whose mean(z_final)-decoded occupancy is in the boundary band (0.1, 0.3),
+    # restricted to U_object and excluding carpet. These are the "uncertain
+    # shell" voxels we encourage to die via shell-sparsity during P1 main_g1.
+    U_flat_idx = (
+        U_object_xyz[:, 0].long() * 64 * 64
+        + U_object_xyz[:, 1].long() * 64
+        + U_object_xyz[:, 2].long()
+    )                                                       # [N_obj]
+    O_at_U = O_init.view(-1)[U_flat_idx]                    # [N_obj]
+    carpet_at_U = is_carpet_mask[U_flat_idx]                # [N_obj] bool
+    slat_shell_mask = (O_at_U > 0.1) & (O_at_U < 0.3) & (~carpet_at_U)
+    
     # ===== B12: 写盘 =====
     save_to_disk({
         'z_s0': z_s0,
         'z_slat0': z_slat0,
+        'slat_mean': slat_mean,                              # ★ v3.3.1 [8]
+        'slat_std':  slat_std,                               # ★ v3.3.1 [8]
+        'slat_shell_mask': slat_shell_mask.cpu().numpy(),    # ★ v3.3.1 [N_obj] bool
         'dit_hidden_cache': dit_hidden_cache,
         'O_init': O_init.cpu().numpy(),
         'M_attn_boot_64': M_attn_boot_64.cpu().numpy(),
@@ -1589,7 +1620,22 @@ def sample_tau_inverse_cdf_logit_normal(
 
 ---
 
-## 11. 纹理阶段（P2）— **v3.3.1 S4 修：tanh-reparameterized canonical SLAT 残差**
+## 11. 纹理阶段（P2）— **v3.3.2 增量：D_GS-output gradient biasing + ARAP-style spatial smoothness（v3.3.1 S4 tanh reparam 基础上）**
+
+> **v3.3.2 vs v3.3.1 修改要点**（不动 v3.3.1 S4 的核心机制 — tanh reparameterization 保留）：
+>
+> 1. **(★ Risk 1 解) D_GS-output gradient biasing**：在 D_GS 输出端用 `scale_grad` autograd hook 把几何属性（xyz / scale / rotation / opacity）的反向梯度按 `α_geom` (default 0.1) 缩放，SH₀ 保持 full grad。前向 100% identity。
+>    - **动机**：8-d SLAT channel 与 Gaussian 几何/纹理属性是 entangled mapping，无法 channel-level disentangle（D_GS 的 layout 决定，见 `paper/TRELLIS/.../decoder_gs.py:67-79`）。MorphAny3D 的 disentangled morphing 也是在 attention-flag layer 而不是 channel layer 做 disentangle，进一步佐证 channel-level 不可行。
+>    - 既然不能 channel-level disentangle，就改在 **gradient-level disentangle**：让 P2 把"降纹理 loss"的代价大部分摊到 SH₀ 路径，只小部分摊到几何路径 → 几何属性的实际漂移变小。
+>    - 详见 §11.7。
+>
+> 2. **(★ Risk 2 解) ARAP-style spatial smoothness on delta_z**：每个 voxel 与其 KNN (k=6) 邻居的 delta_z 差异做 Gaussian-weighted L2，加入 loss（默认权重 0.5）。
+>    - **动机**：原 §11.5 只有 magnitude anchor（delta_z.pow(2).mean）, 没有邻域光滑性。voxel 邻域间的 delta_z 高频噪声会被 Wan VAE 8x downsample 在 L_lat_rec / L_sds 端 mask 掉，但最终 export 的 atlas 暴露 → SH₀ speckle artifact。
+>    - 灵感来自 CHORD §3.4 ARAP loss（chord.txt:333-355），但简化（我方 delta_z 是 latent residual 不是 SE(3) deformation，不需要 R̂ 估计）。
+>    - U_object 在整个 P2 不变，KNN 与权重在 P2 init 时一次性算好（cost ~50ms），主循环零开销。
+>    - 详见 §11.10。
+>
+> 3. **(★ Risk 3) Ablation 矩阵纳入**：4-run ablation (A1 baseline / A2 no SDS / A3 no L_lat / A4 SDS-dominant) + 6-value ALPHA_GEOM 扫，正式作为论文 §4 必跑项。详见 §11.11。
 
 ### 11.1 核心机制
 
@@ -1729,6 +1775,15 @@ for it in range(N_p2):
     gauss_can = d_gs(sparse_in)[0]
     # 所有 channel 都参与 backward (xyz / scale / rotation / opacity / sh)
     
+    # ----- ★ v3.3.2: D_GS-output gradient biasing (见 §11.7) -----
+    # 几何属性反向梯度按 alpha_geom 缩放; SH₀ (颜色) 保持 full grad.
+    # Forward 100% identity, 不破坏 manifold. 不引入新可学参数.
+    gauss_can._xyz      = scale_grad(gauss_can._xyz,      cfg.p2_alpha_geom)   # default 0.1
+    gauss_can._scaling  = scale_grad(gauss_can._scaling,  cfg.p2_alpha_geom)
+    gauss_can._rotation = scale_grad(gauss_can._rotation, cfg.p2_alpha_geom)
+    gauss_can._opacity  = scale_grad(gauss_can._opacity,  cfg.p2_alpha_geom)
+    # gauss_can._features_dc (SH₀) 不动, 保持 full grad
+    
     # ----- 21-frame render with frozen joint, single branch (★ S3 简化) -----
     rgb_T3HW = render_21_with_warp(
         gauss_can, T_list, g_per_gauss, m_per_gauss, cfg_warp=cfg.warp
@@ -1763,6 +1818,14 @@ for it in range(N_p2):
     L_move_smooth      = (move_conf  * delta_z_sq_per_voxel).mean()
     L_uncertain_anchor = (uncertain  * delta_z_sq_per_voxel).mean()
     
+    # ----- ★ v3.3.2: ARAP-style spatial smoothness on delta_z (见 §11.10) -----
+    # KNN (knn_idx, knn_dist_sq) 在 P2 init 时一次性算 (U_object 全 P2 不变), 整个训练复用.
+    # Gaussian-weighted 邻域差分平方; 抑制 D_GS 解码后 voxel-邻域 SH₀ 高频 speckle
+    # (Wan VAE 8x downsample 会 mask 掉这种噪声, 但最终 atlas 会暴露).
+    L_delta_smooth = delta_z_smoothness_loss(
+        delta_z, knn_idx, knn_dist_sq, sigma=cfg.p2_smooth_sigma,    # default 1.0/64 world unit
+    )
+    
     # ----- total (anchor 权重比 v3.3 降低: tanh 已提供硬上界) -----
     loss = (
         0.2 * L_sds
@@ -1772,6 +1835,7 @@ for it in range(N_p2):
       + 3.0  * L_base_anchor                                    # ★ v3.3.1: 10.0 → 3.0
       + 0.05 * L_move_smooth                                    # ★ v3.3.1: 0.1 → 0.05
       + 0.3  * L_uncertain_anchor                               # ★ v3.3.1: 1.0 → 0.3
+      + 0.5  * L_delta_smooth                                   # ★ v3.3.2 NEW (ARAP-style 邻域)
     )
     loss.backward()
     optimizer.step()
@@ -1845,6 +1909,51 @@ if it % 100 == 0:
 
 AAAI reviewer 若质疑"P2 优化 SLAT 会不会破坏 geometry"，drift monitor + tanh 硬上界 + ablation 三件套是直接回应。
 
+### 11.7 D_GS-output gradient biasing（★ v3.3.2 新增：Risk 1 解）
+
+**Risk 1 重述**：8-d SLAT 通过冻结的 D_GS 解码为 32 个 Gaussian/voxel 的全部 14-d 属性（xyz / scale / rotation / opacity / SH₀），channel mapping 是 entangled 的——不存在"前 N 维管几何、后 8-N 维管纹理"的清晰划分（证据：`paper/TRELLIS/.../decoder_gs.py:67-79` layout table；MorphAny3D `example_disentangled_3Dmorphing.py:50` 的 disentangled morphing 也是在 attention-flag layer 而不是 channel layer 做 disentangle，进一步佐证）。因此 P2 在 delta_z 上学习时，几何属性必然被同步扰动。原 v3.3.1 设计依赖 tanh 硬上界 + drift monitor 限制几何漂移，但**没有主动控制几何梯度强度**。
+
+**v3.3.2 解法**：在 D_GS 输出端注入 gradient-scaling autograd hook。前向 100% identity（loss 数值不变），反向时几何属性的梯度按 `α_geom` (default 0.1) 缩放，SH₀ 路径保持 full grad。这样 delta_z 收到的总梯度 = `α_geom · ∂L/∂(几何属性) + 1.0 · ∂L/∂SH₀`，自然偏向纹理优化方向。
+
+```python
+class _ScaleGrad(torch.autograd.Function):
+    """Forward identity; backward scales gradient by alpha."""
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = float(alpha)
+        return x
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.alpha, None
+
+def scale_grad(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    return _ScaleGrad.apply(x, alpha)
+```
+
+**关键性质**：
+1. **唯一可学参数仍是 delta_z**（[N_obj, 8]），与 v3.3.1 S4 完全一致 — 不引入新可学参数、不让 Gaussian 参数变可学
+2. **前向数值零变化** → render / loss 计算与未启用时完全相同
+3. **反向时梯度被缩放** → delta_z 的更新方向偏向降低纹理 loss，对几何 loss 不太敏感
+4. **不破坏 tanh manifold 约束** → tanh 上界仍生效
+5. **不需要改 anchor 权重** → 与 S4 软正则配合，互不干扰
+
+**ALPHA_GEOM 选择**：
+- 默认 **α_geom = 0.1**
+- 论文 ablation 扫 [0.0, 0.05, 0.1, 0.2, 0.5, 1.0]
+  - 0.0：极端 — 几何梯度完全切断（最强 disentangle，但 D_GS 几何路径完全无 supervise 可能导致 SH₀ 学到 "错位" 颜色）
+  - 1.0：旧设计 — 不 biasing，等价 v3.3.1
+- 监控指标：每 100 iter 记录 `||∂L/∂(geom channels of gauss)||_2` vs `||∂L/∂SH₀||_2`，确认 biasing 在生效
+
+**为什么不在 channel 端 disentangle**：
+- D_GS 是 frozen MLP+conv，8 维输入到 14 维输出的 mapping 是 fully learned 的，**没有解析关系区分"哪一维管几何"**
+- MorphAny3D 也无法在 channel 端 disentangle（他们的 disentangled morphing 走 attention flag 路径，不是 channel split）
+- gradient-level biasing 是唯一干净的实现路径
+
+**与 §11.6 drift monitor 的配合**：
+- v3.3.1 drift monitor 仅 logging（tanh 已硬约束）
+- v3.3.2 加 gradient biasing 后，预期 `xyz_drift_rmse` 会进一步降低（α_geom=0.1 应给 ~10x 降幅）
+- monitor 的 warning 阈值 0.05 仍保留；若启用 biasing 后 drift 仍超阈值，说明 α_geom 太大或 tanh scale 太宽，按 §11.6 ablation 路径调整
+
 ### 11.8 Supervision Provenance map（v3.3 改名 + 收窄 claim）
 
 **关键改动**：v3.2 的 `texture_provenance` 命名暗示纹理来源 (donor source)，但我们没做 donor projection，做不到精确 source 判定。v3.3 改名 `supervision_provenance`，类别只描述 **"该 Gaussian 在多少 state 中可见，因此 supervision 信号来自哪里"**，**不**声称颜色来自某 frame。
@@ -1914,6 +2023,94 @@ lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 ```
 
 无需 lr 分组（只有 delta_z 一个 Parameter）。weight_decay=0 因为：(a) tanh reparameterization 已提供 manifold-aware 硬上界；(b) L_base_anchor 软正则鼓励 base voxel delta_z 接近 0。
+
+### 11.10 Spatial smoothness on delta_z（★ v3.3.2 新增：Risk 2 解，ARAP-style）
+
+**Risk 2 重述**：原 §11.5 的三个 anchor (`L_base_anchor / L_move_smooth / L_uncertain_anchor`) 都是 magnitude 正则 (`delta_z.pow(2).mean(dim=-1)`)，**只约束每个 voxel 的 delta_z 长度，不约束邻域结构**。L_sds + L_lat_rec + L_rgb_rec 是 pixel/latent 空间 loss，对 delta_z 邻域结构没有显式约束。Wan VAE 8x downsample 让高频 voxel-邻域噪声在 L_lat_rec 端不可见，但 D_GS 解码后的 SH₀ 会 voxel-to-voxel 跳变 → 最终 export 的 atlas 出现 speckle。
+
+**v3.3.2 解法**：每个 voxel 与其 KNN 邻居的 delta_z 差异做 Gaussian-weighted L2，加入 loss。灵感来自 CHORD §3.4 ARAP loss（chord.txt:333-355），但因我方 delta_z 是 8 维 latent residual 不是 SE(3) deformation，不需要 R̂ 局部旋转估计 — 简化为纯 L2。
+
+```python
+@torch.no_grad()
+def precompute_knn_indices(U_object_xyz: torch.Tensor, res: int = 64, k: int = 6):
+    """
+    P2 init 时一次性算. U_object 全 P2 不变, 整个训练复用.
+    
+    Returns:
+        knn_idx       : [N_obj, k]  k 最近邻 voxel index (排除自身)
+        knn_dist_sq   : [N_obj, k]  对应的世界空间平方距离
+    """
+    coords_world = voxel_to_world(U_object_xyz, res=res)              # [N_obj, 3]
+    dist = torch.cdist(coords_world, coords_world)                     # [N_obj, N_obj]
+    dist.fill_diagonal_(float('inf'))                                  # 排除自身
+    knn_dist, knn_idx = dist.topk(k, largest=False)                    # 各 [N_obj, k]
+    return knn_idx, knn_dist.pow(2)
+
+
+def delta_z_smoothness_loss(delta_z, knn_idx, knn_dist_sq, sigma=1.0/64):
+    """
+    L_smooth = mean_i mean_k [ w_ij * mean(||delta_z_i - delta_z_j||^2) ]
+    w_ij = exp(-||p_i - p_j||^2 / (2 sigma^2))    Gaussian-weighted by spatial distance
+    """
+    weights = torch.exp(-knn_dist_sq / (2 * sigma * sigma))            # [N_obj, k]
+    neighbors = delta_z[knn_idx]                                       # [N_obj, k, 8]
+    diff_sq = (delta_z.unsqueeze(1) - neighbors).pow(2).mean(dim=-1)   # [N_obj, k], 8 dim 求均值
+    return (weights * diff_sq).mean()
+```
+
+**关键参数**：
+- `k = 6`（典型 voxel 6-邻接结构；可扩到 26-邻接 ablation）
+- `sigma = 1.0/64`（一个 voxel 边长 in world units；远邻居权重快速衰减）
+- loss 权重 = 0.5（初始猜测；ablation 扫 [0.0, 0.1, 0.5, 1.0, 2.0]）
+
+**为什么 Gaussian-weighted 而非均匀**：
+- 远邻居（k=6 中可能包含的 2-3 voxel 距离的邻居）若强制接近会过度平滑跨 base-move 边界
+- Gaussian 权重让近邻强约束、远邻弱约束，自然保留几何边界处的纹理跳变
+
+**不会破坏 base/move 边界**：
+- base voxel 的 delta_z 已被 `L_base_anchor`（权重 3.0）强力拉向 0
+- 与之相邻的 move voxel 的 delta_z 在 smoothness 项作用下倾向接近 0（base 邻居的状态）
+- → 边界附近 move 的 delta_z 学得保守一些（不会被 W-RFSDS 推得太远）
+- 这是想要的行为：边界 voxel 的纹理本来就是 ambiguous，保守是好的
+
+**与 D_GS 的关系**：
+- L_delta_smooth 在 latent space (delta_z) 上做平滑
+- D_GS 是 frozen MLP，对相似的 latent 输入会输出相似的 Gaussian → SH₀ 也会平滑
+- 不直接在 Gaussian SH₀ 上加 smoothness（那会引入额外的 backward path through D_GS）
+
+**计算开销**：
+- KNN precompute: ~50ms one-time (P2 init)
+- per-iter: N_obj × k × 8 ≈ 30k × 6 × 8 = 1.4M flops, 可忽略
+
+### 11.11 Stage F Ablation 矩阵（★ v3.3.2 新增：Risk 3 解 + 论文 §4 必跑）
+
+**Risk 3 重述**：原 §11.5 损失权重 `0.2 * L_sds + 1.0 * L_lat_rec + 1.0 * L_rgb_rec` 表明 L_lat_rec 实际是主导（5x L_sds），W-RFSDS 看起来是辅助。但论文 framing 主张 "CHORD-style W-RFSDS 蒸馏 video prior 到 3D" 是 Stage F 主线 — 若 ablation 显示 W-RFSDS 实际无用（L_lat_rec 单独就够），framing 必须降级。必须实证。
+
+**主 ablation 矩阵（4 run on 同一样本，如 30857）**：
+
+| Run | L_sds | L_lat_rec | L_rgb_rec | L_first | Anchor | L_smooth | 目的 |
+|---|---|---|---|---|---|---|---|
+| **A1 baseline** | 0.2 | 1.0 | 1.0 | 1.0 | 全 | 0.5 | 完整 P2 (v3.3.2 默认) |
+| A2 no SDS | **0** | 1.0 | 1.0 | 1.0 | 全 | 0.5 | W-RFSDS 是不是冗余？ |
+| A3 no L_lat | 0.2 | **0** | 1.0 | 1.0 | 全 | 0.5 | L_lat_rec 是不是主导？ |
+| A4 SDS-dominant | **0.8** | **0** | 0.5 | 1.0 | 全 | 0.5 | W-RFSDS 翻成主导能否成立？ |
+
+**判读规则**：
+- 若 A2 显著差于 A1 → W-RFSDS 必要 ✓
+- 若 A4 ≈ A1 或更好 → W-RFSDS 可以主导 ✓
+- 若 A2 ≈ A1（L_lat_rec 单独已够）→ **W-RFSDS framing 必须降级**，应改写为 "L_lat_rec 是主信号，W-RFSDS 是辅助 regularizer"
+- 若 A3 显著差于 A1（L_lat_rec 关键）AND A4 也差 → 三 loss 互补，不可单独翻 framing
+
+**子 ablation：ALPHA_GEOM 扫**（6-value，独立扫，全部基于 A1 baseline 设置）：
+- α_geom ∈ {0.0, 0.05, 0.1, 0.2, 0.5, 1.0}
+- 报告：每个 α_geom 下的 (xyz_drift_rmse, SH₀ 颜色 PSNR, final atlas SSIM)
+- 期望：α_geom=0.1 处于 sweet spot（几何漂移已显著抑制 + 纹理仍有足够 supervisory signal）
+- 若 α_geom=0 也行（完全切断几何梯度）→ 说明纹理优化与几何属性的耦合可以彻底切断，gradient biasing 简化为 gradient gating
+
+**子 ablation：L_smooth 权重扫**（5-value）：
+- λ_smooth ∈ {0.0, 0.1, 0.5, 1.0, 2.0}
+- 报告：每个权重下的 (SH₀ voxel-邻域 std, final atlas TV norm, edge sharpness)
+- 期望：λ=0.5 提供 anti-speckle 同时保留必要的高频 detail
 
 ---
 
