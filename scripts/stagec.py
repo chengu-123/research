@@ -91,7 +91,9 @@ def main() -> int:
     z_final_path = os.path.join(sb, "z_final.pt")
     if not os.path.isfile(z_final_path):
         raise FileNotFoundError(f"Missing {z_final_path}")
-    z_final = torch.load(z_final_path, map_location=device)
+    # z_final.pt is our own checkpoint (saved by stage_b_scar.run_scar), so
+    # weights_only=False is safe + explicit silences the PyTorch 2.4 FutureWarning.
+    z_final = torch.load(z_final_path, map_location=device, weights_only=False)
     K = int(z_final.shape[0])
     res = int(O_base.shape[-1])
     print(f"[run_stage_c_from_stageb] loaded stage_b/ artifacts: K={K}, res={res}")

@@ -54,14 +54,26 @@ def _check_prompts():
     print("[smoke] prompts OK")
 
 
-def _make_synthetic_static_video(F=21, H=480, W=832, seed=0):
+def test_stage_a_wan_shape_contract_is_strict():
+    stage_a_path = os.path.join(_REPO_ROOT, "pipelines", "stage_a_wan.py")
+    with open(stage_a_path, encoding="utf-8") as f:
+        source = f.read()
+
+    assert "resolution_hw: Tuple[int, int] = (464, 832)" in source
+    assert "_WAN_OUTPUT_TO_SIZE_LABEL" in source
+    assert "expected_hw=(H, W)" in source
+    assert "max_area=wan_max_area" in source
+    assert "Wan output shape mismatch" in source
+
+
+def _make_synthetic_static_video(F=21, H=464, W=832, seed=0):
     rng = np.random.default_rng(seed)
     base = rng.uniform(0.2, 0.8, size=(3, H, W)).astype(np.float32)
     video = np.broadcast_to(base[:, None], (3, F, H, W)).copy()
     return video
 
 
-def _make_synthetic_moving_video(F=21, H=480, W=832, seed=0, shift_per_frame=5):
+def _make_synthetic_moving_video(F=21, H=464, W=832, seed=0, shift_per_frame=5):
     rng = np.random.default_rng(seed)
     base = rng.uniform(0.2, 0.8, size=(3, H, W)).astype(np.float32)
     video = np.zeros((3, F, H, W), dtype=np.float32)

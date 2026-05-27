@@ -119,11 +119,19 @@ def extract_anchors(
     corridor_threshold: float = 0.1,
     base_threshold: float = 0.5,
     dilate_radius: int = 1,
-    target_count: int = 48,
+    target_count: int = 48,                          # v3: ignored (no FPS subsample)
     min_count: int = 8,
     res: int = 64,
-    fps_seed: int = 0,
+    fps_seed: int = 0,                               # v3: ignored
 ) -> tuple[torch.Tensor, dict]:
+    """v3 change: no FPS subsample. Keep ALL contact-band voxels.
+
+    Reason: the 48-anchor cap was an arbitrary tractability heuristic from
+    when anchors fed an expensive EM loss. v3 voxel-physical scoring uses
+    anchors only for the contact_compat term (distance from axis line to
+    anchor band), which is cheap regardless of |anchors|. Keeping all
+    contact-band voxels gives more reliable physical constraint.
+    """
     """Extract anchor voxel set.
 
     Returns
@@ -216,12 +224,10 @@ def extract_anchors(
         diag["status"] = "empty"
         return cand_coords, diag
 
-    # FPS down-sample (work in world space for true distance)
-    if cand_coords.shape[0] > target_count:
-        world_coords = (cand_coords.float() + 0.5) / float(res) - 0.5
-        sel = _farthest_point_sample(world_coords, target_count, seed=fps_seed)
-        cand_coords = cand_coords[sel]
-
+    # v3: NO FPS subsample. Keep all contact-band voxels.
+    # The contact_compat scoring term only needs min-distance from axis line
+    # to anchor cloud, which is O(N_a) regardless of count.
     diag["final_anchor_count"] = int(cand_coords.shape[0])
     diag["status"] = "ok" if cand_coords.shape[0] >= min_count else "below_min"
+    diag["fps_skipped"] = True
     return cand_coords, diag

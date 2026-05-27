@@ -79,7 +79,7 @@ class BootstrapConfig:
     # ---- B1 (Stage A Wan I2V) --------------------------------------------
     skip_b1_stage_a: bool = False
     wan_ckpt_dir: Optional[str] = None
-    stage_a_resolution_hw: Tuple[int, int] = (480, 832)
+    stage_a_resolution_hw: Tuple[int, int] = (464, 832)
     stage_a_frame_num: int = 21
     stage_a_seed: int = 42
     stage_a_lang: str = "zh"
@@ -187,12 +187,12 @@ class BootstrapResult:
 
     # B10 / B11
     wan_cond_cached: Optional[Dict[str, Any]]         # T5 + 4-ch mask + VAE first frame
-    z_wan_target: Optional[torch.Tensor]              # (16, 6, 60, 104)
+    z_wan_target: Optional[torch.Tensor]              # (16, 6, 58, 104)
 
     # Inputs preserved + passthrough
     trellis_cond_can: torch.Tensor                    # (1, N_dino, 1024) DINOv2(s_0_carpet)
-    wan_video_target_3FHW: torch.Tensor               # (3, 21, 480, 832) uint8
-    s_0_clean: torch.Tensor                           # (3, 480, 832) float [0,1]
+    wan_video_target_3FHW: torch.Tensor               # (3, 21, 464, 832) uint8
+    s_0_clean: torch.Tensor                           # (3, 464, 832) float [0,1]
 
     # Stage B v3.3.6 secondary outputs (passed through)
     O_base_canonical: torch.Tensor                    # (64, 64, 64) uint8
@@ -247,6 +247,18 @@ def _run_b1_stage_a(
             raise TypeError(
                 f"loaded {loaded_path} dtype={wan_video_target_3FHW.dtype}, "
                 f"expected uint8"
+            )
+        expected_shape = (
+            3,
+            int(cfg.stage_a_frame_num),
+            int(cfg.stage_a_resolution_hw[0]),
+            int(cfg.stage_a_resolution_hw[1]),
+        )
+        if tuple(wan_video_target_3FHW.shape) != expected_shape:
+            raise ValueError(
+                f"loaded {loaded_path} shape={tuple(wan_video_target_3FHW.shape)}, "
+                f"expected {expected_shape}. Regenerate Stage A with the "
+                f"Wan2.2/CHORD actual output contract."
             )
         s_0_clean = wan_video_target_3FHW[:, 0].float() / 255.0
         return wan_video_target_3FHW, s_0_clean
@@ -956,7 +968,7 @@ def _run_b11_wan_vae_encode(
 
     method.md section 6 B11:
         z_wan_target = wan_vae.encode([(video * 2 - 1)])[0].detach()
-    Expected shape: (16, 6, 60, 104) for (480, 832, F=21) at vae_stride=(4,8,8).
+    Expected shape: (16, 6, 58, 104) for (464, 832, F=21) at vae_stride=(4,8,8).
     Skipped if cfg.skip_b11_wan_vae.
     """
     if cfg.skip_b11_wan_vae:

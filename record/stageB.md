@@ -63,7 +63,7 @@ base-consistent solution. Two outputs:
 Stage B accepts EITHER of two input sources via `pipelines/utils/state_input.py`:
 
 - **(a) Stage A video tensor**: `wan_video_target_3FHW_uint8.pt`, a torch.Tensor
-  uint8 of shape `[3, F, H, W]` (typically F=21, 480x832). We sample K=6 frames
+  uint8 of shape `[3, F, H, W]` (typically F=21, 464x832). We sample K=6 frames
   at indices `[0, 4, 8, 12, 16, 20]`.
 - **(b) Segmented image directory**: K=6 PNGs named `{i:02d}_seg.png`
   (FreeArt3D convention).
@@ -1062,10 +1062,10 @@ Acceptable as is.
 
 ### 7.6 Resolution dependency
 
-Stage A produces 480x832 video (v3.3.1 NEW.2 fix to align with Wan2.2
+Stage A produces 464x832 video (v3.3.1 NEW.2 fix to align with Wan2.2
 official SUPPORTED_SIZES). Stage B downscales to TRELLIS DINOv2 input
 (518x518). This works but the cropping is hard-coded in `pipe.preprocess_image`.
-If Stage A switches to a different official size (832x480 / 720x1280),
+If Stage A switches to a different actual size (832x480 / 720x1280),
 Stage B's image preprocessing remains correct but the K=6 frame sampling
 indices are unchanged.
 

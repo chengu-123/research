@@ -17,6 +17,7 @@ are not exercised here; they are tested separately as e2e on GPU.
 import os
 import sys
 import tempfile
+import importlib.util
 
 import numpy as np
 import torch
@@ -33,6 +34,7 @@ from pipelines.bootstrap import (
     _detect_carpet_freeart3d,
     _dilate_voxels,
     _flat_idx_to_xyz,
+    _run_b1_stage_a,
     _save_bootstrap_artifacts,
     _se3_prismatic,
     _se3_revolute,
@@ -41,6 +43,39 @@ from pipelines.bootstrap import (
     _world_to_voxel,
 )
 from pipelines.stage_c import JointInit, Psi, StageCConfig, StageCInputs, run_stage_c_joint_init
+
+
+def test_wan_resolution_contract():
+    cfg = BootstrapConfig()
+    assert cfg.stage_a_resolution_hw == (464, 832)
+
+    config_path = os.path.join(
+        os.path.dirname(__file__), "..", "pipelines", "stage_d", "config.py"
+    )
+    spec = importlib.util.spec_from_file_location("stage_d_config_contract", config_path)
+    stage_d_config = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = stage_d_config
+    spec.loader.exec_module(stage_d_config)
+
+    assert (stage_d_config.H_PIXEL, stage_d_config.W_PIXEL) == (464, 832)
+    assert (stage_d_config.H_LATENT, stage_d_config.W_LATENT) == (58, 104)
+
+
+def test_b1_rejects_stale_stage_a_resolution():
+    cfg = BootstrapConfig(skip_b1_stage_a=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_a_dir = os.path.join(tmp, "stage_a")
+        os.makedirs(stage_a_dir, exist_ok=True)
+        pt_path = os.path.join(stage_a_dir, "wan_video_target_3FHW_uint8.pt")
+        torch.save(torch.zeros((3, 21, 480, 832), dtype=torch.uint8), pt_path)
+
+        try:
+            _run_b1_stage_a(None, "dummy motion", cfg, tmp)
+        except ValueError as exc:
+            assert "expected (3, 21, 464, 832)" in str(exc)
+        else:
+            raise AssertionError("expected stale Stage A resolution to be rejected")
 
 
 def test_voxel_world_roundtrip():
@@ -209,8 +244,8 @@ def test_save_bootstrap_artifacts_smoke():
         wan_cond_cached=None,
         z_wan_target=None,
         trellis_cond_can=torch.randn(1, 1374, 1024),
-        wan_video_target_3FHW=torch.zeros((3, 21, 480, 832), dtype=torch.uint8),
-        s_0_clean=torch.zeros((3, 480, 832), dtype=torch.float32),
+        wan_video_target_3FHW=torch.zeros((3, 21, 464, 832), dtype=torch.uint8),
+        s_0_clean=torch.zeros((3, 464, 832), dtype=torch.float32),
         O_base_canonical=torch.zeros((res, res, res), dtype=torch.uint8),
         O_move_per_state=torch.zeros((K, res, res, res), dtype=torch.uint8),
         P_base_canonical=torch.zeros((res, res, res), dtype=torch.float32),

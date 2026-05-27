@@ -27,7 +27,7 @@ Memory:
       Limitations explicitly acknowledges this).
     - Wan DiT forwards (cond + uncond) run under torch.no_grad so we don't
       retain activations for 40-layer DiT * 2 forwards.
-    - On a 480x832 frame x 21 frames, the latent is [16, 6, 60, 104] which
+    - On a 464x832 frame x 21 frames, the latent is [16, 6, 58, 104] which
       is ~5MB fp32; grad through the VAE encoder peaks around ~10 GB for
       A14B. The bookkeeping is contained inside this module.
 """
@@ -245,14 +245,14 @@ def wan_vae_encode_grad(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, F=21, H=480, W=832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, F=21, H=464, W=832] in [0, 1]
         Direct render output from ``render_21_with_warp`` (permuted from
         ``[F, 3, H, W]`` to ``[3, F, H, W]``).
     ctx : WanRFSDSContext
 
     Returns
     -------
-    z : Tensor [1, 16, F_lat=6, H_lat=60, W_lat=104]
+    z : Tensor [1, 16, F_lat=6, H_lat=58, W_lat=104]
         Grad-enabled VAE latent. ``z.requires_grad`` is True iff the input
         rgb has ``requires_grad`` (true for our differentiable renderer).
     """
@@ -334,7 +334,7 @@ def w_rfsds_loss(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, 21, 480, 832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, 21, 464, 832] in [0, 1]
         Differentiable render output (caller should already have clamped to
         [0, 1] to keep VAE input in-distribution).
     wan_cond : dict   from Bootstrap B11
@@ -379,7 +379,7 @@ def w_rfsds_loss(
     )
 
     # ---- 4) Two DiT forwards (cond + uncond), both under no_grad ----
-    x_input = [z_sigma.squeeze(0)]                     # List of [16, 6, 60, 104]
+    x_input = [z_sigma.squeeze(0)]                     # List of [16, 6, 58, 104]
     with torch.no_grad():
         v_pred_cond = wan_model(
             x_input, t=t_wan,
@@ -429,7 +429,7 @@ def latent_recon_loss(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, 21, 480, 832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, 21, 464, 832] in [0, 1]
     z_wan_target : Tensor [16, F_lat, H_lat, W_lat]
     ctx : WanRFSDSContext
     z_render_cached : Optional[Tensor [1, 16, F_lat, H_lat, W_lat]]

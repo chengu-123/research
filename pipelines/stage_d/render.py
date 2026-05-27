@@ -78,10 +78,10 @@ class StageDCameraConfig:
         projection matrix computes ``fov_y`` from the image aspect ratio
         assuming square pixels. Set explicitly when the image pixel grid
         does NOT have a square-pixel aspect — e.g. the Stage A pipeline
-        LANCZOS-resizes FreeArt3D's 800x800 render to Wan's 480x832, so
-        a square-FoV (45/45 deg) camera ends up sampled on a 480x832 grid
+        LANCZOS-resizes FreeArt3D's 800x800 render to Wan's 464x832, so
+        a square-FoV (45/45 deg) camera ends up sampled on a 464x832 grid
         with non-square pixels. In that case set ``fov_x_deg = fov_y_deg
-        = 45`` and image_h/w = 480/832.
+        = 45`` and image_h/w = 464/832.
 
     near / far must bracket the object (in [-0.5, 0.5]^3) plus camera
     distance; defaults 0.1 / 10.0 cover all reasonable poses including
@@ -92,7 +92,7 @@ class StageDCameraConfig:
     up: Tuple[float, float, float] = (0.0, 1.0, 0.0)
     fov_x_deg: float = 30.0
     fov_y_deg: Optional[float] = None       # ★ explicit y FoV (None -> derive from aspect)
-    image_h: int = H_PIXEL                  # 480
+    image_h: int = H_PIXEL                  # 464
     image_w: int = W_PIXEL                  # 832
     near: float = 0.1
     far: float = 10.0
@@ -121,11 +121,11 @@ class StageDCameraConfig:
         Same convention as Blender / FreeArt3D source. No axis swap needed.
 
         Image aspect: Stage A LANCZOS-resizes FreeArt3D's 800x800 render to
-        480x832 before Wan I2V. This is a NON-uniform aspect transform.
+        464x832 before Wan I2V. This is a NON-uniform aspect transform.
         We replicate it by keeping fov_x = fov_y = 45 deg while rendering
-        at 480x832 (i.e. non-square pixels). Without explicit fov_y, the
+        at 464x832 (i.e. non-square pixels). Without explicit fov_y, the
         default aspect-derivation would compute fov_y = atan(tan(22.5) *
-        480/832) ~= 13.4 deg, which crops the vertical view and breaks the
+        464/832) * 2 ~= 26 deg, which crops the vertical view and breaks the
         match to s_0.
         """
         d = 2.1                                 # distance, normalized object_scale=1
@@ -141,7 +141,7 @@ class StageDCameraConfig:
             look_at=(0.0, 0.0, 0.0),
             up=(0.0, 0.0, 1.0),                 # ★ hardcoded +Z (TRELLIS canonical)
             fov_x_deg=45.0,
-            fov_y_deg=45.0,                     # ★ explicit: square FoV stretched to 480x832
+            fov_y_deg=45.0,                     # explicit: square FoV stretched to 464x832
             image_h=H_PIXEL, image_w=W_PIXEL,
             near=0.1, far=10.0,
             bg_color=(0.0, 0.0, 0.0),
@@ -187,7 +187,7 @@ def _build_proj_matrix(camera_cfg: StageDCameraConfig,
     ``fov_y`` from the image aspect via ``tan(fov_y/2) = tan(fov_x/2) * H/W``.
     When ``fov_y_deg`` is set explicitly, uses it directly — this is needed
     when the image grid does NOT have square pixels (e.g. FreeArt3D's
-    800x800 LANCZOS-resized to 480x832 by Stage A, where the "true" FoV is
+    800x800 LANCZOS-resized to 464x832 by Stage A, where the "true" FoV is
     45/45 deg square but the pixel grid is rectangular).
 
     Maps z in [near, far] to [0, 1] (diff_gauss / TRELLIS convention; see

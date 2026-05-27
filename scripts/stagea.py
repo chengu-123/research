@@ -15,7 +15,7 @@ optical-flow sanity check, and writes the Stage A artifact bundle:
         keyframes_6.png                   states [0,4,8,12,16,20] for Stage B
         optical_flow_per_frame.png        per-transition mean flow + threshold
         meta.json                         prompts, seed, sanity report
-        wan_video_target_3FHW_uint8.pt    [3, 21, 480, 832] uint8 (Stage B input)
+        wan_video_target_3FHW_uint8.pt    [3, 21, 464, 832] uint8 (Stage B input)
 
 Usage:
     conda activate mine
@@ -91,14 +91,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frame_num", type=int, default=21,
                    help="Output video frame count; must satisfy 4n+1. Default 21 "
                         "yields F_lat=6 matching Stage B K=6 conditioning.")
-    p.add_argument("--height", type=int, default=480,
-                   help="Output height. (H, W) must be one of Wan2.2 I2V-A14B "
-                        "SUPPORTED_SIZES: (480, 832), (832, 480), (720, 1280), "
-                        "(1280, 720). Default 480 -> lat_h=60 (paired with W=832, "
-                        "official 480P landscape).")
+    p.add_argument("--height", type=int, default=464,
+                   help="Actual output height. (H, W) must map to an official "
+                        "Wan2.2 I2V-A14B area profile: (464, 832), (832, 480), "
+                        "(720, 1280), (1280, 720). Default 464 -> lat_h=58 "
+                        "(paired with W=832, CHORD/Wan default 480P landscape).")
     p.add_argument("--width", type=int, default=832,
                    help="Output width. Default 832 -> lat_w=104. See --height for "
-                        "the full list of supported (H, W) pairs.")
+                        "the full list of supported actual (H, W) pairs.")
     p.add_argument("--sampling_steps", type=int, default=50,
                    help="Wan ODE sampling steps. Default 50.")
     p.add_argument("--guide_scale", type=float, default=5.0,

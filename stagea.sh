@@ -10,9 +10,9 @@
 #SBATCH --output=stagea_%j.out
 #SBATCH --error=stagea_%j.err
 #
-# Stage A: Wan2.2 I2V 21-frame 480x832 articulated-object video.
+# Stage A: Wan2.2 I2V 21-frame 464x832 articulated-object video.
 # All hyperparameters are fixed by pipeline v3.3.1 inside scripts/stagea.py
-# (seed=42, frame=21, 480x832, guide=5.0, unipc, 50 steps, lang=en, ...).
+# (seed=42, frame=21, 464x832, guide=5.0, unipc, 50 steps, lang=en, ...).
 # This wrapper only takes the three things that actually vary per run:
 #   $1  OBJECT_ID    PartNet object id under ~/hf_models/PartNet/
 #   $2  OUTPUT_DIR   destination dir for the 7 Stage A artifacts

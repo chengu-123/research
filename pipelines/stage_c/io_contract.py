@@ -121,6 +121,13 @@ class JointInit:
     Returned by `pipelines.stage_c.run_stage_c_init.run_stage_c_joint_init`.
     Persisted into Bootstrap artifacts (`psi_0.json`, `phi_0.npy`,
     `anchors_object.npy`) for Stage D consumption.
+
+    v3 (cardinal-cand + voxel-scoring) addition: `secondary` field holds the
+    OTHER type's best candidate (e.g., if primary is prismatic, secondary is
+    revolute). Stage D's dual-clone can use both inits as warm-starts when
+    the type margin is small, instead of cloning the same state.
+    Set to None when not applicable (e.g., when running unit tests without
+    dual-branch evaluation).
     """
 
     psi: Psi                                # initial joint parameters (unpacked)
@@ -134,6 +141,9 @@ class JointInit:
 
     # Diagnostic intermediate quantities (move centroids, fit residuals etc.)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+    # ★ v3 addition: alternate-type candidate for Stage D dual-clone init
+    secondary: Optional["JointInit"] = None
 
     def joint_type(self) -> str:
         """Hard-classified joint type from psi.type_logit."""
@@ -168,4 +178,7 @@ class JointInit:
             else:
                 diag_safe[k] = f"<{type(v).__name__}>"
         out["diagnostics_scalars"] = diag_safe
+        # Embed secondary candidate recursively for downstream consumers
+        if self.secondary is not None:
+            out["secondary"] = self.secondary.to_dict_serialisable()
         return out

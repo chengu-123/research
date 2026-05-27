@@ -151,9 +151,9 @@ class BootstrapBundle:
     # Conditioning + targets
     trellis_cond_can: torch.Tensor            # [1, N_dino, 1024]
     wan_cond: Dict[str, Any]                  # context / context_null / seq_len / y
-    z_wan_target: torch.Tensor                # [16, 6, 60, 104]
-    wan_video_target_T3HW_01: torch.Tensor    # [F=21, 3, 480, 832] in [0, 1]
-    s_0_with_carpet_3HW_01: torch.Tensor      # [3, 480, 832] in [0, 1]
+    z_wan_target: torch.Tensor                # [16, 6, 58, 104]
+    wan_video_target_T3HW_01: torch.Tensor    # [F=21, 3, 464, 832] in [0, 1]
+    s_0_with_carpet_3HW_01: torch.Tensor      # [3, 464, 832] in [0, 1]
 
 
 @dataclass
@@ -493,7 +493,7 @@ def train_stage_d_p1(
             save_diag_to=os.path.join(out_dir, "viz", "iter_0_camera_diag.png"),
         )
         summary["iter_0_camera_iou"] = iter0_iou
-        # Free init render before the real loop begins (cheap; ~36MB on 832x480x21).
+        # Free init render before the real loop begins (cheap; ~34MB on 832x464x21).
         del rgb_T3HW_init
 
     for it in range(cfg.total_iters):

@@ -57,9 +57,9 @@ WAN_TEXT_LEN: int = 512                               # padded T5 text length
 
 # --- Stage A output (must match) ---
 F_FRAMES: int = 21                                    # frame count; F % 4 == 1
-H_PIXEL: int = 480                                    # MUST match Stage A (Wan training distribution)
+H_PIXEL: int = 464                                    # MUST match Stage A actual Wan output
 W_PIXEL: int = 832                                    # off-distribution sizes invalidate W-RFSDS
-H_LATENT: int = H_PIXEL // WAN_VAE_STRIDE[1]          # 60
+H_LATENT: int = H_PIXEL // WAN_VAE_STRIDE[1]          # 58
 W_LATENT: int = W_PIXEL // WAN_VAE_STRIDE[2]          # 104
 F_LATENT: int = (F_FRAMES - 1) // WAN_VAE_STRIDE[0] + 1  # 6
 

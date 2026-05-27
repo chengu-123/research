@@ -11,7 +11,7 @@
 > 4. **Confidence-aware anchor**：三段（base_conf / move_conf / uncertain）替代二元 (1-m_soft)/m_soft，对 P1 边界不确定区更鲁棒
 > 5. **Decoded-geometry drift monitor**：每 100 iter 计算 z_slat 解码后的 xyz/scale/opacity 与 z_slat_init 解码的差异，作为 sanity check + 可选 regularizer
 > 6. **P2 joint type confidence gate**：若 P1 学到的 type_confidence < 0.7，P2 前 20% 保持 two-branch soft render；之后才硬切
-> 7. **Resource fallback 提升为默认**：F=21 + 832×480 全程使用（v3.3.1 切到官方 SUPPORTED_SIZES 后，288×512 / 384×216 等 off-distribution 分辨率作为 fast-debug ablation 保留但不进主线）
+> 7. **Resource fallback 提升为默认**：F=21 + 832×464 全程使用（v3.3.1 切到官方 SUPPORTED_SIZES 后，288×512 / 384×216 等 off-distribution 分辨率作为 fast-debug ablation 保留但不进主线）
 > 8. **Provenance 改名** `supervision_provenance`，类别收窄为 `visible_in_all_states / visible_in_open_states / never_visible`，不再声称 donor texture source
 > 9. **SCAR：z_t mix → x₀_pred mix**（保留位置对齐 + 修 ODE 一致性）。在 x₀ 空间混合保留 mean alignment（位置对齐效果不变），用原始 per-state ε 重建 z_{t-dt} 保留 noise variance（model 看 in-distribution 输入）。验证依据：用户实测 "drop SCAR → base 漂移"，证明 SCAR 是位置对齐器；x₀ 混合的 mean 与 z_t 混合的 mean 完全等价，所以对齐效果保留。
 > 10. **BMCSA：static M_base → dynamic per-block M**（每个 block 内从当前 hidden 实时算 K 状态 token cosine，sigmoid 后作 gate）。修复 static M 来自 Pass-1 末态、Pass-2 演化中 stale 的问题。代价 < 1% compute。
@@ -26,8 +26,8 @@
 > 17. **(NEW.1) Canonical state = s_c（默认 c=2）**：phi 序列零点从 s_0 移到 s_c，即渲染时 `phi_render[c] = 0` 而非 `phi_render[0] = 0`。**Motivation**：TRELLIS 在 s_0 闭合态对 move 部件几何 underrepresent（DINOv2 cond 信息不对称——drawer 完全在 cabinet 内只看到外壳轮廓 → SS-DiT 重建出的"内部 occupancy"偏低 → s_0 实体偏小）；s_2 半开时 drawer 暴露 front face + 部分侧面 → DINOv2 看到更多几何 → canonical move 重建更稳。**L_first 仍 anchor frame 0 = s_0_with_carpet 真实输入**（不损失真实数据 anchor 强度）。**实现**：phi 序列 cumsum + normalize 后做 shift `u_shifted = u - u[c]`，`phi_render_rev/pri = u_shifted × {theta_max, disp_max}` 可正可负（state < c 反向，state > c 正向）。`c = 2` 是 fixed hyperparameter，不自动选（per-instance auto-select c 留作 future work / ablation）。
 > 18. **(Q1 增强) B5 加 `O_init_max` 兜底**：`U_seed = {O_mean > 0.3} ∪ {O_max > 0.5} ∪ boundary_band`，覆盖三种 voxel：mean 高置信主体 ∨ 任一 state 强占据 ∨ mean 中等不确定带。原因：大平移 / K state 间不重叠时 latent-mean 解码出的 trajectory 概率会跌出 boundary band (0.1-0.3) → mean only 漏 voxel；O_max（per-state decode 后 voxel-wise max）兜底"至少一个 state 强占据"的位置。代价：6 次 SS-VAE decode（Bootstrap 一次性，不进训练循环）。
 > 19. **(NEW.1-consistency) Bootstrap SLAT 采样 cond 改用 `trellis_cond_k[CANONICAL_STATE_IDX]`**：旧版本 SLAT sample 用 `cond=trellis_cond_k[0]`（DINOv2 of state 0），但 canonical=s_c=s_2 又指 phi[c]=0，二者冲突 — SLAT decoder 用 s_0 image evidence 解码，xyz_canon ≈ s_0 几何，但 phi_shift 设计要求 xyz_canon ≈ s_2 几何。修复：SLAT cond 与 canonical state 同步，xyz_canon 真正聚集在 s_c 状态附近，T_{c→k} 解出的 frame k 几何无需 ψ 浪费 capacity 去 bridge 内部 inconsistency。trellis_cond_k 全部来自 Wan video 抽帧（包括 [0]），换 [2] 不引入额外 hallucination 来源；frame 8 暴露几何更多 → SLAT 重建更稳。
-> 20. **(Camera convention) Stage D 默认渲染相机 = FreeArt3D rendering 相机**：来源 `mine/pipelines/render.py:run_rendering()` 第 211-285 行硬编码的 Blender 相机：fov=45°（方FoV），azi=π/8=22.5°，elevation=45° (sin(π/4)·distance 推出来)，distance=2.1·object_scale，**+Z up**。**TRELLIS canonical world up = +Z**，由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(orig, [0,0,0], [0,0,1])` 直接证明（line 28-32 球面坐标 `[sin(yaw)cos(pitch), cos(yaw)cos(pitch), sin(pitch)]` 第 3 维 = 高度，与 Blender 完全一致）。无 OpenGL +Y up 转换需求。Stage A LANCZOS-resize 800×800 → 480×832 后 image grid 非正方 pixel：`StageDCameraConfig` 新增 `fov_y_deg: Optional[float]` 字段，`freeart3d_canonical()` 显式设 fov_x=fov_y=45°（square FoV 渲到 480×832 模拟拉伸）。**Stage D 训练循环开头加 iter-0 silhouette IoU 自检**：渲染 frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError`（fail-loud，防止相机不对静默跑废）。Real photo 输入需用户自己提供相机参数（不是 v1 AAAI 实验集设定）。
-> 19. **(NEW.2) Stage A 默认分辨率切到官方 480P 横屏 (H=480, W=832)**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B SUPPORTED_SIZES（仅 720×1280 / 1280×720 / 480×832 / 832×480 四档），是 off-distribution 的 area scale，会让 W-RFSDS 用 Wan DiT 时 v_pred 不可靠（核心创新 2 失效）。改成官方 (480, 832) 后：lat_h=60, lat_w=104, z_wan_target=[16, 6, 60, 104]，wan_video_target_3FHW=[3, 21, 480, 832]，seq_len = 6·60·104/(2·2) = 9360。Stage D backward 计算开销相对旧默认 ↑2.71×（H800 单卡 P1 5000 iter 从 ~7h 涨到 ~19h，可接受）。`pipelines/stage_a_wan.py` 新增 SUPPORTED_SIZES 硬校验，不在官方列表的 (H, W) 直接 ValueError。fast-debug 用 off-distribution 分辨率作 ablation 不进主线。
+> 20. **(Camera convention) Stage D 默认渲染相机 = FreeArt3D rendering 相机**：来源 `mine/pipelines/render.py:run_rendering()` 第 211-285 行硬编码的 Blender 相机：fov=45°（方FoV），azi=π/8=22.5°，elevation=45° (sin(π/4)·distance 推出来)，distance=2.1·object_scale，**+Z up**。**TRELLIS canonical world up = +Z**，由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(orig, [0,0,0], [0,0,1])` 直接证明（line 28-32 球面坐标 `[sin(yaw)cos(pitch), cos(yaw)cos(pitch), sin(pitch)]` 第 3 维 = 高度，与 Blender 完全一致）。无 OpenGL +Y up 转换需求。Stage A LANCZOS-resize 800×800 → 464×832 后 image grid 非正方 pixel：`StageDCameraConfig` 新增 `fov_y_deg: Optional[float]` 字段，`freeart3d_canonical()` 显式设 fov_x=fov_y=45°（square FoV 渲到 464×832 模拟拉伸）。**Stage D 训练循环开头加 iter-0 silhouette IoU 自检**：渲染 frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError`（fail-loud，防止相机不对静默跑废）。Real photo 输入需用户自己提供相机参数（不是 v1 AAAI 实验集设定）。
+> 19. **(NEW.2) Stage A 默认分辨率切到 Wan2.2/CHORD 480P actual output (H=464, W=832)**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B 官方 area profiles（720*1280 / 1280*720 / 480*832 / 832*480），是 off-distribution 的 area scale，会让 W-RFSDS 用 Wan DiT 时 v_pred 不可靠（核心创新 2 失效）。I2V 的 `size` 是面积档，不是固定 H/W；我们用官方 832*480 area profile，但按 CHORD/Wan 实际输出契约固定 tensor shape 为 (464, 832)。改成 (464, 832) 后：lat_h=58, lat_w=104, z_wan_target=[16, 6, 58, 104]，wan_video_target_3FHW=[3, 21, 464, 832]，seq_len = 6·58·104/(2·2) = 9048。Stage D backward 计算开销相对旧默认 ↑2.62×（H800 单卡 P1 5000 iter 从 ~7h 涨到 ~18h，可接受）。`pipelines/stage_a_wan.py` 对 actual output (H, W) 做硬校验，不能再把官方 area label 误当成输出 H/W。fast-debug 用 off-distribution 分辨率作 ablation 不进主线。
 
 ---
 
@@ -71,7 +71,7 @@
 ### 1.3 帧数与分辨率
 
 - **F = 21**（Wan2.2 `F % 4 == 1` 约束下的合法值；F=21 给 6 个 latent frames，匹配 K=6 articulation states）
-- **分辨率 832 × 480**（H=480, W=832；H/8=60, W/8=104 满足 Wan VAE 8 倍数约束；lat_h=60, lat_w=104 满足 DiT patch_size=(1,2,2) 的 2 倍数约束）
+- **分辨率 832 × 480**（H=464, W=832；H/8=58, W/8=104 满足 Wan VAE 8 倍数约束；lat_h=58, lat_w=104 满足 DiT patch_size=(1,2,2) 的 2 倍数约束）
 
 ---
 
@@ -123,7 +123,7 @@ GPT v3 审查全部 13 项指控均 CONFIRMED。比 v2 那轮审查（GPT 错 1 
 ### 2.3 GPT 部分正确（PARTIAL）
 
 - (P-v3.1) z_s0 = mean(z_final)：旧 StageB 实测可用。保留默认，加 ablation A/B/C/D（z_final[0] / mean / endpoint-weighted / learned）
-- (P-v3.2) 832×480 + F=21 数学上合法（H/8=60, W/8=104, lat/2 也满足 DiT patch=(1,2,2)），但仍需 Day-1 shape test 实测
+- (P-v3.2) 832×464 + F=21 数学上合法（H/8=58, W/8=104, lat/2 也满足 DiT patch=(1,2,2)），但仍需 Day-1 shape test 实测
 - (P-v3.3) D_GS geometry 固定时论文表述要准确："RFSDS refines canonical support occupancy, part assignment, and articulation over a fixed TRELLIS SLAT/Gaussian scaffold"，**不要**说 "RFSDS refines canonical Gaussian geometry"
 - (P-v3.4) P2 atlas 主张要收窄："atlas is baked from optimized per-Gaussian SH₀ colors after geometry freezing"，**不要**强调 "donor fusion" 主贡献
 
@@ -193,8 +193,8 @@ TRELLIS SS-DiT 和 Wan2.2 DiT 的 condition 格式完全不同：
 | `ψ_0, φ_0` | dict, `[6]` | StageC joint init |
 | `anchors_object` | `[N_a, 3]` | 接触带 |
 | `wan_cond_cached` | dict | `{'context': T5([prompt]), 'seq_len': int, 'y': [tensor]}`（一次性算，全程用） |
-| `z_wan_target` | `[1, 16, 6, 60, 104]` | Wan VAE encoder 编码 21-帧 clean 视频，post-norm |
-| `wan_video_target_3FHW` | `[3, 21, 480, 832]` | clean Wan 视频 raw RGB（LPIPS / L1 用） |
+| `z_wan_target` | `[1, 16, 6, 58, 104]` | Wan VAE encoder 编码 21-帧 clean 视频，post-norm |
+| `wan_video_target_3FHW` | `[3, 21, 464, 832]` | clean Wan 视频 raw RGB（LPIPS / L1 用） |
 
 ### 4.3 可学习参数
 
@@ -255,8 +255,8 @@ L_base_anchor 软正则保留（见 §11.5），但权重可降（tanh 已提供
 | 用途 | 内容 | carpet | 帧数 / 形状 |
 |---|---|---|---|
 | **用户输入** | `s_0_with_carpet` (用户在输入端合成 grounding disk) | **有** | `[3, H_in, W_in]` |
-| **Wan 监督 target** | `wan_video_target_3FHW` (Wan I2V 输入 s_0_with_carpet) | **有** | `[3, 21, 480, 832]` |
-| **L_first anchor** | `s_0_with_carpet` | **有** | `[3, 480, 832]` |
+| **Wan 监督 target** | `wan_video_target_3FHW` (Wan I2V 输入 s_0_with_carpet) | **有** | `[3, 21, 464, 832]` |
+| **L_first anchor** | `s_0_with_carpet` | **有** | `[3, 464, 832]` |
 | **TRELLIS Bootstrap input** | 直接抽样 `s_0...s_5` from `wan_video_target_3FHW` | **有** | 不再额外 add carpet |
 | **carpet 检测** | `is_carpet_mask` via FreeArt3D plane fit on `O_init` | — | `[64³]` bool, 仅用于 contact loss / Stage G export 时过滤 |
 
@@ -441,7 +441,7 @@ def to_wan_vae_input(video_3FHW_float01):
     return video_3FHW_float01 * 2.0 - 1.0
 
 
-def build_wan_i2v_cond(s_0_clean_float01, prompt, frame_num=21, H=480, W=832,
+def build_wan_i2v_cond(s_0_clean_float01, prompt, frame_num=21, H=464, W=832,
                         device='cuda', wan_config=None):
     """
     一次性构造 Wan2.2 I2V condition (Stage B 内调用，全程缓存).
@@ -468,7 +468,7 @@ def build_wan_i2v_cond(s_0_clean_float01, prompt, frame_num=21, H=480, W=832,
     # 2) Wan VAE encode (输入 list, 取 [0])
     y_vae = wan_vae.encode([fake_video_neg11])[0]             # tensor
     
-    # ★ v3.1 关键：从 shape 动态取 (不再硬写 h_lat=60/w_lat=104)
+    # ★ v3.1 关键：从 shape 动态取 (不再硬写 h_lat/w_lat)
     C_lat, F_lat, h_lat, w_lat = y_vae.shape
     assert C_lat == 16, f"Wan VAE latent channels expected 16, got {C_lat}"
     
@@ -647,10 +647,10 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     # ===== B1: Wan2.2 生成 clean 21 帧视频 =====
     wan_video_target_3FHW = wan22_i2v_pipeline(
         image=s_0_clean, prompt=prompt,
-        n_frames=21, resolution=(480, 832),
+        n_frames=21, resolution=(464, 832),
         seeds=[s1, s2, s3, s4], steps=50, guidance=5.0,
     )
-    # Output: [3, 21, 480, 832]
+    # Output: [3, 21, 464, 832]
     
     # ===== B2: 抽 6 帧 + 加 carpet =====
     state_indices = [0, 4, 8, 12, 16, 20]
@@ -746,12 +746,12 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     # ===== B10: Wan I2V cond builder (一次性, 全程缓存) =====
     wan_cond_cached = build_wan_i2v_cond(
         s_0_clean=s_0_clean, prompt=prompt,
-        F=21, H=480, W=832, device=device,
+        F=21, H=464, W=832, device=device,
     )
     
     # ===== B11: Wan VAE 编码 21 帧 clean 视频 (latent reconstruction target) =====
     z_wan_target = wan_vae.encode([wan_video_target_3FHW])[0].detach()
-    # z_wan_target: [16, 6, 60, 104]
+    # z_wan_target: [16, 6, 58, 104]
     
     # ===== B11.5: ★ v3.3.1 added — derived artifacts for Stage D / F =====
     # slat_mean / slat_std: SLAT post-norm constants (length 8) used above at
@@ -1239,14 +1239,14 @@ T_prismatic = [SE3_prismatic(ψ_pred.axis, phi_render_pri[t]) for t in range(21)
 rgb_revolute  = torch.stack([
     diff_gaussian_rasterize(*warp_gauss_state_t(T_revolute[t]),
                             camera=camera_locked) for t in range(21)
-])                                                  # [21, 3, 480, 832]
+])                                                  # [21, 3, 464, 832]
 rgb_prismatic = torch.stack([
     diff_gaussian_rasterize(*warp_gauss_state_t(T_prismatic[t]),
                             camera=camera_locked) for t in range(21)
 ])
 
 type_soft = torch.sigmoid(ψ_pred.type_logit)
-rgb_frames = (1 - type_soft) * rgb_revolute + type_soft * rgb_prismatic    # [21, 3, 480, 832]
+rgb_frames = (1 - type_soft) * rgb_revolute + type_soft * rgb_prismatic    # [21, 3, 464, 832]
 ```
 
 ---
@@ -1258,7 +1258,7 @@ rgb_frames = (1 - type_soft) * rgb_revolute + type_soft * rgb_prismatic    # [21
 ```python
 def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    # ★ v3.1: CHORD 实测 25-12, 默认 20
     """
-    rgb_frames_3FHW_float01: [3, 21, 480, 832] in [0, 1]  (grad-enabled, from renderer)
+    rgb_frames_3FHW_float01: [3, 21, 464, 832] in [0, 1]  (grad-enabled, from renderer)
     wan_cond: dict from build_wan_i2v_cond (cached, context_null 已用 sample_neg_prompt)
     τ_raw: scalar in [0, 1]
     """
@@ -1267,7 +1267,7 @@ def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    #
     
     # ★ Wan VAE encode takes List[Tensor] of [C=3, T, H, W]
     z_θ_list = wan_vae.encode([rgb_frames_neg11])             # List[Tensor], grad-enabled
-    z_θ = z_θ_list[0].unsqueeze(0)                            # [1, 16, F_lat=6, h_lat=60, w_lat=104]
+    z_θ = z_θ_list[0].unsqueeze(0)                            # [1, 16, F_lat=6, h_lat=58, w_lat=104]
     
     # SDS q_sample (CHORD-style, σ_min=0)
     with torch.no_grad():
@@ -1283,7 +1283,7 @@ def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    #
         
         # ★ Wan model input is List[Tensor [C_in, T, H, W]], no leading batch
         # ★ z_τ and y are concatenated INSIDE model (model.py:444-445)
-        x_input = [z_τ.squeeze(0)]                            # List[[16, 6, 60, 104]]
+        x_input = [z_τ.squeeze(0)]                            # List[[16, 6, 58, 104]]
         
         # ★ CFG: cond and uncond
         v_pred_cond = wan_model(
@@ -1291,7 +1291,7 @@ def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    #
             context=wan_cond['context'],
             seq_len=wan_cond['seq_len'],
             y=wan_cond['y'],
-        )[0]                                                   # [16, 6, 60, 104]
+        )[0]                                                   # [16, 6, 58, 104]
         
         v_pred_uncond = wan_model(
             x_input, t=t_wan,
@@ -1301,7 +1301,7 @@ def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    #
         )[0]
         
         v_pred = v_pred_uncond + cfg_scale * (v_pred_cond - v_pred_uncond)
-        v_pred = v_pred.unsqueeze(0)                          # [1, 16, 6, 60, 104]
+        v_pred = v_pred.unsqueeze(0)                          # [1, 16, 6, 58, 104]
     
     # SDS residual (CHORD Eq. 3)
     residual = v_pred - ε + z_θ.detach()
@@ -1325,8 +1325,8 @@ def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=20.0):    #
 ```python
 def L_latent_rec_Wan(rgb_frames_3FHW_float01, z_wan_target):
     """
-    rgb_frames_3FHW_float01: [3, 21, 480, 832] in [0, 1]
-    z_wan_target: [16, 6, 60, 104], cached in bootstrap (already from [-1,1] input).
+    rgb_frames_3FHW_float01: [3, 21, 464, 832] in [0, 1]
+    z_wan_target: [16, 6, 58, 104], cached in bootstrap (already from [-1,1] input).
     """
     rgb_frames_neg11 = rgb_frames_3FHW_float01 * 2.0 - 1.0
     z_render = wan_vae.encode([rgb_frames_neg11])[0]      # grad-enabled
@@ -1342,7 +1342,7 @@ z_wan_target = wan_vae.encode([to_wan_vae_input(wan_video_target_float01)])[0].d
 ### 8.3 RGB reconstruction（**v3.1 修 shape D-v3.13**）
 
 shape 约定：
-- **Render 输出**：`[T, 3, H, W]` = `[21, 3, 480, 832]`
+- **Render 输出**：`[T, 3, H, W]` = `[21, 3, 464, 832]`
 - **LPIPS / L1 / first frame**：需要 `[N, 3, H, W]` 标准 batch 输入
 - **Wan VAE encode**：需要 `[3, T, H, W]` （list per video）
 
@@ -1350,10 +1350,10 @@ shape 约定：
 
 ```python
 # 渲染输出
-rgb_frames_T3HW = render_21_with_warp(...)              # [21, 3, 480, 832] in [0,1]
+rgb_frames_T3HW = render_21_with_warp(...)              # [21, 3, 464, 832] in [0,1]
 
 # Permute 给 Wan VAE
-rgb_frames_3THW = rgb_frames_T3HW.permute(1, 0, 2, 3)   # [3, 21, 480, 832]
+rgb_frames_3THW = rgb_frames_T3HW.permute(1, 0, 2, 3)   # [3, 21, 464, 832]
 L_sds     = W_RFSDS_Wan(rgb_frames_3THW, wan_cond, τ_sds)
 L_lat_rec = L_latent_rec_Wan(rgb_frames_3THW, bootstrap.z_wan_target)
 
@@ -1787,7 +1787,7 @@ for it in range(N_p2):
     # ----- 21-frame render with frozen joint, single branch (★ S3 简化) -----
     rgb_T3HW = render_21_with_warp(
         gauss_can, T_list, g_per_gauss, m_per_gauss, cfg_warp=cfg.warp
-    )                                                          # [21, 3, 480, 832] in [0, 1]
+    )                                                          # [21, 3, 464, 832] in [0, 1]
     rgb_3THW = rgb_T3HW.permute(1, 0, 2, 3)                    # for Wan VAE
     
     # ----- losses -----

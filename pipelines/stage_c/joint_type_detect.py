@@ -1,148 +1,285 @@
-"""Joint type detection via geometric fit (per user direction).
+"""Joint type + axis detection via cardinal-axis enumeration + voxel scoring.
 
-Replaces v8.1's BIC loss-ratio (which needed full Phase-EM, ~30 sec)
-with a direct geometric fit on per-state move centroids (~1 sec):
+v3 (cardinal-cand + voxel-physical-scoring; supersedes centroid-only v2):
 
-  centroid_k = centroid of state k's move voxels (world space)
-  residual_line = sum_k dist(centroid_k, best_fit_line)^2
-  residual_arc  = sum_k dist(centroid_k, best_fit_circle)^2
-  type_logit = log(residual_arc + eps) - log(residual_line + eps)
-               > 0 -> linear fit better -> prismatic
-               < 0 -> arc fit better    -> revolute
+Algorithm:
+  Step A. Build per-state move voxel sets V_k (in voxel int and world coords)
+          and the swept union V_union.
+  Step B. FreeArt3D-style cardinal axis invariant (estimate.py:387-401):
+          - Compute pair-wise centroid displacement vectors
+          - prismatic axis = cardinal with MAX |sum proj| (parallel to motion)
+          - revolute axis  = cardinal with MIN |sum proj| (perpendicular)
+          These give us geometric prior; physical scoring is the final arbiter.
+  Step C. For BOTH types (prismatic, revolute), generate K_cardinal candidates
+          on the 6 cardinal axes (sign convention: ensure phi monotone-increasing
+          in k by flipping axis if needed). For revolute, origin = anchor band
+          centroid projected onto axis line through swept centroid (physical
+          constraint: hinge must be at base-move contact).
+  Step D. For each candidate, run voxel reverse-warp scoring (voxel_scoring.py):
+              score = consistency * (1 - conflict) * coverage *
+                      contact_compat * monotone_quality
+  Step E. best_pris = argmax score over 6 prismatic candidates
+          best_rev  = argmax score over 6 revolute candidates
+          type_logit = log(best_pris.score / best_rev.score)
+          recommended = sign(type_logit) when margin > threshold
 
-Confidence is derived from the separation margin between the two residuals,
-normalised against the centroid spread length scale.
-
-method/pipeline.md spec: this function consumes Stage B v3.3.6's
-O_move_per_state directly; no Phase-EM dependency.
+The result is a JointTypeResult that records BOTH best_pris and best_rev so
+axis_fit / phi_fit / run_stage_c_init can construct primary AND secondary
+JointInit (Stage D dual-clone gets two well-initialized branches).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from .move_geometry import (
-    PerStateMoveGeom,
-    centroid_trajectory_length,
-    overall_move_extent,
-    valid_centroid_subset,
+from .voxel_scoring import (
+    CandidateScore,
+    angular_median_around_axis,
+    envelope_advance_along_axis,
+    freeart3d_axis_invariant,
+    reverse_align_and_score,
+    voxel_to_world,
 )
 
 
 # ---------------------------------------------------------------------------
-# Geometric fits (numpy, no autograd needed)
+# Cardinal set
 # ---------------------------------------------------------------------------
 
 
-def fit_line_3d_pca(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """Best-fit 3D line via PCA.
+def cardinal_axes(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Six cardinal axes as a (6, 3) tensor: +X, -X, +Y, -Y, +Z, -Z."""
+    return torch.tensor([
+        [+1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+        [0.0, +1.0, 0.0], [0.0, -1.0, 0.0],
+        [0.0, 0.0, +1.0], [0.0, 0.0, -1.0],
+    ], device=device, dtype=dtype)
 
-    points : (n, 3)
-    Returns:
-        origin    : (3,) line passes through this point (centroid of input)
-        direction : (3,) unit vector along principal axis
-        residual  : float, mean squared perpendicular distance to line
+
+# ---------------------------------------------------------------------------
+# Per-state voxel set builder
+# ---------------------------------------------------------------------------
+
+
+def build_per_state_voxel_sets(
+    O_move_per_state: Optional[torch.Tensor],         # (K, D, H, W) uint8/bool
+    P_move_evidence_per_state: Optional[torch.Tensor],# (K, D, H, W) float
+    O_base_canonical: Optional[torch.Tensor],         # (D, H, W) uint8/bool
+    is_carpet_mask_flat: torch.Tensor,                # (res^3,) bool
+    res: int = 64,
+    soft_threshold: float = 0.1,
+    min_voxels: int = 20,
+    prefer_soft: bool = True,
+) -> Tuple[List[torch.Tensor], torch.Tensor, List[bool]]:
+    """Build per-state cleaned voxel coordinate lists.
+
+    Returns
+    -------
+    V_per_state_voxel : list of K tensors (N_k, 3) int voxel coords
+                        Empty tensor if state's evidence below min_voxels.
+    V_union_voxel     : (N_union, 3) int voxel coords of OR_k(V_k)
+    valid_mask        : list of K bool, True if state has >= min_voxels
     """
-    if points.shape[0] < 2:
-        raise ValueError("fit_line_3d_pca needs >= 2 points")
-    centroid = points.mean(axis=0)
-    centred = points - centroid
-    # PCA: largest singular vector of centred = line direction
-    # SVD: centred = U S Vt; first row of Vt = principal axis
-    u, s, vt = np.linalg.svd(centred, full_matrices=False)
-    direction = vt[0]
-    direction = direction / (np.linalg.norm(direction) + 1e-12)
-    # Residual: perpendicular distance from each point to line
-    proj = (centred @ direction)[:, None] * direction[None, :]
-    perp = centred - proj
-    residual = float((perp ** 2).sum(axis=-1).mean())
-    return centroid.astype(np.float64), direction.astype(np.float64), residual
-
-
-def fit_circle_3d(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """Best-fit 3D circle to >=3 points.
-
-    Algorithm:
-        1) Fit best-fit plane via PCA (normal = smallest-variance axis).
-        2) Project points into that plane (2D coords in plane basis).
-        3) Algebraic least-squares circle fit in 2D:
-              min over (a, b, r) of sum [(x_i-a)^2 + (y_i-b)^2 - r^2]^2
-           -> linear system in (a, b, c=a^2+b^2-r^2):
-              2*a*x_i + 2*b*y_i - c = x_i^2 + y_i^2
-        4) Lift 2D centre back to 3D.
-
-    points : (n, 3); n >= 3
-    Returns:
-        center_3d  : (3,) circle centre in 3D
-        normal_3d  : (3,) unit vector normal to circle plane (rotation axis)
-        radius     : float
-        residual   : float, mean squared 3D distance from point to circle
-                     ( = (in-plane radial error)^2 + (out-of-plane error)^2 )
-    """
-    n = points.shape[0]
-    if n < 3:
-        raise ValueError("fit_circle_3d needs >= 3 points")
-    # 1) plane fit via PCA
-    centroid = points.mean(axis=0)
-    centred = points - centroid
-    u, s, vt = np.linalg.svd(centred, full_matrices=False)
-    # vt rows = principal axes; smallest variance = plane normal (last)
-    normal = vt[-1]
-    normal = normal / (np.linalg.norm(normal) + 1e-12)
-    # Two in-plane basis vectors = first two rows of vt (orthonormal)
-    e1 = vt[0] / (np.linalg.norm(vt[0]) + 1e-12)
-    e2 = vt[1] / (np.linalg.norm(vt[1]) + 1e-12)
-
-    # 2) project to 2D in (e1, e2) basis
-    pts2d = np.stack([centred @ e1, centred @ e2], axis=1)        # (n, 2)
-    x = pts2d[:, 0]
-    y = pts2d[:, 1]
-
-    # 3) algebraic LS circle fit
-    A = np.stack([2.0 * x, 2.0 * y, -np.ones(n)], axis=1)         # (n, 3)
-    b = x * x + y * y                                              # (n,)
-    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-    a2d, b2d, c = sol[0], sol[1], sol[2]
-    r2 = a2d * a2d + b2d * b2d - c
-    radius = float(np.sqrt(max(r2, 1e-12)))
-
-    # 4) lift centre back to 3D
-    center_3d = centroid + a2d * e1 + b2d * e2
-
-    # Residual: in-plane radial error squared + out-of-plane distance squared
-    in_plane = np.sqrt((x - a2d) ** 2 + (y - b2d) ** 2) - radius     # (n,)
-    out_plane = centred @ normal                                      # (n,)
-    residual = float(np.mean(in_plane ** 2 + out_plane ** 2))
-    return (
-        center_3d.astype(np.float64),
-        normal.astype(np.float64),
-        radius,
-        residual,
+    device = is_carpet_mask_flat.device
+    carpet_3d = is_carpet_mask_flat.reshape(res, res, res).to(device)
+    base_3d = (
+        O_base_canonical.to(device).bool()
+        if O_base_canonical is not None
+        else torch.zeros(res, res, res, dtype=torch.bool, device=device)
     )
 
+    if prefer_soft and P_move_evidence_per_state is not None:
+        src = P_move_evidence_per_state.to(device)
+        K = int(src.shape[0])
+        masks = [(src[k] >= soft_threshold) for k in range(K)]
+    elif O_move_per_state is not None:
+        src = O_move_per_state.to(device)
+        K = int(src.shape[0])
+        masks = [src[k].bool() for k in range(K)]
+    elif P_move_evidence_per_state is not None:
+        src = P_move_evidence_per_state.to(device)
+        K = int(src.shape[0])
+        masks = [(src[k] >= soft_threshold) for k in range(K)]
+    else:
+        raise ValueError(
+            "build_per_state_voxel_sets: need at least one of "
+            "O_move_per_state or P_move_evidence_per_state"
+        )
+
+    V_per_state: List[torch.Tensor] = []
+    valid: List[bool] = []
+    union_mask = torch.zeros(res, res, res, dtype=torch.bool, device=device)
+    for k in range(K):
+        m = masks[k] & (~base_3d) & (~carpet_3d)
+        coords = torch.nonzero(m, as_tuple=False).to(torch.int32)
+        if coords.shape[0] >= min_voxels:
+            V_per_state.append(coords)
+            valid.append(True)
+            union_mask = union_mask | m
+        else:
+            V_per_state.append(torch.zeros(0, 3, dtype=torch.int32, device=device))
+            valid.append(False)
+    V_union = torch.nonzero(union_mask, as_tuple=False).to(torch.int32)
+    return V_per_state, V_union, valid
+
 
 # ---------------------------------------------------------------------------
-# Detection result
+# Candidate generation: phi_k per state given (type, axis, origin)
+# ---------------------------------------------------------------------------
+
+
+def _project_phi_prismatic(
+    V_per_state_world: List[torch.Tensor],
+    axis_unit: torch.Tensor,
+    valid: List[bool],
+    canonical_state_idx: int,
+    percentile: float = 0.5,
+) -> torch.Tensor:
+    """Per-state phi from percentile projection of voxels on axis (signed).
+
+    Uses median (percentile=0.5) which is robust to occlusion-revealed extra
+    voxels; the user noted Stage B per-state count is NOT monotone for prismatic
+    so the median per-state position along axis is more stable than mean or
+    extreme percentile.
+
+    Returns (K,) tensor; NaN for invalid states (filled later by interpolation).
+    """
+    K = len(V_per_state_world)
+    out = torch.full((K,), float("nan"))
+    for k in range(K):
+        if not valid[k]:
+            continue
+        Vk = V_per_state_world[k]
+        proj = (Vk * axis_unit.unsqueeze(0)).sum(dim=-1)
+        out[k] = float(torch.quantile(proj, percentile).item())
+    # Fill NaN by linear interpolation over valid k indices
+    return _interp_nan_linear(out)
+
+
+def _project_phi_revolute(
+    V_per_state_world: List[torch.Tensor],
+    axis_unit: torch.Tensor,
+    origin: torch.Tensor,
+    valid: List[bool],
+    canonical_state_idx: int,
+) -> torch.Tensor:
+    """Per-state phi from angular median around axis. Returns (K,) radians.
+
+    Reference perpendicular = canonical state's centroid - origin, projected
+    perpendicular to axis. NaN-filled by interpolation.
+    """
+    K = len(V_per_state_world)
+    a = axis_unit / axis_unit.norm().clamp_min(1e-12)
+    # Build reference perp from canonical state
+    ref_perp = None
+    if 0 <= canonical_state_idx < K and valid[canonical_state_idx]:
+        Vc = V_per_state_world[canonical_state_idx]
+        cc = Vc.mean(dim=0)
+        v = cc - origin
+        v_perp = v - (v @ a) * a
+        if v_perp.norm().item() > 1e-6:
+            ref_perp = v_perp / v_perp.norm()
+    if ref_perp is None:
+        # Fallback: use first valid state
+        for k in range(K):
+            if not valid[k]:
+                continue
+            ck = V_per_state_world[k].mean(dim=0)
+            v = ck - origin
+            v_perp = v - (v @ a) * a
+            if v_perp.norm().item() > 1e-6:
+                ref_perp = v_perp / v_perp.norm()
+                break
+    if ref_perp is None:
+        return torch.zeros(K)
+
+    out = angular_median_around_axis(
+        V_per_state_world, axis_unit, origin, ref_perp_unit=ref_perp,
+    )
+    return _interp_nan_linear(out)
+
+
+def _interp_nan_linear(x: torch.Tensor) -> torch.Tensor:
+    """Linearly interpolate NaN entries in a 1D tensor."""
+    arr = x.detach().cpu().numpy().astype(np.float64)
+    K = len(arr)
+    valid_idx = np.where(~np.isnan(arr))[0]
+    if len(valid_idx) == K:
+        return torch.from_numpy(arr).float()
+    if len(valid_idx) < 2:
+        # Degenerate: <= 1 valid -> linear ramp 0..1
+        return torch.linspace(0.0, 1.0, K)
+    arr_filled = np.interp(np.arange(K), valid_idx, arr[valid_idx])
+    return torch.from_numpy(arr_filled).float()
+
+
+def _resolve_revolute_origin(
+    axis_unit: torch.Tensor,
+    swept_centroid: torch.Tensor,
+    anchors_world: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Compute origin = point on axis line {swept_centroid + t*axis} nearest to
+    anchor centroid. If anchors absent, return swept_centroid.
+
+    Physical motivation: hinge axis must pass through base-move contact band.
+    """
+    if anchors_world is None or anchors_world.shape[0] == 0:
+        return swept_centroid.clone()
+    anchor_centroid = anchors_world.mean(dim=0)
+    t_star = float((anchor_centroid - swept_centroid) @ axis_unit)
+    return swept_centroid + t_star * axis_unit
+
+
+# ---------------------------------------------------------------------------
+# Public result schema
 # ---------------------------------------------------------------------------
 
 
 @dataclass
+class CandidateResult:
+    """One (type, axis, origin, phi_k) candidate + its score."""
+
+    type_str: str                        # "prismatic" | "revolute"
+    axis: torch.Tensor                   # (3,) cardinal unit vector
+    origin: torch.Tensor                 # (3,) world
+    phi_k: torch.Tensor                  # (K,) per-state progress
+    score: CandidateScore                # voxel-level physical score breakdown
+
+
+@dataclass
 class JointTypeResult:
-    type_str: str                  # "prismatic" | "revolute" | "uncertain"
-    type_logit: float              # raw log-ratio (positive -> prismatic)
-    confidence: float              # in [0, 1]
-    residual_line: float
-    residual_arc: float
-    line_origin: np.ndarray        # (3,) world space
-    line_direction: np.ndarray     # (3,) unit
-    arc_center: Optional[np.ndarray]    # (3,) world space, None if arc fit unavailable
-    arc_normal: Optional[np.ndarray]    # (3,) unit
-    arc_radius: Optional[float]
-    n_valid_states: int            # how many centroids were usable
+    """v3 dual-candidate output (replaces v2 single line-vs-arc result)."""
+
+    # Selected primary
+    type_str: str                        # "prismatic" | "revolute" | "uncertain"
+    type_logit: float                    # log(best_pris.score / best_rev.score)
+    confidence: float                    # |type_logit| / margin_norm, clamped [0,1]
+
+    # Best candidate per type (Stage D dual-clone uses both)
+    best_pris: Optional[CandidateResult] = None
+    best_rev: Optional[CandidateResult] = None
+
+    # All candidates for diagnostics
+    all_candidates: List[CandidateResult] = field(default_factory=list)
+
+    # Voxel-statistical diagnostics
+    n_valid_states: int = 0
+    pris_geom_scores: Optional[torch.Tensor] = None  # (6,) FreeArt3D argmax values
+    rev_geom_scores: Optional[torch.Tensor] = None   # (6,) FreeArt3D argmin values
+
+    # Legacy fields for confidence.py / run_stage_c_init.py compatibility
+    residual_line: float = float("inf")
+    residual_arc: float = float("inf")
+    line_origin: Optional[np.ndarray] = None
+    line_direction: Optional[np.ndarray] = None
+    arc_center: Optional[np.ndarray] = None
+    arc_normal: Optional[np.ndarray] = None
+    arc_radius: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,112 +287,182 @@ class JointTypeResult:
 # ---------------------------------------------------------------------------
 
 
-def detect_joint_type(
-    geom: PerStateMoveGeom,
-    type_decision_margin: float = 0.15,
-    arc_min_states: int = 4,
-    eps: float = 1e-8,
+def detect_joint_type_v3(
+    V_per_state_voxel: List[torch.Tensor],            # K tensors of (N_k, 3) int
+    V_union_voxel: torch.Tensor,                       # (N_u, 3) int
+    valid_state: List[bool],
+    O_base_canonical: Optional[torch.Tensor],         # (res, res, res) for conflict check
+    anchors_voxel: Optional[torch.Tensor],            # (N_a, 3) int, may be None
+    canonical_state_idx: int = 2,
+    res: int = 64,
+    type_margin: float = 0.20,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
 ) -> JointTypeResult:
-    """Decide joint type from per-state move centroids.
+    """v3 cardinal-cand + voxel-scoring joint type detection.
 
-    Logic:
-      1. Need >= 2 valid centroids to even fit a line. If less, return
-         "uncertain" with confidence=0 (Stage D will dual-clone branch).
-      2. Need >= arc_min_states centroids for arc fit; if fewer, only line fit
-         available -> default prismatic with confidence depending on line
-         residual / length-scale ratio.
-      3. Otherwise fit both, compute type_logit = log(arc) - log(line),
-         convert margin to confidence in [0, 1].
-
-    The length scale used for confidence normalisation is the centroid
-    trajectory length (sum of consecutive pairwise distances), which is the
-    natural "how far did things move" magnitude.
-
-    Parameters mirror StageCConfig.
+    Replaces v2's centroid line-vs-arc residual ratio.
     """
-    cents_t, ks = valid_centroid_subset(geom)
-    n_valid = int(cents_t.shape[0])
+    if device is None:
+        device = V_union_voxel.device
+    K = len(V_per_state_voxel)
+    n_valid = int(sum(valid_state))
 
-    if n_valid < 2:
-        # Not enough data to fit anything
+    if n_valid < 2 or V_union_voxel.shape[0] < 10:
+        # Degenerate input
         return JointTypeResult(
-            type_str="uncertain",
-            type_logit=0.0,
-            confidence=0.0,
-            residual_line=float("inf"),
-            residual_arc=float("inf"),
-            line_origin=np.zeros(3, dtype=np.float64),
-            line_direction=np.array([1.0, 0.0, 0.0], dtype=np.float64),
-            arc_center=None,
-            arc_normal=None,
-            arc_radius=None,
+            type_str="uncertain", type_logit=0.0, confidence=0.0,
             n_valid_states=n_valid,
         )
 
-    points = cents_t.detach().cpu().numpy().astype(np.float64)
-    length_scale = max(centroid_trajectory_length(geom), eps)
+    # ---- Step A: World coordinates ----
+    V_per_state_world: List[torch.Tensor] = []
+    for V_int in V_per_state_voxel:
+        if V_int.shape[0] == 0:
+            V_per_state_world.append(torch.zeros(0, 3, device=device, dtype=dtype))
+        else:
+            V_per_state_world.append(
+                voxel_to_world(V_int, res=res).to(device=device, dtype=dtype)
+            )
+    V_union_world = voxel_to_world(V_union_voxel, res=res).to(device=device, dtype=dtype)
+    swept_centroid = V_union_world.mean(dim=0)
+    anchors_world = (
+        voxel_to_world(anchors_voxel, res=res).to(device=device, dtype=dtype)
+        if anchors_voxel is not None and anchors_voxel.shape[0] > 0
+        else None
+    )
 
-    line_origin, line_dir, res_line = fit_line_3d_pca(points)
+    # ---- Step B: FreeArt3D-style axis invariant (geometric prior) ----
+    pris_geom, rev_geom = freeart3d_axis_invariant(V_per_state_world)
 
-    if n_valid < arc_min_states:
-        # Arc fit not reliable -- default to prismatic.
-        # Confidence = how well the line fits relative to overall move size.
-        norm_res = res_line / (length_scale * length_scale + eps)
-        # norm_res small -> confident prismatic; large -> uncertain
-        conf = float(np.exp(-norm_res * 50.0))
-        return JointTypeResult(
-            type_str="prismatic",
-            type_logit=type_decision_margin * 2.0,   # mild prismatic bias
-            confidence=max(0.0, min(conf, 1.0)),
-            residual_line=res_line,
-            residual_arc=float("inf"),
-            line_origin=line_origin,
-            line_direction=line_dir,
-            arc_center=None,
-            arc_normal=None,
-            arc_radius=None,
-            n_valid_states=n_valid,
+    # ---- Step C+D: Enumerate cardinal candidates per type, score each ----
+    cardinals = cardinal_axes(device, dtype)             # (6, 3)
+    all_candidates: List[CandidateResult] = []
+    pris_candidates: List[CandidateResult] = []
+    rev_candidates: List[CandidateResult] = []
+
+    for axis_idx in range(6):
+        a = cardinals[axis_idx].clone()
+
+        # ===== Prismatic candidate =====
+        origin_pris = swept_centroid.clone()  # any point on axis OK for prismatic
+        phi_pris = _project_phi_prismatic(
+            V_per_state_world, a, valid_state, canonical_state_idx,
         )
+        # Sign convention: ensure phi advances with k (else flip axis + phi sign)
+        if int(K) >= 2:
+            first_valid = next((k for k in range(K) if valid_state[k]), 0)
+            last_valid = next((k for k in range(K - 1, -1, -1) if valid_state[k]), K - 1)
+            if phi_pris[last_valid].item() < phi_pris[first_valid].item():
+                a_signed = -a
+                phi_pris = -phi_pris
+            else:
+                a_signed = a
+        else:
+            a_signed = a
 
-    # Full case: both fits available
-    arc_center, arc_normal, arc_radius, res_arc = fit_circle_3d(points)
+        score_pris = reverse_align_and_score(
+            joint_type="prismatic",
+            axis=a_signed,
+            origin=origin_pris,
+            phi_k=phi_pris,
+            canonical_state_idx=canonical_state_idx,
+            V_per_state_voxel=V_per_state_voxel,
+            V_union_voxel=V_union_voxel,
+            O_base_canonical=O_base_canonical,
+            anchors_world=anchors_world,
+            res=res,
+        )
+        c_pris = CandidateResult(
+            type_str="prismatic", axis=a_signed, origin=origin_pris,
+            phi_k=phi_pris, score=score_pris,
+        )
+        pris_candidates.append(c_pris)
+        all_candidates.append(c_pris)
 
-    # Normalised log-ratio: log(res_arc/L^2 + eps) - log(res_line/L^2 + eps)
-    # Equivalently: log(res_arc) - log(res_line) (L^2 cancels)
-    type_logit = float(np.log(res_arc + eps) - np.log(res_line + eps))
+        # ===== Revolute candidate =====
+        origin_rev = _resolve_revolute_origin(a, swept_centroid, anchors_world)
+        phi_rev = _project_phi_revolute(
+            V_per_state_world, a, origin_rev, valid_state, canonical_state_idx,
+        )
+        if int(K) >= 2:
+            first_valid = next((k for k in range(K) if valid_state[k]), 0)
+            last_valid = next((k for k in range(K - 1, -1, -1) if valid_state[k]), K - 1)
+            if phi_rev[last_valid].item() < phi_rev[first_valid].item():
+                a_rev = -a
+                phi_rev = -phi_rev
+                origin_rev = _resolve_revolute_origin(a_rev, swept_centroid, anchors_world)
+            else:
+                a_rev = a
+        else:
+            a_rev = a
 
-    # Confidence from margin |type_logit| relative to decision threshold
-    # confidence = clamp((|type_logit| - margin/2) / margin, 0, 1) + small offset
-    abs_logit = abs(type_logit)
-    if abs_logit < type_decision_margin * 0.5:
-        # Near-zero margin: residuals are comparable -> low confidence
-        conf = float(abs_logit / max(type_decision_margin, eps))
-        type_str = "uncertain"
+        score_rev = reverse_align_and_score(
+            joint_type="revolute",
+            axis=a_rev,
+            origin=origin_rev,
+            phi_k=phi_rev,
+            canonical_state_idx=canonical_state_idx,
+            V_per_state_voxel=V_per_state_voxel,
+            V_union_voxel=V_union_voxel,
+            O_base_canonical=O_base_canonical,
+            anchors_world=anchors_world,
+            res=res,
+        )
+        c_rev = CandidateResult(
+            type_str="revolute", axis=a_rev, origin=origin_rev,
+            phi_k=phi_rev, score=score_rev,
+        )
+        rev_candidates.append(c_rev)
+        all_candidates.append(c_rev)
+
+    # ---- Step E: Best per type + type decision ----
+    best_pris = max(pris_candidates, key=lambda c: c.score.score)
+    best_rev = max(rev_candidates, key=lambda c: c.score.score)
+
+    eps = 1e-6
+    s_pris = max(best_pris.score.score, eps)
+    s_rev = max(best_rev.score.score, eps)
+    type_logit = float(math.log(s_pris / s_rev))
+
+    if type_logit > type_margin:
+        type_str = "prismatic"
+    elif type_logit < -type_margin:
+        type_str = "revolute"
     else:
-        # Beyond margin: confidence saturates as logit grows
-        # Saturate around 3*margin -> conf ~ 0.95
-        conf = float(1.0 - np.exp(-abs_logit / max(type_decision_margin, eps)))
-        type_str = "prismatic" if type_logit > 0.0 else "revolute"
+        type_str = "uncertain"
 
-    # Also weight by absolute residual quality (both residuals should be
-    # small relative to length-scale; if both are large, neither fits well).
-    min_res = min(res_line, res_arc)
-    norm_min_res = min_res / (length_scale * length_scale + eps)
-    fit_quality = float(np.exp(-norm_min_res * 50.0))   # 1 when good fit, ->0 when bad
-    conf = conf * fit_quality
-
-    conf = max(0.0, min(conf, 1.0))
+    # Confidence from margin
+    confidence = float(min(abs(type_logit) / max(type_margin * 2.0, eps), 1.0))
 
     return JointTypeResult(
         type_str=type_str,
         type_logit=type_logit,
-        confidence=conf,
-        residual_line=res_line,
-        residual_arc=res_arc,
-        line_origin=line_origin,
-        line_direction=line_dir,
-        arc_center=arc_center,
-        arc_normal=arc_normal,
-        arc_radius=arc_radius,
+        confidence=confidence,
+        best_pris=best_pris,
+        best_rev=best_rev,
+        all_candidates=all_candidates,
         n_valid_states=n_valid,
+        pris_geom_scores=pris_geom.detach().cpu(),
+        rev_geom_scores=rev_geom.detach().cpu(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat wrapper for run_stage_c_init.py + confidence.py
+# ---------------------------------------------------------------------------
+
+
+def detect_joint_type(*args, **kwargs):  # type: ignore[no-untyped-def]
+    """Legacy entry name kept for compatibility with existing imports.
+
+    New code should call `detect_joint_type_v3` directly with explicit args.
+    This wrapper is intentionally minimal -- callers pass the v3 signature.
+    """
+    return detect_joint_type_v3(*args, **kwargs)
+
+
+__all__ = [
+    "JointTypeResult", "CandidateResult", "detect_joint_type_v3", "detect_joint_type",
+    "build_per_state_voxel_sets", "cardinal_axes",
+]
