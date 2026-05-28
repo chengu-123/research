@@ -5,7 +5,7 @@ method.md section 9.1 enumerates the full loss list:
     L_total = lambda_sds   * L_sds        (W-RFSDS through Wan2.2)
             + lambda_lat   * L_lat_rec    (auxiliary, off by default; C2)
             + lambda_rgb   * L_rgb_rec    (L1 + LPIPS vs Wan video target)
-            + lambda_first * L_first      (frame 0 vs Wan-canonical s_0)
+            + lambda_first * L_first      (frame 0 vs no-carpet s_0_pure)
             + lambda_contact * L_contact  (axis-through-anchor-band prior)
             + lambda_gate  * L_gate       (encourages g, m -> {0, 1})
             + lambda_shell * L_shell      (sparsity on uncertain shell voxels)
@@ -125,10 +125,10 @@ def loss_rgb_recon(
 
 def loss_first_frame_anchor(
     rgb_T3HW: torch.Tensor,
-    s_0_with_carpet_3HW: torch.Tensor,
+    s_0_pure_3HW: torch.Tensor,
     lpips_module: LPIPSModule,
 ) -> torch.Tensor:
-    """Frame 0 of rendered video vs the Wan-canonical ``s_0_with_carpet``.
+    """Frame 0 of rendered video vs the no-carpet ``s_0_pure`` reference.
 
     With NEW.1 canonical-state shift (c=2), rendering frame 0 means the
     canonical asset is *back-warped* by SE(3)(phi[0]) (negative phi for
@@ -140,20 +140,20 @@ def loss_first_frame_anchor(
     Parameters
     ----------
     rgb_T3HW : Tensor [F, 3, H, W] in [0, 1]
-    s_0_with_carpet_3HW : Tensor [3, H, W] in [0, 1]
+    s_0_pure_3HW : Tensor [3, H, W] in [0, 1]
     """
     if rgb_T3HW.ndim != 4 or rgb_T3HW.shape[1] != 3:
         raise ValueError(
             f"rgb_T3HW must be [F, 3, H, W]; got {tuple(rgb_T3HW.shape)}"
         )
     expected_s0 = (3, int(rgb_T3HW.shape[2]), int(rgb_T3HW.shape[3]))
-    if s_0_with_carpet_3HW.shape != expected_s0:
+    if s_0_pure_3HW.shape != expected_s0:
         raise ValueError(
-            f"s_0_with_carpet must be {expected_s0}; "
-            f"got {tuple(s_0_with_carpet_3HW.shape)}"
+            f"s_0_pure must be {expected_s0}; "
+            f"got {tuple(s_0_pure_3HW.shape)}"
         )
     frame_0 = rgb_T3HW[0:1]                                          # [1, 3, H, W]
-    target = s_0_with_carpet_3HW.unsqueeze(0).to(frame_0.dtype)     # [1, 3, H, W]
+    target = s_0_pure_3HW.unsqueeze(0).to(frame_0.dtype)            # [1, 3, H, W]
     target = target.to(frame_0.device)
     l1 = F.l1_loss(frame_0, target)
     lp = lpips_module(frame_0, target)
@@ -302,7 +302,7 @@ class LossInputs:
 
     # Static Bootstrap-derived inputs
     wan_video_target_T3HW_01: torch.Tensor  # [F, 3, H, W] in [0, 1]
-    s_0_with_carpet_3HW_01: torch.Tensor    # [3, H, W] in [0, 1]
+    s_0_pure_3HW_01: torch.Tensor           # [3, H, W] in [0, 1]
     z_wan_target: torch.Tensor              # [16, F_lat, H_lat, W_lat]
     anchors_world: torch.Tensor             # [N_a, 3]
     shell_mask: torch.Tensor                # [N_obj] bool
@@ -387,8 +387,8 @@ def aggregate_loss(
     else:
         log["L_rgb"] = 0.0
 
-    # ---- L_first (frame 0 vs Wan-canonical s_0; ALWAYS on, fixed weight) ----
-    L_first = loss_first_frame_anchor(rgb_T3HW, inp.s_0_with_carpet_3HW_01, lpips_module)
+    # ---- L_first (frame 0 vs no-carpet s_0_pure; ALWAYS on, fixed weight) ----
+    L_first = loss_first_frame_anchor(rgb_T3HW, inp.s_0_pure_3HW_01, lpips_module)
     total = total + cfg_lambdas_first * L_first
     log["L_first"] = float(L_first.detach().item())
 

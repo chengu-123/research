@@ -25,7 +25,7 @@ Bootstrap artifact contract (loaded by
 ``bootstrap_dir/`` (z_s0, z_slat0, slat_mean/std/shell_mask, U_object,
 gaussian_parent_idx, psi_0, phi_0 [canonical-shifted], anchors_object,
 M_attn_boot_64, is_carpet_mask, trellis_cond_can, wan_cond_cached,
-z_wan_target, wan_video_target_3FHW, s_0_with_carpet / s_0_clean).
+z_wan_target, wan_video_target_3FHW, s_0_pure).
 """
 from __future__ import annotations
 

@@ -272,16 +272,18 @@ def schedule_w_rfsds_weights(f_global: float, cfg: StageDConfig
                               ) -> Tuple[float, float, float]:
     """``(lambda_sds, lambda_lat, lambda_rgb)``.
 
-    method.md section 10.1 defaults:
-        warmup_g_minus :  0.0, 0.0, 0.0     (no W-RFSDS, no Wan call)
-        warmup_g0      :  1.0, 0.0, 0.0     (SDS only, no latent recon, no rgb)
-        main_g1a/b     :  1.0, 0.1, 0.0     (SDS + light lat_rec for stability)
-        transition     :  0.5, 0.5, 0.1     (SDS down, lat_rec up, rgb starts)
-        post (Stage F) :  handled by Stage F itself
+    P1 follows the CHORD-style W-RFSDS path: the video prior supplies SDS
+    gradients, while the explicit supervised anchor is the no-carpet
+    ``s_0_pure`` frame in ``L_first``. Bootstrap still keeps the carpeted
+    Stage A video for Stage B/debug, so latent/RGB reconstruction against
+    that 21-frame video must stay off here.
 
-    Note: ``lambda_lat`` is for ``latent_recon_loss`` (not in CHORD). Stage D
-    keeps it disabled by default at 0 in P1 (C2 fix). The values above are
-    the legacy v3.3 defaults; set them to 0 to ablate.
+    Defaults:
+        warmup_g_minus :  0.0, 0.0, 0.0     (no W-RFSDS, no Wan call)
+        warmup_g0      :  1.0, 0.0, 0.0     (SDS only)
+        main_g1a/b     :  1.0, 0.0, 0.0     (SDS only)
+        transition     :  0.5, 0.0, 0.0     (SDS down)
+        post (Stage F) :  handled by Stage F itself
     """
     phase = phase_of(f_global, cfg)
     if phase == "warmup_g_minus":
@@ -289,10 +291,10 @@ def schedule_w_rfsds_weights(f_global: float, cfg: StageDConfig
     if phase == "warmup_g0":
         return 1.0, 0.0, 0.0
     if phase in ("main_g1a", "main_g1b"):
-        return 1.0, 0.1, 0.0
+        return 1.0, 0.0, 0.0
     if phase == "transition":
-        return 0.5, 0.5, 0.1
-    return 0.2, 1.0, 1.0    # post / handed off to Stage F
+        return 0.5, 0.0, 0.0
+    return 0.2, 0.0, 0.0    # post / handed off to Stage F
 
 
 def schedule_lambda_shell(f_global: float, cfg: StageDConfig) -> float:

@@ -226,25 +226,14 @@ def load_bootstrap_bundle(
             f"got {tuple(z_wan_target.shape)}"
         )
 
-    # s_0_with_carpet may be saved as s_0_clean.pt (legacy name) or
-    # s_0_with_carpet.pt (v3.3 name). Try the v3.3 name first.
-    s0_path_v33 = os.path.join(bootstrap_dir, "s_0_with_carpet.pt")
-    s0_path_legacy = os.path.join(bootstrap_dir, "s_0_clean.pt")
-    if os.path.isfile(s0_path_v33):
-        s_0 = _load_pt(s0_path_v33)
-    elif os.path.isfile(s0_path_legacy):
-        s_0 = _load_pt(s0_path_legacy)
-    else:
-        raise FileNotFoundError(
-            f"s_0 input missing: expected {s0_path_v33!r} or {s0_path_legacy!r}"
-        )
-    s_0 = s_0.to(device)
-    if s_0.dtype == torch.uint8:
-        s_0 = s_0.float() / 255.0
-    if s_0.shape != (3, H_loaded, W_loaded):
+    s0_pure_path = os.path.join(bootstrap_dir, "s_0_pure.pt")
+    s_0_pure = _load_pt(s0_pure_path).to(device)
+    if s_0_pure.dtype == torch.uint8:
+        s_0_pure = s_0_pure.float() / 255.0
+    if s_0_pure.shape != (3, H_loaded, W_loaded):
         raise RuntimeError(
-            f"s_0_with_carpet shape mismatch: expected "
-            f"(3, {H_loaded}, {W_loaded}); got {tuple(s_0.shape)}"
+            f"s_0_pure shape mismatch: expected "
+            f"(3, {H_loaded}, {W_loaded}); got {tuple(s_0_pure.shape)}"
         )
 
     return BootstrapBundle(
@@ -262,7 +251,7 @@ def load_bootstrap_bundle(
         trellis_cond_can=trellis_cond_can,
         wan_cond=wan_cond_on_dev, z_wan_target=z_wan_target,
         wan_video_target_T3HW_01=wan_video_target_T3HW_01,
-        s_0_with_carpet_3HW_01=s_0,
+        s_0_pure_3HW_01=s_0_pure,
         frame_num=int(F_FRAMES),
         resolution_hw=(H_loaded, W_loaded),
         latent_hw=(expected_z[2], expected_z[3]),
@@ -331,7 +320,7 @@ def run_stage_d_main(
         +Z up). TRELLIS canonical world up is verified +Z via
         ``trellis/utils/render_utils.py:33``. The iter-0 silhouette IoU
         sanity check inside ``train_stage_d_p1`` validates against
-        ``s_0_with_carpet``; failure raises ``CameraMismatchError``.
+        ``s_0_pure``; failure raises ``CameraMismatchError``.
 
     Returns the training summary dict (committed_type, n_iters_run,
     type_vote details, iter_0_camera_iou, etc).
@@ -370,7 +359,7 @@ def run_stage_d_main(
         )
         logger.info(
             "[stage_d] using freeart3d_canonical camera (TRELLIS +Z up); "
-            "iter-0 sanity check will validate against s_0_with_carpet."
+            "iter-0 sanity check will validate against s_0_pure."
         )
     locked_camera = build_locked_camera(camera, device=dev, dtype=torch.float32)
     lpips_module = LPIPSModule(net_type=lpips_net).to(dev)

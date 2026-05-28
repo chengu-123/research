@@ -161,7 +161,7 @@ class StageDConfig:
     T_m_transition_end: float = 0.2
 
     # ---- Loss weights (phase-gated; see schedules.py) ----
-    lambda_first: float = 1.0           # frame 0 anchor to s_0_with_carpet
+    lambda_first: float = 1.0           # frame 0 anchor to no-carpet s_0_pure
     lambda_contact: float = 0.2         # axis-through-anchor band
     lambda_gate: float = 0.05           # rounds g, m to {0, 1}
     lambda_shell_main: float = 0.02     # shell sparsity (D-v3.14)
@@ -175,7 +175,7 @@ class StageDConfig:
     lambda_joint_max: float = 0.5
 
     # ---- Stage C.5 periodic silhouette check (S1) ----
-    silhouette_check_every: int = 1000  # iters
+    silhouette_check_every: int = 0     # disabled unless a no-carpet video target exists
     silhouette_iou_threshold: float = 0.85
     silhouette_n_states: int = 4        # how many states to check (subsampled from K)
     silhouette_expand_dilate: int = 2

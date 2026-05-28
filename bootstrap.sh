@@ -16,6 +16,7 @@
 #   cd /path/to/mine
 #   sbatch bootstrap.sh outputs/30857 "A brown wooden desk. The right drawer slides open, smoothly and completely pulling outward. "
 #   BOOTSTRAP_INPUT_MODE=six_images IMAGE_DIR=~/hf_models/PartNet/30857 sbatch bootstrap.sh outputs/30857 "..."
+#   PURE_IMAGE=~/hf_models/PartNet/30857/00_pure.png sbatch bootstrap.sh outputs/30857 "..."
 #
 # Stage A video input:
 #   outputs/30857/stage_a/wan_video_target_3FHW_uint8.pt
@@ -51,6 +52,7 @@ BOOTSTRAP_INPUT_MODE="${BOOTSTRAP_INPUT_MODE:-stagea_video}"
 STAGEA_VIDEO="${STAGEA_VIDEO:-}"
 IMAGE_DIR="${IMAGE_DIR:-}"
 IMAGE_PATTERN="${IMAGE_PATTERN:-rendering_joint_00_state_{i:02d}.png}"
+PURE_IMAGE="${PURE_IMAGE:-}"
 
 INPUT_ARGS=(--input_mode "${BOOTSTRAP_INPUT_MODE}")
 if [[ "${BOOTSTRAP_INPUT_MODE}" == "stagea_video" ]]; then
@@ -68,9 +70,24 @@ else
   exit 2
 fi
 
+if [[ -z "${PURE_IMAGE}" ]]; then
+  if [[ -n "${IMAGE_DIR}" ]]; then
+    PURE_IMAGE="${IMAGE_DIR}/00_pure.png"
+  else
+    RUN_ID="$(basename "${OUTPUT_ROOT}")"
+    PURE_IMAGE="${HOME}/hf_models/PartNet/${RUN_ID}/00_pure.png"
+  fi
+fi
+if [[ ! -f "${PURE_IMAGE}" ]]; then
+  echo "ERROR: PURE_IMAGE not found: ${PURE_IMAGE}" >&2
+  echo "Set PURE_IMAGE to the no-carpet 00_pure.png that matches the Stage A 00_seg.png." >&2
+  exit 2
+fi
+
 python scripts/bootstrap.py \
     --output_dir "${OUTPUT_ROOT}" \
     "${INPUT_ARGS[@]}" \
+    --s0_pure "${PURE_IMAGE}" \
     --motion "${PROMPT}" \
     --wan_ckpt "${WAN_CKPT}" \
     --device "${DEVICE}" \

@@ -135,7 +135,7 @@ class CameraMismatchError(RuntimeError):
 
 def iter_0_camera_check(
     rendered_frame_0_3HW: torch.Tensor,
-    s_0_with_carpet_3HW: torch.Tensor,
+    s_0_pure_3HW: torch.Tensor,
     iou_threshold: float = 0.5,
     save_diag_to: Optional[str] = None,
 ) -> float:
@@ -143,12 +143,12 @@ def iter_0_camera_check(
 
     Called ONCE at training iter 0 (before any optimization step). Renders
     frame 0 of the current 3D under the configured camera, computes the
-    silhouette IoU against the Wan-canonical ``s_0_with_carpet`` image, and raises
+    silhouette IoU against the no-carpet ``s_0_pure`` image, and raises
     ``CameraMismatchError`` if IoU is below ``iou_threshold``. This catches
     the most common Stage D bug — wrong camera convention — at iter 0
     rather than after a long failed training run.
 
-    The silhouette of ``s_0_with_carpet`` is the frame-0 observation foreground;
+    The silhouette of ``s_0_pure`` is the frame-0 observation foreground;
     the silhouette of the render is the rasterized foreground (alpha-like).
     Both use the ``silhouette_from_rgb`` heuristic (sum-channel > thresh
     over black bg). If your bg is not black, override that explicitly.
@@ -157,8 +157,8 @@ def iter_0_camera_check(
     ----------
     rendered_frame_0_3HW : Tensor [3, H, W] in [0, 1]
         Frame 0 of the current iter's render (no grad needed).
-    s_0_with_carpet_3HW : Tensor [3, H, W] in [0, 1]
-        Real user-supplied input image (from Bootstrap).
+    s_0_pure_3HW : Tensor [3, H, W] in [0, 1]
+        No-carpet frame-0 reference image (from Bootstrap).
     iou_threshold : float
         Below this, raise CameraMismatchError. Default 0.5 = conservative
         (catches large mismatches; will pass with small angular offsets
@@ -175,15 +175,15 @@ def iter_0_camera_check(
         raise ValueError(
             f"rendered_frame_0 must be [3, H, W]; got {tuple(rendered_frame_0_3HW.shape)}"
         )
-    if s_0_with_carpet_3HW.shape != rendered_frame_0_3HW.shape:
+    if s_0_pure_3HW.shape != rendered_frame_0_3HW.shape:
         raise ValueError(
             f"shape mismatch: render={tuple(rendered_frame_0_3HW.shape)}, "
-            f"s_0={tuple(s_0_with_carpet_3HW.shape)}"
+            f"s_0_pure={tuple(s_0_pure_3HW.shape)}"
         )
 
     # silhouette_from_rgb expects [T, 3, H, W]; unsqueeze a temporal dim.
     sil_pred = silhouette_from_rgb(rendered_frame_0_3HW.unsqueeze(0))
-    sil_target = silhouette_from_rgb(s_0_with_carpet_3HW.unsqueeze(0))
+    sil_target = silhouette_from_rgb(s_0_pure_3HW.unsqueeze(0))
     iou = silhouette_iou(sil_pred, sil_target)
 
     if save_diag_to is not None:
@@ -196,7 +196,7 @@ def iter_0_camera_check(
         from PIL import Image
         r = (rendered_frame_0_3HW.detach().cpu()
              .float().clamp(0, 1) * 255).round().to(torch.uint8).numpy()
-        t = (s_0_with_carpet_3HW.detach().cpu()
+        t = (s_0_pure_3HW.detach().cpu()
              .float().clamp(0, 1) * 255).round().to(torch.uint8).numpy()
         # [3, H, W] -> [H, W, 3]
         r_hwc = _np.transpose(r, (1, 2, 0))
@@ -211,7 +211,7 @@ def iter_0_camera_check(
             f"Iter-0 camera sanity check FAILED: rendered frame 0 vs s_0 "
             f"silhouette IoU = {iou:.3f} < threshold {iou_threshold:.3f}. "
             "This means the render camera does not match the camera that "
-            "produced s_0_with_carpet. "
+            "produced s_0_pure. "
             "If your input is a PartNet image rendered by FreeArt3D "
             "(mine/pipelines/render.py), the default "
             "StageDCameraConfig.freeart3d_canonical() should already match "

@@ -39,6 +39,7 @@ OUTPUT LAYOUT:
         z_wan_target.pt
         wan_video_target_3FHW.pt
         s_0_clean.pt
+        s_0_pure.pt
         bootstrap_meta.json
 """
 
@@ -98,6 +99,7 @@ class BootstrapConfig:
     stage_image_dir: Optional[str] = None
     stage_image_pattern: str = "rendering_joint_00_state_{i:02d}.png"
     stage_image_paths: Tuple[str, ...] = ()
+    s_0_pure_path: Optional[str] = None
 
     # ---- B2 (K=6 frame sampling) -----------------------------------------
     state_indices: Tuple[int, ...] = (0, 4, 8, 12, 16, 20)
@@ -206,6 +208,7 @@ class BootstrapResult:
     trellis_cond_can: torch.Tensor                    # (1, N_dino, 1024) DINOv2(s_0_carpet)
     wan_video_target_3FHW: torch.Tensor               # (3, F, H, W) uint8
     s_0_clean: torch.Tensor                           # (3, H, W) float [0,1]
+    s_0_pure: torch.Tensor                            # (3, H, W) float [0,1], no carpet
 
     # Stage B v3.3.6 secondary outputs (passed through)
     O_base_canonical: torch.Tensor                    # (64, 64, 64) uint8
@@ -328,6 +331,41 @@ def _pil_to_rgb_uint8_chw(image: Image.Image) -> torch.Tensor:
     alpha = rgba[:, :, 3:4] / 255.0
     premultiplied = (rgb * alpha).round().clip(0.0, 255.0).astype(np.uint8)
     return torch.from_numpy(np.transpose(premultiplied, (2, 0, 1))).contiguous()
+
+
+def _load_s0_pure_reference(
+    image_path: str,
+    target_hw: Tuple[int, int],
+) -> torch.Tensor:
+    """Load the no-carpet frame-0 reference and resize to Stage A H/W."""
+    p = os.path.abspath(os.fspath(image_path))
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"s_0_pure image not found: {p}")
+    H_tgt, W_tgt = int(target_hw[0]), int(target_hw[1])
+    if H_tgt <= 0 or W_tgt <= 0:
+        raise ValueError(f"target_hw must be positive; got {target_hw}")
+
+    image = Image.open(p).convert("RGBA")
+    s0 = _pil_to_rgb_uint8_chw(image).float() / 255.0
+    H_src, W_src = int(s0.shape[1]), int(s0.shape[2])
+    src_aspect = float(W_src) / float(H_src)
+    tgt_aspect = float(W_tgt) / float(H_tgt)
+    rel_aspect_err = abs(src_aspect - tgt_aspect) / max(tgt_aspect, 1.0e-6)
+    if rel_aspect_err > 0.02:
+        raise ValueError(
+            f"s_0_pure aspect mismatch: image shape=({H_src}, {W_src}) "
+            f"but Stage A target shape=({H_tgt}, {W_tgt}); relative error "
+            f"{rel_aspect_err:.4f} > 0.02. The pure image must come from the "
+            "same camera and source folder as 00_seg."
+        )
+    if (H_src, W_src) != (H_tgt, W_tgt):
+        s0 = F.interpolate(
+            s0.unsqueeze(0),
+            size=(H_tgt, W_tgt),
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze(0).clamp(0.0, 1.0)
+    return s0.contiguous()
 
 
 def _tensor_frame_to_rgb_pil(frame_3hw_uint8: torch.Tensor) -> Image.Image:
@@ -1065,7 +1103,7 @@ def _run_b8_slat_sampler(
 
 
 def _run_b10_wan_cond(
-    s_0_clean: torch.Tensor,
+    s_0_pure: torch.Tensor,
     user_motion_prompt: str,
     cfg: BootstrapConfig,
     wan_t5: Any = None,
@@ -1074,7 +1112,7 @@ def _run_b10_wan_cond(
     """Build cached Wan I2V condition dict.
 
     Per method.md section 5.4 + Wan2.2 image2video.py:259-323:
-      1. Normalise s_0_clean to [-1, 1] and resize to (H, W) target.
+      1. Normalise s_0_pure to [-1, 1] and resize to (H, W) target.
       2. Build a (3, F, H, W) "fake video": first frame = s_0, rest = zeros.
       3. wan_vae.encode -> y_vae (16, F_lat, h_lat, w_lat).
       4. Build 4-channel mask: frame 0 visible, frames 1.. masked.
@@ -1108,10 +1146,10 @@ def _run_b10_wan_cond(
     lat_h = H // vae_stride[1]
     lat_w = W // vae_stride[2]
 
-    # Step 1+2: prepare s_0 as image-frame-1 of a zero-padded video.
-    # s_0_clean is (3, H_in, W_in) in [0, 1]. Resize to target (H, W),
+    # Step 1+2: prepare s_0_pure as image-frame-1 of a zero-padded video.
+    # s_0_pure is (3, H_in, W_in) in [0, 1]. Resize to target (H, W),
     # normalise to [-1, 1].
-    img = s_0_clean.to(device=device, dtype=torch.float32)
+    img = s_0_pure.to(device=device, dtype=torch.float32)
     if img.shape[-2] != H or img.shape[-1] != W:
         img = F.interpolate(
             img.unsqueeze(0), size=(H, W), mode="bicubic", align_corners=False,
@@ -1284,6 +1322,7 @@ def _save_bootstrap_artifacts(result: BootstrapResult, out_dir: str, cfg: Bootst
     _save_tensor("trellis_cond_can", result.trellis_cond_can)
     _save_tensor("wan_video_target_3FHW", result.wan_video_target_3FHW)
     _save_tensor("s_0_clean", result.s_0_clean)
+    _save_tensor("s_0_pure", result.s_0_pure)
     if result.z_wan_target is not None:
         _save_tensor("z_wan_target", result.z_wan_target)
     if result.wan_cond_cached is not None:
@@ -1378,6 +1417,17 @@ def run_bootstrap(
     )
     wan_video_target_3FHW = input_bundle.wan_video_target_3FHW
     s_0_clean = input_bundle.s_0_clean
+    if cfg.s_0_pure_path is None:
+        raise ValueError(
+            "Bootstrap now requires cfg.s_0_pure_path. Stage A and Stage B "
+            "consume the carpeted 00_seg/Stage A video, but Stage D frame-0 "
+            "supervision and Wan I2V conditioning require the no-carpet "
+            "00_pure image from the same source folder."
+        )
+    s_0_pure = _load_s0_pure_reference(
+        cfg.s_0_pure_path,
+        target_hw=(int(wan_video_target_3FHW.shape[2]), int(wan_video_target_3FHW.shape[3])),
+    )
 
     # ---- B3 + B4: Stage B Pass-1 + Pass-2 --------------------------------
     print("[bootstrap] B3-B4 Stage B (SCAR + BMCSA)")
@@ -1510,7 +1560,7 @@ def run_bootstrap(
 
     # ---- B10: build_wan_i2v_cond ---------------------------------------
     print("[bootstrap] B10 build_wan_i2v_cond")
-    wan_cond_cached = _run_b10_wan_cond(s_0_clean, user_motion_prompt, cfg, wan_t5, wan_vae)
+    wan_cond_cached = _run_b10_wan_cond(s_0_pure, user_motion_prompt, cfg, wan_t5, wan_vae)
 
     # ---- B11: Wan VAE encoding -----------------------------------------
     print("[bootstrap] B11 Wan VAE encoding")
@@ -1551,6 +1601,7 @@ def run_bootstrap(
         trellis_cond_can=trellis_cond_can,
         wan_video_target_3FHW=wan_video_target_3FHW,
         s_0_clean=s_0_clean,
+        s_0_pure=s_0_pure,
         O_base_canonical=O_base_canonical,
         O_move_per_state=O_move_per_state,
         P_base_canonical=P_base_canonical,
@@ -1565,6 +1616,8 @@ def run_bootstrap(
             "stage_a_resolution_hw": list(cfg.stage_a_resolution_hw),
             "stage_a_skipped": cfg.skip_b1_stage_a,
             "bootstrap_input": input_bundle.source_meta,
+            "s_0_pure_path": os.path.abspath(os.fspath(cfg.s_0_pure_path)),
+            "wan_condition_source": "s_0_pure",
             "slat_skipped": cfg.skip_b8_slat,
             "wan_cond_skipped": cfg.skip_b10_wan_cond,
             "wan_vae_skipped": cfg.skip_b11_wan_vae,

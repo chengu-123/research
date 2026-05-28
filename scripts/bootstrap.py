@@ -18,7 +18,8 @@ Usage:
         --output_dir outputs/30857 \
         --input_mode stagea_video \
         --motion "A brown wooden desk. The right drawer slides open." \
-        --wan_ckpt /path/to/Wan2.2-I2V-A14B
+        --wan_ckpt /path/to/Wan2.2-I2V-A14B \
+        --s0_pure /path/to/PartNet/30857/00_pure.png
 
     python scripts/bootstrap.py \
         --output_dir outputs/30857 \
@@ -26,7 +27,8 @@ Usage:
         --image_dir /path/to/PartNet/30857 \
         --image_pattern "rendering_joint_00_state_{i:02d}.png" \
         --motion "A brown wooden desk. The right drawer slides open." \
-        --wan_ckpt /path/to/Wan2.2-I2V-A14B
+        --wan_ckpt /path/to/Wan2.2-I2V-A14B \
+        --s0_pure /path/to/PartNet/30857/00_pure.png
 """
 
 from __future__ import annotations
@@ -107,6 +109,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--state_images", nargs=6, default=None,
                    help="Six explicit image paths for six_images mode. Overrides "
                         "--image_dir/--image_pattern when provided.")
+    p.add_argument("--s0_pure", required=True,
+                   help="No-carpet frame-0 image, typically 00_pure.png in the "
+                        "same source directory as 00_seg.png. Used only for "
+                        "Stage D supervision and cached Wan conditioning.")
     p.add_argument("--motion", required=True,
                    help="Same user motion prompt used for Stage A.")
     p.add_argument("--wan_ckpt", required=True, dest="wan_ckpt_dir",
@@ -141,6 +147,7 @@ def main() -> None:
     output_dir = os.path.abspath(args.output_dir)
     wan_ckpt_dir = os.path.abspath(args.wan_ckpt_dir)
     config_path = os.path.abspath(args.config)
+    s0_pure_path = os.path.abspath(args.s0_pure)
 
     stagea_video_path = None
     image_dir = None
@@ -174,6 +181,8 @@ def main() -> None:
         raise FileNotFoundError(f"--wan_ckpt not found: {wan_ckpt_dir}")
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"--config not found: {config_path}")
+    if not os.path.isfile(s0_pure_path):
+        raise FileNotFoundError(f"--s0_pure not found: {s0_pure_path}")
 
     from pipelines.bootstrap import BootstrapConfig, run_bootstrap
     from pipelines.recon import build_trellis_pipeline
@@ -187,6 +196,7 @@ def main() -> None:
         stage_image_dir=image_dir,
         stage_image_pattern=str(args.image_pattern),
         stage_image_paths=state_images,
+        s_0_pure_path=s0_pure_path,
         stage_a_wan_size=str(args.stage_a_size),
         stage_a_frame_num=int(args.stage_a_frame_num),
         stage_a_lang=str(args.lang),

@@ -119,7 +119,7 @@ class SS_DiT_WithAdapters(nn.Module):
             before being passed to ``base.t_embedder`` (TRELLIS convention).
         cond : torch.Tensor   shape [B, N_dino, 1024]
             DINOv2 patch embeddings (the cached ``trellis_cond_can`` from
-            Bootstrap, which is ``DINOv2(s_0_with_carpet)``).
+            Bootstrap, which is DINOv2 of the canonical carpeted state).
 
         Returns
         -------

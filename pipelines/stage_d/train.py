@@ -114,7 +114,7 @@ class BootstrapBundle:
     Lifetimes:
       - ``z_s0`` and ``trellis_cond_can`` stay resident (cheap; SS-DiT cond).
       - ``z_slat0`` and ``U_object`` stay resident (drive D_GS every iter).
-      - ``M_attn_at_U`` / ``shell_mask`` / ``anchors_world`` / ``s_0_with_carpet`` /
+      - ``M_attn_at_U`` / ``shell_mask`` / ``anchors_world`` / ``s_0_pure`` /
         ``wan_video_target_T3HW_01`` / ``z_wan_target`` / ``wan_cond`` /
         ``slat_mean`` / ``slat_std`` stay resident (every iter).
       - ``dit_hidden_cache`` is diagnostic-only and dropped after loading
@@ -151,7 +151,7 @@ class BootstrapBundle:
     wan_cond: Dict[str, Any]                  # context / context_null / seq_len / y
     z_wan_target: torch.Tensor                # [16, F_lat, H_lat, W_lat]
     wan_video_target_T3HW_01: torch.Tensor    # [F, 3, H, W] in [0, 1]
-    s_0_with_carpet_3HW_01: torch.Tensor      # [3, H, W] in [0, 1]
+    s_0_pure_3HW_01: torch.Tensor             # [3, H, W] in [0, 1]
     frame_num: int
     resolution_hw: Tuple[int, int]
     latent_hw: Tuple[int, int]
@@ -489,7 +489,7 @@ def train_stage_d_p1(
         )
         iter0_iou = iter_0_camera_check(
             rendered_frame_0_3HW=rgb_T3HW_init[0],
-            s_0_with_carpet_3HW=bootstrap.s_0_with_carpet_3HW_01,
+            s_0_pure_3HW=bootstrap.s_0_pure_3HW_01,
             iou_threshold=0.5,
             save_diag_to=os.path.join(out_dir, "viz", "iter_0_camera_diag.png"),
         )
@@ -546,7 +546,7 @@ def train_stage_d_p1(
             Delta_z_s=learnable.Delta_z_s,
             alpha_m=learnable.alpha_m,
             wan_video_target_T3HW_01=wan_target_T3HW,
-            s_0_with_carpet_3HW_01=bootstrap.s_0_with_carpet_3HW_01,
+            s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,
@@ -647,7 +647,8 @@ def train_stage_d_p1(
                 )
 
         # ---- Periodic: silhouette check (raises on failure) ----
-        if (phase != "warmup_g_minus"
+        if (cfg.silhouette_check_every > 0
+                and phase != "warmup_g_minus"
                 and it > 0 and it % cfg.silhouette_check_every == 0):
             with torch.no_grad():
                 periodic_silhouette_check(
@@ -904,7 +905,7 @@ def _run_dual_clone_to_completion(
             Delta_z_s=learnable_cur.Delta_z_s,
             alpha_m=learnable_cur.alpha_m,
             wan_video_target_T3HW_01=bootstrap.wan_video_target_T3HW_01,
-            s_0_with_carpet_3HW_01=bootstrap.s_0_with_carpet_3HW_01,
+            s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,

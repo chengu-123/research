@@ -67,7 +67,7 @@ class StageDCameraConfig:
     The camera is placed on a single fixed location and stays there across
     all 21 frames (Wan2.2 generates locked-off video; render must match).
 
-    The camera MUST match the camera that produced ``s_0_with_carpet`` (the
+    The camera MUST match the camera that produced ``s_0_pure`` (the
     user-input image). For PartNet inputs rendered by FreeArt3D's pipeline
     (``mine/pipelines/render.py``), use ``StageDCameraConfig.freeart3d_canonical()``.
     Mismatched camera makes L_first ill-defined and biases the W-RFSDS
