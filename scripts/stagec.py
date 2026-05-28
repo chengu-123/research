@@ -141,13 +141,9 @@ def main() -> int:
     print(f"Artifacts written to {out_dir}/:")
     print(f"  - stage_c_joint_init.json    (full diagnostics + Psi)")
     if cfg.save_viz:
-        print(f"  - viz/summary.html           (text summary, no plotly needed)")
-        print(f"  - viz/joint_overview_3d.html (3D scatter + axis + anchors)")
-        print(f"  - viz/phi_progression.html   (u_raw / u_norm / phi_0 / delta_u)")
-        print(f"  - viz/type_fit_diagnostics.html (residuals + sub-conf)")
-        print(f"  - viz/M_motion_corridor_64.html")
-        print(f"  - viz/anchors_overlay.html")
-        print(f"  - viz/axis_overlay.html")
+        viz_dir = os.path.join(out_dir, "viz")
+        for name in sorted(os.listdir(viz_dir)):
+            print(f"  - viz/{name}")
     return 0
 
 

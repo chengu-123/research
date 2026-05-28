@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import html
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -48,6 +50,7 @@ from pipelines.stage_c.phi_fit import (
     fit_phi_from_candidate,
     _inverse_softplus_scalar,
 )
+from pipelines.stage_c.viz import save_stage_c_viz
 
 
 def _encode_psi_from_candidate(
@@ -150,6 +153,56 @@ def _build_joint_init_from_candidate(
     )
 
 
+def _build_viz_geom(V_per_state: list[torch.Tensor], res: int, device: torch.device) -> SimpleNamespace:
+    """Build the legacy geometry object expected by stage_c/viz.py."""
+    cents = []
+    valid = []
+    for coords in V_per_state:
+        if coords is None or int(coords.shape[0]) == 0:
+            cents.append(torch.zeros(3, device=device, dtype=torch.float32))
+            valid.append(False)
+            continue
+        world = (coords.to(device=device, dtype=torch.float32) + 0.5) / float(res) - 0.5
+        cents.append(world.mean(dim=0))
+        valid.append(True)
+    return SimpleNamespace(
+        centroid_world=torch.stack(cents, dim=0),
+        valid_mask=torch.tensor(valid, device=device, dtype=torch.bool),
+    )
+
+
+def _prepare_legacy_viz_fields(
+    type_result: JointTypeResult,
+    geom: SimpleNamespace,
+) -> None:
+    """Populate legacy fields consumed by the original HTML visualizers."""
+    if type_result.best_pris is not None:
+        pris = type_result.best_pris
+        type_result.line_origin = pris.origin.detach().cpu().numpy()
+        type_result.line_direction = pris.axis.detach().cpu().numpy()
+        type_result.residual_line = float(max(0.0, 1.0 - pris.score.score))
+    if type_result.best_rev is not None:
+        rev = type_result.best_rev
+        origin = rev.origin.detach().cpu().numpy()
+        axis = rev.axis.detach().cpu().numpy()
+        axis_norm = float(np.sqrt((axis * axis).sum()))
+        if axis_norm > 1e-8:
+            axis = axis / axis_norm
+        cents = geom.centroid_world.detach().cpu().numpy()
+        valid = geom.valid_mask.detach().cpu().numpy().astype(bool)
+        if valid.any():
+            diff = cents[valid] - origin[None, :]
+            proj_len = (diff * axis[None, :]).sum(axis=1, keepdims=True)
+            perp = diff - proj_len * axis[None, :]
+            radius = float(np.sqrt((perp * perp).sum(axis=1)).mean())
+        else:
+            radius = 0.1
+        type_result.arc_center = origin
+        type_result.arc_normal = axis
+        type_result.arc_radius = radius
+        type_result.residual_arc = float(max(0.0, 1.0 - rev.score.score))
+
+
 def run_stage_c_joint_init(
     inputs: StageCInputs,
     cfg: Optional[StageCConfig] = None,
@@ -219,6 +272,7 @@ def run_stage_c_joint_init(
         valid_state=valid_state,
         O_base_canonical=inputs.O_base_canonical,
         anchors_voxel=anchors_object,
+        M_motion_corridor_64=inputs.M_motion_corridor_64,
         canonical_state_idx=c_idx,
         res=res,
         type_margin=float(cfg.type_decision_margin),
@@ -279,7 +333,7 @@ def run_stage_c_joint_init(
         )
 
     common_diag = {
-        "stage_c_version": "v3_cardinal_voxel_scoring",
+        "stage_c_version": "v4_branched_voxel_physics",
         "K": K,
         "canonical_state_idx": c_idx,
         "joint_type": type_result.type_str,
@@ -361,7 +415,26 @@ def run_stage_c_joint_init(
     if out_dir is not None and cfg.save_viz:
         viz_dir = os.path.join(out_dir, "viz")
         os.makedirs(viz_dir, exist_ok=True)
+        viz_geom = _build_viz_geom(V_per_state, res=res, device=device)
+        _prepare_legacy_viz_fields(type_result, viz_geom)
         _save_v3_diagnostics(viz_dir, type_result, primary_init, anchor_diag)
+        viz_phi_result = fit_phi_from_candidate(
+            phi_raw_signed=primary_cand.phi_k,
+            canonical_state_idx=int(cfg.canonical_state_idx),
+            enforce_monotone=bool(cfg.phi_enforce_monotone),
+            phi_min_gap=float(cfg.phi_min_gap),
+            joint_type_str=primary_cand.type_str,
+        )
+        save_stage_c_viz(
+            viz_dir=viz_dir,
+            inputs=inputs,
+            geom=viz_geom,
+            type_result=type_result,
+            axis_result=axis_result,
+            phi_result=viz_phi_result,
+            anchors_object=anchors_object,
+            joint_init=primary_init,
+        )
 
     return primary_init
 
@@ -373,16 +446,23 @@ def _save_v3_diagnostics(
     anchor_diag: dict,
 ) -> None:
     """Minimal text-based v3 diagnostics dump (HTML viz is a separate task)."""
+    ranked = sorted(type_result.all_candidates, key=lambda c: c.score.score, reverse=True)
     summary_lines = [
-        "=== Stage C v3 diagnostics ===",
+        "=== Stage C branched diagnostics ===",
+        f"joint_type: {primary_init.joint_type()}",
+        f"psi.axis: {[round(float(x), 4) for x in primary_init.psi.axis]}",
+        f"psi.origin: {[round(float(x), 4) for x in primary_init.psi.origin]}",
+        f"phi_0: {[round(float(x), 4) for x in primary_init.phi_0]}",
+        f"anchors count: {int(primary_init.anchors_object.shape[0])}",
+        "",
         f"Selected type: {type_result.type_str}",
         f"type_logit: {type_result.type_logit:.4f}",
         f"type_confidence: {type_result.confidence:.4f}",
         f"n_valid_states: {type_result.n_valid_states}",
         "",
-        "--- All 12 candidates (6 cardinal x 2 types) ---",
+        "--- Top candidates ---",
     ]
-    for c in type_result.all_candidates:
+    for c in ranked[:24]:
         axis_str = (
             f"[{c.axis[0].item():+.0f},{c.axis[1].item():+.0f},{c.axis[2].item():+.0f}]"
         )
@@ -409,7 +489,19 @@ def _save_v3_diagnostics(
         summary_lines.append(f"  {k}: {v}")
 
     with open(os.path.join(viz_dir, "v3_summary.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(summary_lines))
+        text = "\n".join(summary_lines)
+        f.write(text)
+    with open(os.path.join(viz_dir, "summary.html"), "w", encoding="utf-8") as f:
+        f.write(
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>Stage C diagnostics</title>"
+            "<style>body{font-family:Consolas,monospace;margin:24px;"
+            "background:#f7f7f7;color:#111}pre{white-space:pre-wrap;"
+            "background:#fff;border:1px solid #ddd;padding:16px}</style>"
+            "</head><body><pre>"
+        )
+        f.write(html.escape(text))
+        f.write("</pre></body></html>")
 
 
 __all__ = ["run_stage_c_joint_init"]

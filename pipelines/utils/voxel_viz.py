@@ -261,8 +261,9 @@ def save_axis_overlay_html(
     # World -> voxel index: idx = (world + 0.5) * (R - 1)
     q_idx = (np.asarray(q_world, dtype=np.float64) + 0.5) * (R - 1)
     omega_np = np.asarray(omega_world, dtype=np.float64)
-    if np.linalg.norm(omega_np) > 1e-8:
-        omega_np = omega_np / np.linalg.norm(omega_np)
+    omega_norm = float(np.sqrt((omega_np * omega_np).sum()))
+    if omega_norm > 1e-8:
+        omega_np = omega_np / omega_norm
 
     traces: List[Any] = [move_trace]
     if joint_type == "revolute":

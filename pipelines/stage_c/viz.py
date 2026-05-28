@@ -55,6 +55,11 @@ def _world_to_voxel_idx_f(p_world: np.ndarray, res: int) -> np.ndarray:
     return (np.asarray(p_world, dtype=np.float64) + 0.5) * (res - 1)
 
 
+def _norm_np(x: np.ndarray) -> float:
+    arr = np.asarray(x, dtype=np.float64)
+    return float(np.sqrt((arr * arr).sum()))
+
+
 def _color_for_k(k: int, K: int) -> str:
     """Per-state colour for K=6: red -> orange -> yellow -> green -> blue -> purple."""
     palette = [
@@ -163,10 +168,10 @@ def save_joint_overview_html(
             ac = _world_to_voxel_idx_f(type_result.arc_center, resolution)
             an = type_result.arc_normal
             an = np.asarray(an, dtype=np.float64)
-            an = an / (np.linalg.norm(an) + 1e-12)
+            an = an / (_norm_np(an) + 1e-12)
             # Two basis vectors in plane perpendicular to an
             tmp = np.array([1.0, 0.0, 0.0]) if abs(an[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-            u = np.cross(an, tmp); u = u / (np.linalg.norm(u) + 1e-12)
+            u = np.cross(an, tmp); u = u / (_norm_np(u) + 1e-12)
             v = np.cross(an, u)
             r_world = float(type_result.arc_radius)
             r_idx = r_world * (resolution - 1)
@@ -183,9 +188,9 @@ def save_joint_overview_html(
             # Prismatic / fallback: best-fit line through line_origin along line_direction
             lo = _world_to_voxel_idx_f(type_result.line_origin, resolution)
             ld = np.asarray(type_result.line_direction, dtype=np.float64)
-            ld = ld / (np.linalg.norm(ld) + 1e-12)
+            ld = ld / (_norm_np(ld) + 1e-12)
             # Extend ±2x trajectory length
-            cents_along = (cents_w[valid] - type_result.line_origin) @ ld
+            cents_along = ((cents_w[valid] - type_result.line_origin) * ld[None, :]).sum(axis=1)
             t_max = float(np.abs(cents_along).max()) * 1.5 if cents_along.size > 0 else 0.2
             t_max_idx = t_max * (resolution - 1)
             ts = np.linspace(-t_max_idx, t_max_idx, 60)
@@ -202,7 +207,7 @@ def save_joint_overview_html(
 
     # Layer 5: joint axis (the resolved axis_result.axis through origin)
     ax_world = axis_result.axis.detach().cpu().numpy()
-    ax_world = ax_world / (np.linalg.norm(ax_world) + 1e-12)
+    ax_world = ax_world / (_norm_np(ax_world) + 1e-12)
     orig_world = axis_result.origin.detach().cpu().numpy()
     orig_idx = _world_to_voxel_idx_f(orig_world, resolution)
     ts_axis = np.linspace(-0.6, 0.6, 60)

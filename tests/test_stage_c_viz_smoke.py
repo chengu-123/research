@@ -78,7 +78,9 @@ def main() -> int:
         assert "phi_0" in content
         assert "anchors count" in content
 
-        # Plotly-dependent HTMLs: try-list, skip-assert if plotly missing
+        text_path = os.path.join(viz_dir, "v3_summary.txt")
+        assert os.path.isfile(text_path), f"missing {text_path}"
+
         plotly_files = [
             "joint_overview_3d.html",
             "phi_progression.html",
@@ -100,13 +102,13 @@ def main() -> int:
                     raise AssertionError(
                         f"plotly available but missing viz {fn} (path={p})"
                     )
-            print(f"OK Stage C viz wrote all {len(plotly_files) + 1} HTML files:")
-            print(f"  - summary.html (always)")
+            print(f"OK Stage C viz wrote all {len(plotly_files) + 2} diagnostics files:")
+            print("  - summary.html")
+            print("  - v3_summary.txt")
             for fn in plotly_files:
                 print(f"  - {fn}")
         else:
-            print("OK Stage C viz wrote summary.html (plotly missing, "
-                  "other viz silently skipped per voxel_viz convention)")
+            print("OK Stage C viz wrote summary.html and v3_summary.txt")
 
         # Stand-alone summary writer test (works even without driver)
         with tempfile.TemporaryDirectory() as tmp2:

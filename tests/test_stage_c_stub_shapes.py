@@ -87,7 +87,7 @@ def main() -> int:
     assert result.anchors_object.dtype == torch.int32
     assert result.psi.pack_19().shape == (19,)
     assert 0.0 <= result.confidence <= 1.0
-    assert result.diagnostics["stub"] is False  # Production driver, not stub
+    assert result.diagnostics["stage_c_version"] == "v4_branched_voxel_physics"
 
     # ---- Data-driven sanity (prismatic along +X) ----
     assert result.joint_type() == "prismatic", (

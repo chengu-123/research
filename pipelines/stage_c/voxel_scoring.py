@@ -160,6 +160,11 @@ class CandidateScore:
     contact_compat: float           # 1.0 if axis near anchors, 0.3 else
     monotone_quality: float         # 1.0 if phi strictly monotone, else penalty
     valid_states_used: int          # number of states that contributed
+    boundary_path_score: float = 0.0
+    axis_base_support: float = 0.0
+    arc_balance: float = 0.0
+    radius_stability: float = 0.0
+    axis_stability: float = 0.0
 
 
 def reverse_align_and_score(

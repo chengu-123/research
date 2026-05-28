@@ -22,8 +22,8 @@ class StageCConfig:
     soft_centroid_threshold: float = 0.1    # for P_move_evidence_per_state weighted centroid
 
     # ---- Joint type detection (joint_type_detect.py) ----------------------
-    type_decision_margin: float = 0.15      # log(res_arc) - log(res_line) abs threshold
-                                            # below which type is "uncertain" -> low confidence
+    type_decision_margin: float = 0.035     # abs log(best_pris / best_rev) threshold
+                                            # below this, keep type uncertain but still emit both branches
     arc_min_states: int = 4                 # need >= 4 centroids to fit a circle reliably
     ransac_iters_line: int = 50             # RANSAC iterations for line fit
     ransac_inlier_threshold: float = 0.02   # world-unit distance for line inlier
