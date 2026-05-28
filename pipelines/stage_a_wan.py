@@ -1,22 +1,18 @@
-"""Stage A: Wan2.2 I2V articulation video generation (pipeline_v3 Section 5).
+"""Stage A: Wan2.2 I2V articulation video generation.
 
 Single-shot, fixed-seed inference. Given a user input image with carpet
 (grounding disk) baked in and a per-object motion prompt, generate a 21-frame
-832x464 RGB video at 16 fps with a locked-off camera while the articulated
-part moves. The output ``wan_video_target_3FHW`` becomes the universal target
-for Stage B bootstrap (TRELLIS K=6 conditioning, Wan VAE latent target).
+RGB video at 16 fps with a locked-off camera while the articulated part moves.
+The output ``wan_video_target_3FHW`` becomes the universal target for Stage B
+bootstrap (TRELLIS K=6 conditioning, Wan VAE latent target).
 
-Hard constraints (pipeline_v3.3.1 Section 1.3 / 5.3):
+Hard constraints:
   - frame_num = 21              (4*5 + 1; gives F_lat = 6 for K=6 states)
-  - resolution = (464, 832)     (H=464, W=832; H/8=58, W/8=104, both /2 OK)
-                                This is the actual Wan2.2/CHORD 480P
-                                landscape output for the official 832*480
-                                area profile. Off-distribution sizes
-                                invalidate W-RFSDS because Wan's DiT was
-                                never trained on that area scale.
+  - size label = 832*480        (official Wan2.2 I2V 480P area profile)
+  - input aspect is preserved   (Wan I2V derives actual H/W from input aspect)
   - seed = 42                   (no multi-candidate selection per CHORD A.1)
-  - guide_scale = 5.0           (pipeline_v3 Section 5.3; CHORD 25->12 is
-                                 for SDS distillation, NOT video generation)
+  - guide_scale = 5.0           (CHORD 25->12 is for SDS distillation, NOT
+                                 video generation)
 
 Offline-only execution: Wan2.2 weights are loaded from a local checkpoint
 directory; HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE are exported before any
@@ -36,19 +32,13 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
-import sys
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
 import torch
 from PIL import Image
 
-# -----------------------------------------------------------------------------
-# Make the vendored Wan2.2 package importable. mine/Wan2.2/wan/__init__.py
-# defines ``wan.WanI2V``; we add mine/Wan2.2 to sys.path so ``import wan`` works
-# regardless of how this module is invoked.
-# -----------------------------------------------------------------------------
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 _WAN_ROOT = os.path.join(_REPO_ROOT, "Wan2.2")
 if not os.path.isdir(_WAN_ROOT):
@@ -56,13 +46,6 @@ if not os.path.isdir(_WAN_ROOT):
         f"Stage A requires the vendored Wan2.2 sources at {_WAN_ROOT!r}; "
         "directory not found."
     )
-if _WAN_ROOT not in sys.path:
-    sys.path.insert(0, _WAN_ROOT)
-
-from wan.configs.wan_i2v_A14B import i2v_A14B as _WAN_I2V_A14B_CFG
-from wan.configs import MAX_AREA_CONFIGS as _WAN_MAX_AREA_CONFIGS
-from wan.configs import SUPPORTED_SIZES as _WAN_SUPPORTED_SIZES
-from wan.image2video import WanI2V
 
 from pipelines.utils.optical_flow import OpticalFlowReport, background_static_check
 from pipelines.utils.seeding import seed_everything
@@ -70,26 +53,18 @@ from pipelines.utils.visualization_a import save_all_stage_a_visualisations
 from pipelines.wan_helpers import build_articulated_prompts
 
 
-# Official Wan2.2 I2V-A14B size labels are area profiles for I2V, not strict
-# output H/W. Wan image2video.py recomputes latent H/W from max_area plus input
-# aspect ratio. CHORD uses the actual Wan default landscape output 832x464, so
-# this pipeline treats (H, W) as actual output H/W and maps it back to Wan's
-# official area label.
 _WAN_TASK = "i2v-A14B"
-_WAN_OUTPUT_TO_SIZE_LABEL = {
-    (464, 832): "832*480",
-    (832, 480): "480*832",
-    (720, 1280): "1280*720",
-    (1280, 720): "720*1280",
+_DEFAULT_WAN_SIZE_LABEL = "832*480"
+_WAN_MAX_AREA_CONFIGS = {
+    "720*1280": 720 * 1280,
+    "1280*720": 1280 * 720,
+    "480*832": 480 * 832,
+    "832*480": 832 * 480,
 }
-_SUPPORTED_HW = frozenset(_WAN_OUTPUT_TO_SIZE_LABEL.keys())
-_SUPPORTED_SIZE_LABELS = frozenset(_WAN_SUPPORTED_SIZES[_WAN_TASK])
-_MISSING_SIZE_LABELS = frozenset(_WAN_OUTPUT_TO_SIZE_LABEL.values()) - _SUPPORTED_SIZE_LABELS
-if _MISSING_SIZE_LABELS:
-    raise RuntimeError(
-        f"Stage A Wan size labels {sorted(_MISSING_SIZE_LABELS)} are not in "
-        f"Wan2.2 {_WAN_TASK} SUPPORTED_SIZES={sorted(_SUPPORTED_SIZE_LABELS)}"
-    )
+_SUPPORTED_SIZE_LABELS = frozenset(_WAN_MAX_AREA_CONFIGS.keys())
+SUPPORTED_WAN_SIZE_LABELS = tuple(sorted(_SUPPORTED_SIZE_LABELS))
+_WAN_VAE_STRIDE = (4, 8, 8)
+_WAN_PATCH_SIZE = (1, 2, 2)
 
 
 class WanQualityError(RuntimeError):
@@ -104,8 +79,8 @@ class StageAResult:
     ``wan_video_target_3FHW`` as uint8 in [0, 255]; ``.float() / 255.0`` and
     ``* 2 - 1`` push it back to Wan VAE's [-1, 1] input range.
     """
-    wan_video_target_3FHW: torch.Tensor      # [3, 21, 464, 832] uint8 [0,255]
-    wan_video_float01_3FHW: torch.Tensor     # [3, 21, 464, 832] float32 [0,1]
+    wan_video_target_3FHW: torch.Tensor      # [3, F, H, W] uint8 [0,255]
+    wan_video_float01_3FHW: torch.Tensor     # [3, F, H, W] float32 [0,1]
     pos_prompt: str
     neg_prompt: str
     user_motion_prompt: str
@@ -123,19 +98,8 @@ class StageAResult:
     artifact_paths: list = field(default_factory=list)
 
 
-def _resize_input_image(image: Union[Image.Image, np.ndarray, torch.Tensor],
-                        target_hw: Tuple[int, int]) -> Image.Image:
-    """Coerce the user's input image into a PIL Image at exactly ``target_hw``.
-
-    Wan I2V's generate() respects the input image aspect ratio when computing
-    its internal latent (h, w) under ``max_area`` (see image2video.py line
-    262-271). To get the CHORD/Wan default 832x464 output, resize the input
-    image to (W=832, H=464) and use the official 832*480 max-area profile.
-    Carpet/grounding-disk geometry placed by the user is assumed to already
-    be visually centred and reasonably scaled for this aspect ratio.
-    """
-    H, W = int(target_hw[0]), int(target_hw[1])
-
+def _coerce_input_image(image: Union[Image.Image, np.ndarray, torch.Tensor]) -> Image.Image:
+    """Coerce the user's input into RGB PIL without changing aspect or size."""
     if isinstance(image, Image.Image):
         pil = image
     elif isinstance(image, np.ndarray):
@@ -165,9 +129,40 @@ def _resize_input_image(image: Union[Image.Image, np.ndarray, torch.Tensor],
     elif pil.mode != "RGB":
         pil = pil.convert("RGB")
 
-    if pil.size != (W, H):  # PIL .size is (W, H)
-        pil = pil.resize((W, H), Image.Resampling.LANCZOS)
     return pil
+
+
+def _predict_wan_output_hw(input_hw: Tuple[int, int], max_area: int) -> Tuple[int, int]:
+    """Mirror WanI2V.generate() lines 262-271 for shape contract checks."""
+    input_h, input_w = int(input_hw[0]), int(input_hw[1])
+    if input_h <= 0 or input_w <= 0:
+        raise ValueError(f"input_hw must be positive; got {input_hw}")
+    aspect_ratio = float(input_h) / float(input_w)
+    lat_h = round(
+        np.sqrt(float(max_area) * aspect_ratio)
+        // _WAN_VAE_STRIDE[1]
+        // _WAN_PATCH_SIZE[1]
+        * _WAN_PATCH_SIZE[1]
+    )
+    lat_w = round(
+        np.sqrt(float(max_area) / aspect_ratio)
+        // _WAN_VAE_STRIDE[2]
+        // _WAN_PATCH_SIZE[2]
+        * _WAN_PATCH_SIZE[2]
+    )
+    return int(lat_h * _WAN_VAE_STRIDE[1]), int(lat_w * _WAN_VAE_STRIDE[2])
+
+
+def _load_wan_i2v_components():
+    """Import Wan only when Stage A actually runs generation."""
+    import sys
+
+    if _WAN_ROOT not in sys.path:
+        sys.path.insert(0, _WAN_ROOT)
+    from wan.configs.wan_i2v_A14B import i2v_A14B as wan_cfg
+    from wan.image2video import WanI2V
+
+    return wan_cfg, WanI2V
 
 
 def _wan_video_to_float01_uint8(
@@ -224,7 +219,7 @@ def run_stage_a(
     out_dir: str,
     seed: int = 42,
     frame_num: int = 21,
-    resolution_hw: Tuple[int, int] = (464, 832),
+    wan_size_label: str = _DEFAULT_WAN_SIZE_LABEL,
     sampling_steps: int = 50,
     guide_scale: Union[float, Tuple[float, float]] = 5.0,
     sample_shift: float = 5.0,
@@ -245,9 +240,9 @@ def run_stage_a(
     Parameters
     ----------
     image : PIL.Image | np.ndarray | torch.Tensor
-        User-provided closed-state image with carpet/grounding disk baked in
-        at the input (pipeline_v3 Section 1.1). Any aspect ratio is accepted;
-        the image is LANCZOS-resized to ``resolution_hw`` before Wan I2V.
+        User-provided closed-state image with carpet/grounding disk baked in.
+        The aspect ratio is preserved; Wan I2V derives actual H/W from this
+        aspect ratio and the official area profile.
     user_motion_prompt : str
         Per-object motion description (e.g. zh: "the drawer slowly slides
         outward in a continuous motion"). The universal camera-lock addon is
@@ -269,14 +264,9 @@ def run_stage_a(
         Wan2.2 RNG seed. pipeline_v3 Section 5.3 fixes this; do not vary.
     frame_num : int, default 21
         Must satisfy ``frame_num % 4 == 1``. pipeline_v3 Section 1.3 fixes 21.
-    resolution_hw : (int, int), default (464, 832)
-        Actual output (H, W). MUST map to one of Wan2.2 I2V-A14B official
-        area labels, expressed as actual (H, W): (464, 832), (832, 480),
-        (720, 1280), (1280, 720).
-        Off-distribution sizes (e.g. 288x512) make the W-RFSDS gradient
-        direction unreliable because Wan's DiT was never trained at that
-        area scale. The default (464, 832) follows the official 832*480
-        480P area profile and the CHORD/Wan actual landscape output.
+    wan_size_label : str, default "832*480"
+        Official Wan2.2 I2V area profile. This is a max-area label, not fixed
+        output H/W. Wan computes actual H/W from max_area and input aspect.
     sampling_steps : int, default 50
         UniPC steps. pipeline_v3 Section 5.3.
     guide_scale : float | (float, float), default 5.0
@@ -292,8 +282,7 @@ def run_stage_a(
     fps : int, default 16
         MP4 writer frame rate. wan_shared_cfg.sample_fps default.
     offload_model, convert_model_dtype, t5_cpu : bool
-        VRAM controls forwarded to ``WanI2V``. Defaults keep peak VRAM under
-        ~55 GB on a single H800/H100 80 GB card at (464, 832, F=21).
+        VRAM controls forwarded to ``WanI2V``.
     device_id : int, default 0
         CUDA device index. CPU execution is not supported (Wan VAE relies on
         CUDA kernels).
@@ -317,21 +306,11 @@ def run_stage_a(
         raise ValueError(
             f"frame_num must be of the form 4n+1 with n>=1; got {frame_num}"
         )
-    H, W = int(resolution_hw[0]), int(resolution_hw[1])
-    if H % 8 != 0 or W % 8 != 0:
-        raise ValueError(f"resolution_hw must be multiples of 8; got ({H}, {W})")
-    if (H // 8) % 2 != 0 or (W // 8) % 2 != 0:
+    wan_size_label = str(wan_size_label)
+    if wan_size_label not in _SUPPORTED_SIZE_LABELS:
         raise ValueError(
-            f"resolution_hw / 8 must be even for DiT patch_size=(1,2,2); "
-            f"got latent ({H // 8}, {W // 8})"
-        )
-    if (H, W) not in _SUPPORTED_HW:
-        raise ValueError(
-            f"resolution_hw=({H}, {W}) is not a supported actual Wan I2V "
-            f"output (H, W). Supported outputs are {sorted(_SUPPORTED_HW)}. "
-            f"Use the CHORD/Wan default 480P landscape (464, 832), 480P "
-            f"portrait (832, 480), 720P landscape (720, 1280), or 720P "
-            f"portrait (1280, 720)."
+            f"wan_size_label={wan_size_label!r} is not supported for "
+            f"Wan2.2 {_WAN_TASK}; supported labels: {sorted(_SUPPORTED_SIZE_LABELS)}"
         )
     if not os.path.isdir(wan_ckpt_dir):
         raise FileNotFoundError(
@@ -344,11 +323,16 @@ def run_stage_a(
 
     pos_prompt, neg_prompt = build_articulated_prompts(user_motion_prompt, lang=lang)
 
-    pil_image = _resize_input_image(image, target_hw=(H, W))
+    pil_image = _coerce_input_image(image)
+    input_hw = (int(pil_image.height), int(pil_image.width))
     pil_image.save(os.path.join(out_dir, "input_s_0_with_carpet.png"))
 
+    wan_cfg, WanI2V = _load_wan_i2v_components()
+    wan_max_area = int(_WAN_MAX_AREA_CONFIGS[wan_size_label])
+    expected_hw = _predict_wan_output_hw(input_hw, wan_max_area)
+
     wan = WanI2V(
-        config=_WAN_I2V_A14B_CFG,
+        config=wan_cfg,
         checkpoint_dir=wan_ckpt_dir,
         device_id=int(device_id),
         rank=0,
@@ -360,12 +344,6 @@ def run_stage_a(
         convert_model_dtype=bool(convert_model_dtype),
     )
 
-    # Wan2.2 I2V uses `max_area` only as an area profile; the actual (h, w)
-    # is determined inside image2video.py from `max_area` plus input aspect.
-    # For the default CHORD/Wan output (464, 832), keep the input at 464x832
-    # but pass the official 832*480 max area profile.
-    wan_size_label = _WAN_OUTPUT_TO_SIZE_LABEL[(H, W)]
-    wan_max_area = int(_WAN_MAX_AREA_CONFIGS[wan_size_label])
     video_3FHW_neg11 = wan.generate(
         input_prompt=pos_prompt,
         img=pil_image,
@@ -383,13 +361,13 @@ def run_stage_a(
     video_float01, video_uint8 = _wan_video_to_float01_uint8(
         video_3FHW_neg11,
         expected_F=int(frame_num),
-        expected_hw=(H, W),
+        expected_hw=expected_hw,
     )
-    actual_h, actual_w = video_3FHW_neg11.shape[2], video_3FHW_neg11.shape[3]
+    H, W = int(video_uint8.shape[2]), int(video_uint8.shape[3])
     print(
         f"[stage_a] output resolution_hw=({H}, {W}); "
-        f"Wan size_label={wan_size_label}; max_area={wan_max_area}; "
-        f"Wan actual output (H, W) = ({actual_h}, {actual_w})"
+        f"input_hw={input_hw}; Wan size_label={wan_size_label}; "
+        f"max_area={wan_max_area}"
     )
 
     if sanity_check:
@@ -426,6 +404,12 @@ def run_stage_a(
         sample_solver=str(sample_solver),
         wan_ckpt_dir=str(wan_ckpt_dir),
         fps=int(fps),
+        extra={
+            "wan_size_label": wan_size_label,
+            "wan_max_area": int(wan_max_area),
+            "input_hw": [int(input_hw[0]), int(input_hw[1])],
+            "aspect_preserved": True,
+        },
     )
 
     target_uint8_path = os.path.join(out_dir, "wan_video_target_3FHW_uint8.pt")

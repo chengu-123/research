@@ -79,7 +79,8 @@ class BootstrapConfig:
     # ---- B1 (Stage A Wan I2V) --------------------------------------------
     skip_b1_stage_a: bool = False
     wan_ckpt_dir: Optional[str] = None
-    stage_a_resolution_hw: Tuple[int, int] = (464, 832)
+    stage_a_wan_size: str = "832*480"
+    stage_a_resolution_hw: Optional[Tuple[int, int]] = None
     stage_a_frame_num: int = 21
     stage_a_seed: int = 42
     stage_a_lang: str = "zh"
@@ -248,18 +249,24 @@ def _run_b1_stage_a(
                 f"loaded {loaded_path} dtype={wan_video_target_3FHW.dtype}, "
                 f"expected uint8"
             )
-        expected_shape = (
-            3,
-            int(cfg.stage_a_frame_num),
-            int(cfg.stage_a_resolution_hw[0]),
-            int(cfg.stage_a_resolution_hw[1]),
-        )
-        if tuple(wan_video_target_3FHW.shape) != expected_shape:
+        if wan_video_target_3FHW.ndim != 4 or int(wan_video_target_3FHW.shape[0]) != 3:
             raise ValueError(
                 f"loaded {loaded_path} shape={tuple(wan_video_target_3FHW.shape)}, "
-                f"expected {expected_shape}. Regenerate Stage A with the "
-                f"Wan2.2/CHORD actual output contract."
+                "expected [3, F, H, W]"
             )
+        if int(wan_video_target_3FHW.shape[1]) != int(cfg.stage_a_frame_num):
+            raise ValueError(
+                f"loaded {loaded_path} frame count={int(wan_video_target_3FHW.shape[1])}, "
+                f"expected {int(cfg.stage_a_frame_num)}"
+            )
+        H_loaded = int(wan_video_target_3FHW.shape[2])
+        W_loaded = int(wan_video_target_3FHW.shape[3])
+        if H_loaded % 16 != 0 or W_loaded % 16 != 0:
+            raise ValueError(
+                f"loaded {loaded_path} spatial shape=({H_loaded}, {W_loaded}) is not "
+                "aligned to Wan VAE stride 8 and DiT patch size 2"
+            )
+        cfg.stage_a_resolution_hw = (H_loaded, W_loaded)
         s_0_clean = wan_video_target_3FHW[:, 0].float() / 255.0
         return wan_video_target_3FHW, s_0_clean
 
@@ -279,11 +286,12 @@ def _run_b1_stage_a(
         out_dir=stage_a_dir,
         seed=cfg.stage_a_seed,
         frame_num=cfg.stage_a_frame_num,
-        resolution_hw=cfg.stage_a_resolution_hw,
+        wan_size_label=cfg.stage_a_wan_size,
         sampling_steps=cfg.stage_a_sampling_steps,
         guide_scale=cfg.stage_a_guide_scale,
         lang=cfg.stage_a_lang,
     )
+    cfg.stage_a_resolution_hw = tuple(int(v) for v in stage_a_result.resolution_hw)
     s_0_clean = stage_a_result.wan_video_target_3FHW[:, 0].float() / 255.0
     return stage_a_result.wan_video_target_3FHW, s_0_clean
 
@@ -886,6 +894,11 @@ def _run_b10_wan_cond(
     from pipelines.wan_helpers.prompts import build_articulated_prompts
 
     device = torch.device(cfg.device)
+    if cfg.stage_a_resolution_hw is None:
+        raise ValueError(
+            "cfg.stage_a_resolution_hw is unknown. Run B1 Stage A or load a "
+            "Stage A artifact before building Wan I2V conditioning."
+        )
     H, W = int(cfg.stage_a_resolution_hw[0]), int(cfg.stage_a_resolution_hw[1])
     F_count = int(cfg.stage_a_frame_num)
     vae_stride = (4, 8, 8)

@@ -18,6 +18,8 @@ import shutil
 import tempfile
 
 import numpy as np
+import torch
+from PIL import Image
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
@@ -54,16 +56,35 @@ def _check_prompts():
     print("[smoke] prompts OK")
 
 
-def test_stage_a_wan_shape_contract_is_strict():
-    stage_a_path = os.path.join(_REPO_ROOT, "pipelines", "stage_a_wan.py")
-    with open(stage_a_path, encoding="utf-8") as f:
-        source = f.read()
+def test_stage_a_preserves_input_aspect_ratio_for_square_images():
+    from pipelines.stage_a_wan import (
+        _DEFAULT_WAN_SIZE_LABEL,
+        _coerce_input_image,
+        _predict_wan_output_hw,
+        _WAN_MAX_AREA_CONFIGS,
+    )
 
-    assert "resolution_hw: Tuple[int, int] = (464, 832)" in source
-    assert "_WAN_OUTPUT_TO_SIZE_LABEL" in source
-    assert "expected_hw=(H, W)" in source
-    assert "max_area=wan_max_area" in source
-    assert "Wan output shape mismatch" in source
+    image = Image.fromarray(
+        np.zeros((800, 800, 3), dtype=np.uint8),
+        mode="RGB",
+    )
+    pil = _coerce_input_image(image)
+    assert pil.size == (800, 800)
+
+    max_area = int(_WAN_MAX_AREA_CONFIGS[_DEFAULT_WAN_SIZE_LABEL])
+    assert _predict_wan_output_hw((pil.height, pil.width), max_area) == (624, 624)
+
+
+def test_stage_a_shape_check_uses_predicted_wan_output_shape():
+    from pipelines.stage_a_wan import _wan_video_to_float01_uint8
+
+    video = torch.zeros((3, 21, 624, 624), dtype=torch.float32)
+    _float01, uint8 = _wan_video_to_float01_uint8(
+        video,
+        expected_F=21,
+        expected_hw=(624, 624),
+    )
+    assert tuple(uint8.shape) == (3, 21, 624, 624)
 
 
 def _make_synthetic_static_video(F=21, H=464, W=832, seed=0):

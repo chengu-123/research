@@ -47,8 +47,16 @@ from pipelines.stage_c import JointInit, Psi, StageCConfig, StageCInputs, run_st
 
 def test_wan_resolution_contract():
     cfg = BootstrapConfig()
-    assert cfg.stage_a_resolution_hw == (464, 832)
+    assert cfg.stage_a_wan_size == "832*480"
+    assert cfg.stage_a_resolution_hw is None
 
+    from pipelines.stage_a_wan import _predict_wan_output_hw, _WAN_MAX_AREA_CONFIGS
+
+    max_area = int(_WAN_MAX_AREA_CONFIGS[cfg.stage_a_wan_size])
+    assert _predict_wan_output_hw((800, 800), max_area) == (624, 624)
+
+
+def test_stage_d_default_contract_is_only_a_default():
     config_path = os.path.join(
         os.path.dirname(__file__), "..", "pipelines", "stage_d", "config.py"
     )
@@ -62,20 +70,18 @@ def test_wan_resolution_contract():
     assert (stage_d_config.H_LATENT, stage_d_config.W_LATENT) == (58, 104)
 
 
-def test_b1_rejects_stale_stage_a_resolution():
+def test_b1_accepts_dynamic_stage_a_resolution():
     cfg = BootstrapConfig(skip_b1_stage_a=True)
     with tempfile.TemporaryDirectory() as tmp:
         stage_a_dir = os.path.join(tmp, "stage_a")
         os.makedirs(stage_a_dir, exist_ok=True)
         pt_path = os.path.join(stage_a_dir, "wan_video_target_3FHW_uint8.pt")
-        torch.save(torch.zeros((3, 21, 480, 832), dtype=torch.uint8), pt_path)
+        torch.save(torch.zeros((3, 21, 624, 624), dtype=torch.uint8), pt_path)
 
-        try:
-            _run_b1_stage_a(None, "dummy motion", cfg, tmp)
-        except ValueError as exc:
-            assert "expected (3, 21, 464, 832)" in str(exc)
-        else:
-            raise AssertionError("expected stale Stage A resolution to be rejected")
+        wan_video, s_0 = _run_b1_stage_a(None, "dummy motion", cfg, tmp)
+        assert tuple(wan_video.shape) == (3, 21, 624, 624)
+        assert tuple(s_0.shape) == (3, 624, 624)
+        assert cfg.stage_a_resolution_hw == (624, 624)
 
 
 def test_voxel_world_roundtrip():
