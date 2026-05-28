@@ -27,9 +27,8 @@ Memory:
       Limitations explicitly acknowledges this).
     - Wan DiT forwards (cond + uncond) run under torch.no_grad so we don't
       retain activations for 40-layer DiT * 2 forwards.
-    - On a 464x832 frame x 21 frames, the latent is [16, 6, 58, 104] which
-      is ~5MB fp32; grad through the VAE encoder peaks around ~10 GB for
-      A14B. The bookkeeping is contained inside this module.
+    - The VAE latent H/W follows the Stage A actual output H/W. The
+      bookkeeping is contained inside this module.
 """
 from __future__ import annotations
 
@@ -41,12 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from .config import (
-    F_FRAMES,
-    F_LATENT,
-    H_LATENT,
-    H_PIXEL,
-    W_LATENT,
-    W_PIXEL,
+    WAN_VAE_STRIDE,
     WAN_BOUNDARY_NORMALIZED,
     WAN_LATENT_CH,
     WAN_NUM_TRAIN_TIMESTEPS,
@@ -89,6 +83,11 @@ class WanRFSDSContext:
     boundary_in_t_units: float   # = WAN_BOUNDARY_NORMALIZED * (num_train_timesteps)
     num_train_timesteps: int
     sample_shift: float          # ★ C2 fix: Wan scheduler shift parameter (default 5.0)
+    frame_num: int
+    resolution_hw: Tuple[int, int]
+    f_latent: int
+    h_latent: int
+    w_latent: int
     device: torch.device
     dtype: torch.dtype
 
@@ -100,6 +99,8 @@ def load_wan_for_rfsds(
     convert_model_dtype: bool = True,
     device_id: int = 0,
     sample_shift: float = 5.0,
+    frame_num: int = 21,
+    resolution_hw: Tuple[int, int] = (464, 832),
 ) -> WanRFSDSContext:
     """Load the three Wan2.2 components we need for W-RFSDS.
 
@@ -187,6 +188,21 @@ def load_wan_for_rfsds(
         )
     boundary_in_t_units = boundary * float(num_train_ts)
 
+    H, W = int(resolution_hw[0]), int(resolution_hw[1])
+    if H % 16 != 0 or W % 16 != 0:
+        raise ValueError(
+            f"resolution_hw=({H}, {W}) must align to Wan VAE stride 8 and "
+            "DiT patch size 2"
+        )
+    F_count = int(frame_num)
+    if F_count <= 1 or (F_count - 1) % int(WAN_VAE_STRIDE[0]) != 0:
+        raise ValueError(
+            f"frame_num must be of the form 4n+1 for Wan VAE stride 4; got {F_count}"
+        )
+    f_latent = (F_count - 1) // int(WAN_VAE_STRIDE[0]) + 1
+    h_latent = H // int(WAN_VAE_STRIDE[1])
+    w_latent = W // int(WAN_VAE_STRIDE[2])
+
     # Param dtype (bf16 for A14B by default after convert_model_dtype).
     sample_param = next(low_noise.parameters())
     param_dtype = sample_param.dtype
@@ -198,6 +214,11 @@ def load_wan_for_rfsds(
         boundary_in_t_units=boundary_in_t_units,
         num_train_timesteps=num_train_ts,
         sample_shift=float(sample_shift),          # ★ C2 fix
+        frame_num=F_count,
+        resolution_hw=(H, W),
+        f_latent=int(f_latent),
+        h_latent=int(h_latent),
+        w_latent=int(w_latent),
         device=device,
         dtype=param_dtype,
     )
@@ -245,20 +266,21 @@ def wan_vae_encode_grad(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, F=21, H=464, W=832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, F, H, W] in [0, 1]
         Direct render output from ``render_21_with_warp`` (permuted from
         ``[F, 3, H, W]`` to ``[3, F, H, W]``).
     ctx : WanRFSDSContext
 
     Returns
     -------
-    z : Tensor [1, 16, F_lat=6, H_lat=58, W_lat=104]
+    z : Tensor [1, 16, F_lat, H_lat, W_lat]
         Grad-enabled VAE latent. ``z.requires_grad`` is True iff the input
         rgb has ``requires_grad`` (true for our differentiable renderer).
     """
-    if rgb_3FHW_float01.shape != (3, F_FRAMES, H_PIXEL, W_PIXEL):
+    expected_rgb = (3, int(ctx.frame_num), int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1]))
+    if rgb_3FHW_float01.shape != expected_rgb:
         raise ValueError(
-            f"rgb_3FHW must be [3, {F_FRAMES}, {H_PIXEL}, {W_PIXEL}], "
+            f"rgb_3FHW must be {expected_rgb}, "
             f"got {tuple(rgb_3FHW_float01.shape)}"
         )
     rgb_neg11 = _to_wan_vae_input(rgb_3FHW_float01).to(ctx.device)
@@ -270,7 +292,12 @@ def wan_vae_encode_grad(
         )
     z = z_list[0]
     # Sanity-check the latent shape.
-    expected = (WAN_LATENT_CH, F_LATENT, H_LATENT, W_LATENT)
+    expected = (
+        WAN_LATENT_CH,
+        int(ctx.f_latent),
+        int(ctx.h_latent),
+        int(ctx.w_latent),
+    )
     if tuple(z.shape) != expected:
         raise RuntimeError(
             f"Wan VAE latent shape mismatch: expected {expected}, "
@@ -334,7 +361,7 @@ def w_rfsds_loss(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, 21, 464, 832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, F, H, W] in [0, 1]
         Differentiable render output (caller should already have clamped to
         [0, 1] to keep VAE input in-distribution).
     wan_cond : dict   from Bootstrap B11
@@ -429,7 +456,7 @@ def latent_recon_loss(
 
     Parameters
     ----------
-    rgb_3FHW_float01 : Tensor [3, 21, 464, 832] in [0, 1]
+    rgb_3FHW_float01 : Tensor [3, F, H, W] in [0, 1]
     z_wan_target : Tensor [16, F_lat, H_lat, W_lat]
     ctx : WanRFSDSContext
     z_render_cached : Optional[Tensor [1, 16, F_lat, H_lat, W_lat]]

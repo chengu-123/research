@@ -32,7 +32,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import F_FRAMES, H_PIXEL, W_PIXEL
 from .w_rfsds import WanRFSDSContext, latent_recon_loss, w_rfsds_loss
 
 
@@ -147,9 +146,10 @@ def loss_first_frame_anchor(
         raise ValueError(
             f"rgb_T3HW must be [F, 3, H, W]; got {tuple(rgb_T3HW.shape)}"
         )
-    if s_0_with_carpet_3HW.shape != (3, H_PIXEL, W_PIXEL):
+    expected_s0 = (3, int(rgb_T3HW.shape[2]), int(rgb_T3HW.shape[3]))
+    if s_0_with_carpet_3HW.shape != expected_s0:
         raise ValueError(
-            f"s_0_with_carpet must be [3, {H_PIXEL}, {W_PIXEL}]; "
+            f"s_0_with_carpet must be {expected_s0}; "
             f"got {tuple(s_0_with_carpet_3HW.shape)}"
         )
     frame_0 = rgb_T3HW[0:1]                                          # [1, 3, H, W]

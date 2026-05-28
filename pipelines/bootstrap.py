@@ -192,8 +192,8 @@ class BootstrapResult:
 
     # Inputs preserved + passthrough
     trellis_cond_can: torch.Tensor                    # (1, N_dino, 1024) DINOv2(s_0_carpet)
-    wan_video_target_3FHW: torch.Tensor               # (3, 21, 464, 832) uint8
-    s_0_clean: torch.Tensor                           # (3, 464, 832) float [0,1]
+    wan_video_target_3FHW: torch.Tensor               # (3, F, H, W) uint8
+    s_0_clean: torch.Tensor                           # (3, H, W) float [0,1]
 
     # Stage B v3.3.6 secondary outputs (passed through)
     O_base_canonical: torch.Tensor                    # (64, 64, 64) uint8
@@ -981,7 +981,7 @@ def _run_b11_wan_vae_encode(
 
     method.md section 6 B11:
         z_wan_target = wan_vae.encode([(video * 2 - 1)])[0].detach()
-    Expected shape: (16, 6, 58, 104) for (464, 832, F=21) at vae_stride=(4,8,8).
+    Expected shape is derived from the Stage A actual H/W at vae_stride=(4,8,8).
     Skipped if cfg.skip_b11_wan_vae.
     """
     if cfg.skip_b11_wan_vae:
@@ -1356,6 +1356,8 @@ def run_bootstrap(
             "K": len(cfg.state_indices),
             "state_indices": list(cfg.state_indices),
             "resolution": cfg.resolution,
+            "stage_a_wan_size": cfg.stage_a_wan_size,
+            "stage_a_resolution_hw": list(cfg.stage_a_resolution_hw),
             "stage_a_skipped": cfg.skip_b1_stage_a,
             "slat_skipped": cfg.skip_b8_slat,
             "wan_cond_skipped": cfg.skip_b10_wan_cond,

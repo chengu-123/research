@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from .config import F_FRAMES, H_PIXEL, STATE_INDICES, W_PIXEL
+from .config import F_FRAMES, STATE_INDICES
 
 
 logger = logging.getLogger(__name__)

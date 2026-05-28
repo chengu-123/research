@@ -21,8 +21,8 @@
 > 16. **(NEW.1) Canonical state = s_c (c=2 默认)**：phi 序列零点从 s_0 移到 s_c。Bootstrap B7 joint init 输出 φ_0 后做 `φ_0 -= φ_0[c]`；Stage D inner loop 在 cumsum + normalize 后做 `u_shifted = u - u[c]`，`phi_render_rev/pri = u_shifted × {theta_max, disp_max}` 可正可负。**Motivation**：TRELLIS 在 s_0 闭合态对 move 几何 underrep (DINOv2 cond 信息少 → SS-DiT 重建偏小)；s_2 半开 drawer 暴露 front face + 部分侧面 → canonical move 重建更稳。**L_first 仍 anchor frame 0 = s_0_with_carpet 真实输入**（不损失真实数据 anchor 强度）。c=2 固定，不自动选 (per-instance auto-select 留作 future work)。
 > 17. **(Q1 增强) B6 加 `O_init_max` 兜底**：`U_seed = {O_mean > 0.3} ∪ {O_max > 0.5} ∪ boundary_band`。原因：大平移 / state 间不重叠时 mean(z_final) 解码出的 trajectory 概率会跌出 boundary band (0.1-0.3) → mean only 漏 voxel；O_max（per-state decode 后 voxel-wise max）兜底"至少一个 state 强占据"的位置。代价：6 次 SS-VAE decode（Bootstrap 一次性）。
 > 18. **(NEW.1-consistency) Bootstrap B9 SLAT cond 改用 `trellis_cond_k[CANONICAL_STATE_IDX]`**：原版用 [0]，与 canonical=s_2 不一致（xyz_canon 受 cond 牵引聚集在 s_0 几何，但 phi_shift 要求 xyz_canon ≈ s_2 几何）。修复后 SLAT 真正在 s_2 状态条件下采样，xyz_canon 与 NEW.1 canonical 约定 self-consistent。trellis_cond_k 全部源自 wan_video_target 抽帧，换索引不引入额外 hallucination；frame 8 (= state 2) 暴露的几何比 frame 0 多，SLAT 重建质量更高。
-> 19. **(Camera) Stage D 默认相机 = FreeArt3D 渲染相机 + iter-0 IoU 自检**：从 `pipelines/render.py:run_rendering()` 提取硬编码 Blender 相机参数（fov=45°，azi=22.5°，ele=45°，distance=2.1·object_scale，**+Z up**）注入 `StageDCameraConfig.freeart3d_canonical()`；新增 `fov_y_deg` 字段处理 stage_a LANCZOS 800×800→464×832 拉伸（保 45/45° 方 FoV 渲到 464×832 非方 pixel grid）。**TRELLIS canonical world up = +Z** 由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(..., [0,0,1])` 直接确认，**与 Blender 完全一致**，无需坐标系转换；以前的 `world_up_axis` 二元 knob 已删除（没有正确性 ablation 必要）。训练 iter 0 加 silhouette IoU 自检（render frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError` + 修复指引，diag PNG 写到 `viz/iter_0_camera_diag.png`）。Real photo 输入超出 v1 实验集范围（需用户自己提供 camera）。
-> 18. **(NEW.2) Stage A 默认分辨率切到 Wan2.2/CHORD 480P actual output (H=464, W=832)**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B 官方 area profiles（720*1280 / 1280*720 / 480*832 / 832*480），off-distribution area scale → W-RFSDS 用 Wan DiT 时 v_pred 不可靠 (核心创新 2 失效)。I2V 的 `size` 是面积档，不是固定 H/W；我们用官方 832*480 area profile，但按 CHORD/Wan 实际输出契约固定 tensor shape 为 (464, 832)。改成 (464, 832) 后：lat_h=58, lat_w=104, z_wan_target=[16, 6, 58, 104]，wan_video_target_3FHW=[3, 21, 464, 832]，seq_len = 6·58·104/(2·2) = 9048。Stage D backward 计算开销相对旧默认 ↑2.62×（H800 单卡 P1 5000 iter ~7h → ~18h，可接受）。`pipelines/stage_a_wan.py` 对 actual output (H, W) 做硬校验，不能再把官方 area label 误当成输出 H/W。
+> 19. **(Camera) Stage D 默认相机 = FreeArt3D 渲染相机 + iter-0 IoU 自检**：从 `pipelines/render.py:run_rendering()` 提取硬编码 Blender 相机参数（fov=45°，azi=22.5°，ele=45°，distance=2.1·object_scale，**+Z up**）注入 `StageDCameraConfig.freeart3d_canonical()`；Stage A 保留输入 aspect ratio，不再做 800×800→464×832 非均匀拉伸；Stage D 默认相机接收 Bootstrap 记录的 actual H/W。**TRELLIS canonical world up = +Z** 由 `trellis/utils/render_utils.py:33` 的 `extrinsics_look_at(..., [0,0,1])` 直接确认，**与 Blender 完全一致**，无需坐标系转换；以前的 `world_up_axis` 二元 knob 已删除（没有正确性 ablation 必要）。训练 iter 0 加 silhouette IoU 自检（render frame 0 vs s_0_with_carpet，IoU<0.5 抛 `CameraMismatchError` + 修复指引，diag PNG 写到 `viz/iter_0_camera_diag.png`）。Real photo 输入超出 v1 实验集范围（需用户自己提供 camera）。
+> 18. **(NEW.2) Stage A 默认使用 Wan2.2 I2V 官方 832*480 area profile，并保留输入宽高比**：旧 v3.3 默认 288×512 不在 Wan2.2 I2V-A14B 官方 area profiles（720*1280 / 1280*720 / 480*832 / 832*480），off-distribution area scale → W-RFSDS 用 Wan DiT 时 v_pred 不可靠 (核心创新 2 失效)。I2V 的 `size` 是面积档，不是固定 H/W；`pipelines/stage_a_wan.py` 按 Wan 官方 `max_area + input aspect` 公式预测并校验 actual output H/W。例如 800×800 输入在 832*480 profile 下输出 624×624。Bootstrap、Wan cond、Wan VAE target、Stage D render/W-RFSDS 均跟随实际 H/W。
 
 ---
 
@@ -75,7 +75,7 @@
 
 ```mermaid
 flowchart TD
-    A[Input: s_0_clean + prompt] --> B[Stage A: Wan2.2 video gen, F=21, 832x464, clean]
+    A[Input: s_0_clean + prompt] --> B[Stage A: Wan2.2 video gen, F=21, official 832*480 area profile, aspect preserved]
     B --> C[Stage B: 13-step bootstrap, B1-B13]
     C --> D[Stage C.5: Preflight U coverage check]
     D --> E[Stage D: Geometry W-RFSDS inner loop]
@@ -520,11 +520,11 @@ class DGSWithParent(nn.Module):
 
 ```
 Input:
-    s_0_clean                  : [3, 464, 832] uint8 RGB, 用户提供
+    s_0_clean                  : [3, H, W] uint8 RGB, 用户提供 / Stage A actual H/W
     user_object_motion_prompt  : str, 用户描述部件运动 (per object)
 
 Output:
-    wan_video_target_3FHW : [3, 21, 464, 832] uint8 RGB (clean, no carpet)
+    wan_video_target_3FHW : [3, 21, H, W] uint8 RGB (clean, no carpet)
 ```
 
 ### 5.2 Prompt 分层构造（**v3.1 关键修正**）
@@ -625,8 +625,8 @@ bootstrap/
   trellis_cond_can.pt           [1, N_dino, 1024]
   wan_cond_cached.pt            dict (context, context_null, seq_len, y, ...)
   z_wan_target.pt               [16, 6, 58, 104]
-  wan_video_target_3FHW.pt      [3, 21, 464, 832] uint8
-  s_0_clean.pt                  [3, 464, 832]
+  wan_video_target_3FHW.pt      [3, 21, H, W] uint8
+  s_0_clean.pt                  [3, H, W]
 ```
 
 ### 6.2 13-step bootstrap（v3 顺序无循环依赖）
@@ -743,7 +743,7 @@ def stage_b_bootstrap_v3(s_0_clean, prompt):
     wan_cond_cached = build_wan_i2v_cond(
         s_0_clean_float01=s_0_clean.float() / 255.0,
         prompt=prompt,
-        frame_num=21, H=464, W=832, device=device,
+        frame_num=21, H=H_actual, W=W_actual, device=device,
         wan_config=wan_config,
     )
     # 返回 dict 含 context, context_null, seq_len, y, ...
@@ -1340,7 +1340,7 @@ def stage_d_inner_loop(it, total_iters, cfg, bootstrap, ss_dit_w, learnable):
 ```python
 def W_RFSDS_Wan(rgb_frames_3FHW_float01, wan_cond, τ_raw, cfg_scale=5.0):
     """
-    rgb_frames_3FHW_float01: [3, 21, 464, 832] in [0, 1]  (grad-enabled, from renderer)
+    rgb_frames_3FHW_float01: [3, 21, H, W] in [0, 1]  (grad-enabled, from renderer)
     wan_cond: dict from build_wan_i2v_cond (context_null 已用 sample_neg_prompt)
     τ_raw: scalar in [0, 1]
     """
@@ -2192,7 +2192,7 @@ Phase 30-100%: F=21 + 832×464
 ```python
 # Stage B 末尾, 算 F=9 和 F=21 两套
 wan_cond_cached_F9  = build_wan_i2v_cond(s_0_with_carpet, prompt, frame_num=9,  H=216, W=384, ...)
-wan_cond_cached_F21 = build_wan_i2v_cond(s_0_with_carpet, prompt, frame_num=21, H=464, W=832, ...)
+wan_cond_cached_F21 = build_wan_i2v_cond(s_0_with_carpet, prompt, frame_num=21, H=H_actual, W=W_actual, ...)
 
 z_wan_target_F9  = wan_vae.encode([to_wan_vae_input(wan_video_target_F9)])[0].detach()
 z_wan_target_F21 = wan_vae.encode([to_wan_vae_input(wan_video_target_F21)])[0].detach()
@@ -2307,7 +2307,7 @@ Level D: 256×144 proxy renderer for first 50%
 
 ### 15.4.4 Shape 约定（v3.1 新增 D-v3.13）
 ```
-✓ Render output:    rgb_frames_T3HW = [T=21, 3, H=464, W=832] in [0, 1]
+✓ Render output:    rgb_frames_T3HW = [T=21, 3, H, W] in [0, 1]
 ✓ Wan VAE encode:   rgb_frames_3THW = rgb_frames_T3HW.permute(1,0,2,3)
 ✓ LPIPS / L1:       rgb_frames_T3HW (LPIPS 期望 [N, 3, H, W])
 ✓ First frame:      rgb_frames_T3HW[0:1] vs s_0_clean.unsqueeze(0) (都 [1, 3, H, W])

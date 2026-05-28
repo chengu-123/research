@@ -30,10 +30,10 @@ import torch
 from .config import (
     CANONICAL_STATE_IDX,
     F_FRAMES,
-    H_PIXEL,
     StageDConfig,
     TRELLIS_OCC_RES,
-    W_PIXEL,
+    WAN_LATENT_CH,
+    WAN_VAE_STRIDE,
 )
 from .feature_sample import voxel_to_world
 from .losses import LPIPSModule
@@ -201,11 +201,29 @@ def load_bootstrap_bundle(
     wan_video_target_T3HW_01 = (
         wan_video_target_uint8.float().to(device) / 255.0
     ).permute(1, 0, 2, 3).contiguous()                     # [F, 3, H, W] in [0, 1]
-    if wan_video_target_T3HW_01.shape != (F_FRAMES, 3, H_PIXEL, W_PIXEL):
+    if wan_video_target_T3HW_01.ndim != 4 or wan_video_target_T3HW_01.shape[:2] != (F_FRAMES, 3):
         raise RuntimeError(
-            f"Bootstrap target video shape mismatch: expected "
-            f"({F_FRAMES}, 3, {H_PIXEL}, {W_PIXEL}); "
+            f"Bootstrap target video shape mismatch: expected [F={F_FRAMES}, 3, H, W]; "
             f"got {tuple(wan_video_target_T3HW_01.shape)}"
+        )
+    H_loaded = int(wan_video_target_T3HW_01.shape[2])
+    W_loaded = int(wan_video_target_T3HW_01.shape[3])
+    if H_loaded % 16 != 0 or W_loaded % 16 != 0:
+        raise RuntimeError(
+            f"Bootstrap target spatial shape=({H_loaded}, {W_loaded}) is not "
+            "aligned to Wan VAE stride 8 and DiT patch size 2"
+        )
+    expected_z = (
+        int(WAN_LATENT_CH),
+        (int(F_FRAMES) - 1) // int(WAN_VAE_STRIDE[0]) + 1,
+        H_loaded // int(WAN_VAE_STRIDE[1]),
+        W_loaded // int(WAN_VAE_STRIDE[2]),
+    )
+    if tuple(z_wan_target.shape) != expected_z:
+        raise RuntimeError(
+            f"z_wan_target shape mismatch: expected {expected_z} from target "
+            f"video shape {(F_FRAMES, 3, H_loaded, W_loaded)}; "
+            f"got {tuple(z_wan_target.shape)}"
         )
 
     # s_0_with_carpet may be saved as s_0_clean.pt (legacy name) or
@@ -223,10 +241,10 @@ def load_bootstrap_bundle(
     s_0 = s_0.to(device)
     if s_0.dtype == torch.uint8:
         s_0 = s_0.float() / 255.0
-    if s_0.shape != (3, H_PIXEL, W_PIXEL):
+    if s_0.shape != (3, H_loaded, W_loaded):
         raise RuntimeError(
             f"s_0_with_carpet shape mismatch: expected "
-            f"(3, {H_PIXEL}, {W_PIXEL}); got {tuple(s_0.shape)}"
+            f"(3, {H_loaded}, {W_loaded}); got {tuple(s_0.shape)}"
         )
 
     return BootstrapBundle(
@@ -245,6 +263,9 @@ def load_bootstrap_bundle(
         wan_cond=wan_cond_on_dev, z_wan_target=z_wan_target,
         wan_video_target_T3HW_01=wan_video_target_T3HW_01,
         s_0_with_carpet_3HW_01=s_0,
+        frame_num=int(F_FRAMES),
+        resolution_hw=(H_loaded, W_loaded),
+        latent_hw=(expected_z[2], expected_z[3]),
     )
 
 
@@ -334,6 +355,8 @@ def run_stage_d_main(
     wan_ctx = load_wan_for_rfsds(
         wan_ckpt_dir=wan_ckpt_dir, repo_root=repo_root, device=dev,
         convert_model_dtype=True, device_id=device_id,
+        frame_num=bootstrap.frame_num,
+        resolution_hw=bootstrap.resolution_hw,
     )
 
     logger.info("[stage_d] building camera + LPIPS")
@@ -341,7 +364,10 @@ def run_stage_d_main(
         # ★ Default to FreeArt3D's hardcoded render camera (matches s_0).
         # +Z up is the verified TRELLIS canonical world convention; not a
         # tunable. Iter-0 silhouette IoU check inside train.py validates.
-        camera = StageDCameraConfig.freeart3d_canonical()
+        camera = StageDCameraConfig.freeart3d_canonical(
+            image_h=int(bootstrap.resolution_hw[0]),
+            image_w=int(bootstrap.resolution_hw[1]),
+        )
         logger.info(
             "[stage_d] using freeart3d_canonical camera (TRELLIS +Z up); "
             "iter-0 sanity check will validate against s_0_with_carpet."

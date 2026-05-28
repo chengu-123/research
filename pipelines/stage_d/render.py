@@ -78,10 +78,8 @@ class StageDCameraConfig:
         projection matrix computes ``fov_y`` from the image aspect ratio
         assuming square pixels. Set explicitly when the image pixel grid
         does NOT have a square-pixel aspect — e.g. the Stage A pipeline
-        LANCZOS-resizes FreeArt3D's 800x800 render to Wan's 464x832, so
-        a square-FoV (45/45 deg) camera ends up sampled on a 464x832 grid
-        with non-square pixels. In that case set ``fov_x_deg = fov_y_deg
-        = 45`` and image_h/w = 464/832.
+        use the same calibrated FoV as the input renderer and pass the Stage A
+        actual H/W.
 
     near / far must bracket the object (in [-0.5, 0.5]^3) plus camera
     distance; defaults 0.1 / 10.0 cover all reasonable poses including
@@ -92,14 +90,18 @@ class StageDCameraConfig:
     up: Tuple[float, float, float] = (0.0, 1.0, 0.0)
     fov_x_deg: float = 30.0
     fov_y_deg: Optional[float] = None       # ★ explicit y FoV (None -> derive from aspect)
-    image_h: int = H_PIXEL                  # 464
-    image_w: int = W_PIXEL                  # 832
+    image_h: int = H_PIXEL
+    image_w: int = W_PIXEL
     near: float = 0.1
     far: float = 10.0
     bg_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @classmethod
-    def freeart3d_canonical(cls) -> "StageDCameraConfig":
+    def freeart3d_canonical(
+        cls,
+        image_h: int = H_PIXEL,
+        image_w: int = W_PIXEL,
+    ) -> "StageDCameraConfig":
         """FreeArt3D's hardcoded rendering camera, expressed in TRELLIS world.
 
         Source: ``mine/pipelines/render.py:run_rendering()`` line 211-285 sets
@@ -120,13 +122,10 @@ class StageDCameraConfig:
                                                             ^-- third axis = height
         Same convention as Blender / FreeArt3D source. No axis swap needed.
 
-        Image aspect: Stage A LANCZOS-resizes FreeArt3D's 800x800 render to
-        464x832 before Wan I2V. This is a NON-uniform aspect transform.
-        We replicate it by keeping fov_x = fov_y = 45 deg while rendering
-        at 464x832 (i.e. non-square pixels). Without explicit fov_y, the
-        default aspect-derivation would compute fov_y = atan(tan(22.5) *
-        464/832) * 2 ~= 26 deg, which crops the vertical view and breaks the
-        match to s_0.
+        Image aspect: Stage A preserves the input aspect ratio. For the
+        FreeArt3D default 800x800 render, the Wan 480P profile therefore
+        produces a square output. Keep fov_x = fov_y = 45 deg and pass the
+        Stage A actual H/W into this factory.
         """
         d = 2.1                                 # distance, normalized object_scale=1
         azi = math.pi / 8.0                     # 22.5 deg azimuth
@@ -141,8 +140,8 @@ class StageDCameraConfig:
             look_at=(0.0, 0.0, 0.0),
             up=(0.0, 0.0, 1.0),                 # ★ hardcoded +Z (TRELLIS canonical)
             fov_x_deg=45.0,
-            fov_y_deg=45.0,                     # explicit: square FoV stretched to 464x832
-            image_h=H_PIXEL, image_w=W_PIXEL,
+            fov_y_deg=45.0,
+            image_h=int(image_h), image_w=int(image_w),
             near=0.1, far=10.0,
             bg_color=(0.0, 0.0, 0.0),
         )
@@ -186,9 +185,7 @@ def _build_proj_matrix(camera_cfg: StageDCameraConfig,
     When ``camera_cfg.fov_y_deg is None`` (square-pixel default), computes
     ``fov_y`` from the image aspect via ``tan(fov_y/2) = tan(fov_x/2) * H/W``.
     When ``fov_y_deg`` is set explicitly, uses it directly — this is needed
-    when the image grid does NOT have square pixels (e.g. FreeArt3D's
-    800x800 LANCZOS-resized to 464x832 by Stage A, where the "true" FoV is
-    45/45 deg square but the pixel grid is rectangular).
+    when the image grid does NOT have square pixels.
 
     Maps z in [near, far] to [0, 1] (diff_gauss / TRELLIS convention; see
     trellis/renderers/gaussian_render.py:30-47).
@@ -201,7 +198,7 @@ def _build_proj_matrix(camera_cfg: StageDCameraConfig,
         tan_fov_y = tan_fov_x * aspect_h_over_w
         fovy = 2.0 * math.atan(tan_fov_y)
     else:
-        # ★ Explicit fov_y (for non-square-pixel grids, e.g. LANCZOS-stretched).
+        # Explicit fov_y for calibrated non-square-pixel grids.
         fovy = math.radians(float(camera_cfg.fov_y_deg))
         tan_fov_y = math.tan(fovy * 0.5)
 

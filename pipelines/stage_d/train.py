@@ -35,14 +35,12 @@ from trellis.modules import sparse as sp
 from .config import (
     CANONICAL_STATE_IDX,
     F_FRAMES,
-    H_PIXEL,
     K_STATES,
     PSI_PARAM_DIM,
     STATE_INDICES,
     StageDConfig,
     TRELLIS_DGS_N_GAUSS_PER_VOXEL,
     TRELLIS_OCC_RES,
-    W_PIXEL,
 )
 from .feature_sample import (
     binary_concrete_ste,
@@ -151,9 +149,12 @@ class BootstrapBundle:
     # Conditioning + targets
     trellis_cond_can: torch.Tensor            # [1, N_dino, 1024]
     wan_cond: Dict[str, Any]                  # context / context_null / seq_len / y
-    z_wan_target: torch.Tensor                # [16, 6, 58, 104]
-    wan_video_target_T3HW_01: torch.Tensor    # [F=21, 3, 464, 832] in [0, 1]
-    s_0_with_carpet_3HW_01: torch.Tensor      # [3, 464, 832] in [0, 1]
+    z_wan_target: torch.Tensor                # [16, F_lat, H_lat, W_lat]
+    wan_video_target_T3HW_01: torch.Tensor    # [F, 3, H, W] in [0, 1]
+    s_0_with_carpet_3HW_01: torch.Tensor      # [3, H, W] in [0, 1]
+    frame_num: int
+    resolution_hw: Tuple[int, int]
+    latent_hw: Tuple[int, int]
 
 
 @dataclass
