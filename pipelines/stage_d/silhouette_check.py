@@ -143,12 +143,12 @@ def iter_0_camera_check(
 
     Called ONCE at training iter 0 (before any optimization step). Renders
     frame 0 of the current 3D under the configured camera, computes the
-    silhouette IoU against the real ``s_0_with_carpet`` image, and raises
+    silhouette IoU against the Wan-canonical ``s_0_with_carpet`` image, and raises
     ``CameraMismatchError`` if IoU is below ``iou_threshold``. This catches
     the most common Stage D bug — wrong camera convention — at iter 0
     rather than after a long failed training run.
 
-    The silhouette of ``s_0_with_carpet`` is the real input's foreground;
+    The silhouette of ``s_0_with_carpet`` is the frame-0 observation foreground;
     the silhouette of the render is the rasterized foreground (alpha-like).
     Both use the ``silhouette_from_rgb`` heuristic (sum-channel > thresh
     over black bg). If your bg is not black, override that explicitly.

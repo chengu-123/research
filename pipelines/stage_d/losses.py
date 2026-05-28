@@ -5,7 +5,7 @@ method.md section 9.1 enumerates the full loss list:
     L_total = lambda_sds   * L_sds        (W-RFSDS through Wan2.2)
             + lambda_lat   * L_lat_rec    (auxiliary, off by default; C2)
             + lambda_rgb   * L_rgb_rec    (L1 + LPIPS vs Wan video target)
-            + lambda_first * L_first      (frame 0 vs s_0_with_carpet real input)
+            + lambda_first * L_first      (frame 0 vs Wan-canonical s_0)
             + lambda_contact * L_contact  (axis-through-anchor-band prior)
             + lambda_gate  * L_gate       (encourages g, m -> {0, 1})
             + lambda_shell * L_shell      (sparsity on uncertain shell voxels)
@@ -128,13 +128,13 @@ def loss_first_frame_anchor(
     s_0_with_carpet_3HW: torch.Tensor,
     lpips_module: LPIPSModule,
 ) -> torch.Tensor:
-    """Frame 0 of rendered video vs the user's real ``s_0_with_carpet``.
+    """Frame 0 of rendered video vs the Wan-canonical ``s_0_with_carpet``.
 
     With NEW.1 canonical-state shift (c=2), rendering frame 0 means the
     canonical asset is *back-warped* by SE(3)(phi[0]) (negative phi for
     revolute, negative-direction translation for prismatic) to reach the
-    closed pose. This loss is the only direct anchor to *real input data*
-    (everything else is anchored to Wan-generated frames), so it's critical
+    closed pose. This loss is the direct anchor to the frame-0 observation in
+    the same H/W and color space as the Wan video target, so it is critical
     for resolving the canonical-position ambiguity.
 
     Parameters
@@ -387,7 +387,7 @@ def aggregate_loss(
     else:
         log["L_rgb"] = 0.0
 
-    # ---- L_first (frame 0 vs real s_0; ALWAYS on, fixed weight) ----
+    # ---- L_first (frame 0 vs Wan-canonical s_0; ALWAYS on, fixed weight) ----
     L_first = loss_first_frame_anchor(rgb_T3HW, inp.s_0_with_carpet_3HW_01, lpips_module)
     total = total + cfg_lambdas_first * L_first
     log["L_first"] = float(L_first.detach().item())

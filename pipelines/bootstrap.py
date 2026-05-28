@@ -47,11 +47,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from pipelines.stage_c import (
     JointInit,
@@ -85,7 +86,18 @@ class BootstrapConfig:
     stage_a_seed: int = 42
     stage_a_lang: str = "zh"
     stage_a_sampling_steps: int = 50
-    stage_a_guide_scale: float = 5.0
+    stage_a_guide_scale: float = 3.5
+    stage_a_sample_shift: float = 5.0
+    stage_a_sample_solver: str = "unipc"
+    stage_a_offload_model: bool = False
+    stage_a_convert_model_dtype: bool = True
+    stage_a_t5_cpu: bool = False
+    stage_a_device_id: int = 0
+    bootstrap_input_mode: str = "stagea_video"
+    stage_a_video_path: Optional[str] = None
+    stage_image_dir: Optional[str] = None
+    stage_image_pattern: str = "rendering_joint_00_state_{i:02d}.png"
+    stage_image_paths: Tuple[str, ...] = ()
 
     # ---- B2 (K=6 frame sampling) -----------------------------------------
     state_indices: Tuple[int, ...] = (0, 4, 8, 12, 16, 20)
@@ -209,9 +221,183 @@ class BootstrapResult:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class BootstrapInputBundle:
+    """Unified Bootstrap input after resolving Stage A video or six images."""
+
+    wan_video_target_3FHW: torch.Tensor
+    s_0_clean: torch.Tensor
+    state_images: Optional[List[Image.Image]]
+    source_meta: Dict[str, Any] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
-# B1: Stage A Wan I2V (or load existing)
+# B1: Bootstrap input (Stage A video, six images, or optional Stage A run)
 # ---------------------------------------------------------------------------
+
+
+def _load_stage_a_video_tensor(
+    video_path: str,
+    expected_frame_num: int,
+) -> torch.Tensor:
+    """Load and validate a Stage A uint8 video tensor."""
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Stage A video tensor not found: {video_path}")
+    video = torch.load(video_path, map_location="cpu")
+    if video.dtype != torch.uint8:
+        raise TypeError(
+            f"loaded {video_path} dtype={video.dtype}, expected uint8"
+        )
+    if video.ndim != 4 or int(video.shape[0]) != 3:
+        raise ValueError(
+            f"loaded {video_path} shape={tuple(video.shape)}, expected [3, F, H, W]"
+        )
+    if int(video.shape[1]) != int(expected_frame_num):
+        raise ValueError(
+            f"loaded {video_path} frame count={int(video.shape[1])}, "
+            f"expected {int(expected_frame_num)}"
+        )
+    H_loaded = int(video.shape[2])
+    W_loaded = int(video.shape[3])
+    if H_loaded % 16 != 0 or W_loaded % 16 != 0:
+        raise ValueError(
+            f"loaded {video_path} spatial shape=({H_loaded}, {W_loaded}) is not "
+            "aligned to Wan VAE stride 8 and DiT patch size 2"
+        )
+    return video
+
+
+def _resolve_stage_a_video_path(out_dir: str, cfg: BootstrapConfig) -> str:
+    if cfg.stage_a_video_path is not None:
+        return os.path.abspath(os.fspath(cfg.stage_a_video_path))
+    stage_a_dir = os.path.join(out_dir, "stage_a")
+    candidate_paths = [
+        os.path.join(stage_a_dir, "wan_video_target_3FHW_uint8.pt"),
+        os.path.join(out_dir, "wan_video_target_3FHW_uint8.pt"),
+        os.path.join(out_dir, "bootstrap", "wan_video_target_3FHW.pt"),
+    ]
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        "bootstrap_input_mode='stagea_video' but no pre-existing Stage A "
+        f"video tensor was found. Searched: {candidate_paths}"
+    )
+
+
+def _load_state_images_from_config(cfg: BootstrapConfig) -> Tuple[List[Image.Image], List[str]]:
+    K = len(cfg.state_indices)
+    if len(cfg.stage_image_paths) > 0:
+        paths = [os.path.abspath(os.fspath(p)) for p in cfg.stage_image_paths]
+        if len(paths) != K:
+            raise ValueError(
+                f"stage_image_paths length {len(paths)} must equal K={K}"
+            )
+        for p in paths:
+            if not os.path.isfile(p):
+                raise FileNotFoundError(f"missing state image: {p}")
+        images = [Image.open(p).convert("RGBA") for p in paths]
+        return images, paths
+
+    if cfg.stage_image_dir is None:
+        raise ValueError(
+            "bootstrap_input_mode='six_images' requires stage_image_dir or "
+            "stage_image_paths"
+        )
+    from pipelines.utils.state_input import load_K_state_images
+
+    image_dir = os.path.abspath(os.fspath(cfg.stage_image_dir))
+    images = load_K_state_images(
+        image_dir,
+        K=K,
+        state_indices=cfg.state_indices,
+        image_pattern=cfg.stage_image_pattern,
+        out_mode="RGBA",
+    )
+    paths = [
+        os.path.join(image_dir, cfg.stage_image_pattern.format(i=i))
+        for i in range(K)
+    ]
+    return images, paths
+
+
+def _pil_to_rgb_uint8_chw(image: Image.Image) -> torch.Tensor:
+    """Convert PIL RGB/RGBA to uint8 [3, H, W], alpha-premultiplied on black."""
+    rgba = np.array(image.convert("RGBA"), dtype=np.float32)
+    rgb = rgba[:, :, :3]
+    alpha = rgba[:, :, 3:4] / 255.0
+    premultiplied = (rgb * alpha).round().clip(0.0, 255.0).astype(np.uint8)
+    return torch.from_numpy(np.transpose(premultiplied, (2, 0, 1))).contiguous()
+
+
+def _tensor_frame_to_rgb_pil(frame_3hw_uint8: torch.Tensor) -> Image.Image:
+    if frame_3hw_uint8.dtype != torch.uint8:
+        raise TypeError(f"frame dtype must be uint8; got {frame_3hw_uint8.dtype}")
+    if frame_3hw_uint8.ndim != 3 or int(frame_3hw_uint8.shape[0]) != 3:
+        raise ValueError(
+            f"frame must be [3, H, W]; got {tuple(frame_3hw_uint8.shape)}"
+        )
+    arr = frame_3hw_uint8.cpu().numpy()
+    return Image.fromarray(np.transpose(arr, (1, 2, 0)), mode="RGB")
+
+
+def _validate_state_indices_for_video(
+    state_indices: Sequence[int],
+    frame_num: int,
+) -> Tuple[int, ...]:
+    indices = tuple(int(i) for i in state_indices)
+    if len(indices) == 0:
+        raise ValueError("state_indices must be non-empty")
+    if min(indices) < 0 or max(indices) >= int(frame_num):
+        raise ValueError(
+            f"state_indices {list(indices)} out of range for frame_num={frame_num}"
+        )
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        raise ValueError(f"state_indices must be strictly increasing; got {list(indices)}")
+    return indices
+
+
+def _state_images_to_video_tensor(
+    images: Sequence[Image.Image],
+    state_indices: Sequence[int],
+    frame_num: int,
+) -> torch.Tensor:
+    """Create a 21-frame target by holding each observed state until the next."""
+    indices = _validate_state_indices_for_video(state_indices, frame_num)
+    if len(images) != len(indices):
+        raise ValueError(
+            f"len(images)={len(images)} must equal len(state_indices)={len(indices)}"
+        )
+    frames = [_pil_to_rgb_uint8_chw(img) for img in images]
+    H, W = int(frames[0].shape[1]), int(frames[0].shape[2])
+    if H % 16 != 0 or W % 16 != 0:
+        raise ValueError(
+            f"six-image spatial shape=({H}, {W}) is not aligned to Wan VAE "
+            "stride 8 and DiT patch size 2"
+        )
+    for j, frame in enumerate(frames):
+        if tuple(frame.shape) != (3, H, W):
+            raise ValueError(
+                f"state image {j} shape={tuple(frame.shape)} differs from "
+                f"state image 0 shape={(3, H, W)}"
+            )
+
+    video = torch.empty((3, int(frame_num), H, W), dtype=torch.uint8)
+    for f in range(int(frame_num)):
+        src = 0
+        for j, idx in enumerate(indices):
+            if f >= idx:
+                src = j
+        video[:, f] = frames[src]
+    return video
+
+
+def _sample_state_images_from_video(
+    video_3FHW: torch.Tensor,
+    state_indices: Sequence[int],
+) -> List[Image.Image]:
+    indices = _validate_state_indices_for_video(state_indices, int(video_3FHW.shape[1]))
+    return [_tensor_frame_to_rgb_pil(video_3FHW[:, idx]) for idx in indices]
 
 
 def _run_b1_stage_a(
@@ -219,56 +405,55 @@ def _run_b1_stage_a(
     user_motion_prompt: str,
     cfg: BootstrapConfig,
     out_dir: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Returns (wan_video_target_3FHW, s_0_clean).
+) -> BootstrapInputBundle:
+    """Resolve Bootstrap input into a unified video tensor plus K state images.
 
     wan_video_target_3FHW: (3, F, H, W) uint8 [0, 255]
     s_0_clean: (3, H, W) float [0, 1] (first frame as float)
     """
     if cfg.skip_b1_stage_a:
-        # Load pre-existing Stage A artifact
-        stage_a_dir = os.path.join(out_dir, "stage_a")
-        candidate_paths = [
-            os.path.join(stage_a_dir, "wan_video_target_3FHW_uint8.pt"),
-            os.path.join(out_dir, "wan_video_target_3FHW_uint8.pt"),
-            os.path.join(out_dir, "bootstrap", "wan_video_target_3FHW.pt"),
-        ]
-        loaded_path = None
-        for p in candidate_paths:
-            if os.path.isfile(p):
-                loaded_path = p
-                break
-        if loaded_path is None:
-            raise FileNotFoundError(
-                "skip_b1_stage_a=True but no pre-existing wan_video found. "
-                f"Searched: {candidate_paths}"
+        mode = str(cfg.bootstrap_input_mode)
+        if mode == "stagea_video":
+            loaded_path = _resolve_stage_a_video_path(out_dir, cfg)
+            video = _load_stage_a_video_tensor(loaded_path, cfg.stage_a_frame_num)
+            cfg.stage_a_resolution_hw = (int(video.shape[2]), int(video.shape[3]))
+            s_0_clean = video[:, 0].float() / 255.0
+            state_images = _sample_state_images_from_video(video, cfg.state_indices)
+            return BootstrapInputBundle(
+                wan_video_target_3FHW=video,
+                s_0_clean=s_0_clean,
+                state_images=state_images,
+                source_meta={
+                    "mode": mode,
+                    "path": loaded_path,
+                    "constructed_video": False,
+                },
             )
-        wan_video_target_3FHW = torch.load(loaded_path, map_location="cpu")
-        if wan_video_target_3FHW.dtype != torch.uint8:
-            raise TypeError(
-                f"loaded {loaded_path} dtype={wan_video_target_3FHW.dtype}, "
-                f"expected uint8"
+        if mode == "six_images":
+            images, paths = _load_state_images_from_config(cfg)
+            video = _state_images_to_video_tensor(
+                images,
+                state_indices=cfg.state_indices,
+                frame_num=cfg.stage_a_frame_num,
             )
-        if wan_video_target_3FHW.ndim != 4 or int(wan_video_target_3FHW.shape[0]) != 3:
-            raise ValueError(
-                f"loaded {loaded_path} shape={tuple(wan_video_target_3FHW.shape)}, "
-                "expected [3, F, H, W]"
+            cfg.stage_a_resolution_hw = (int(video.shape[2]), int(video.shape[3]))
+            s_0_clean = video[:, 0].float() / 255.0
+            return BootstrapInputBundle(
+                wan_video_target_3FHW=video,
+                s_0_clean=s_0_clean,
+                state_images=list(images),
+                source_meta={
+                    "mode": mode,
+                    "image_paths": paths,
+                    "image_pattern": cfg.stage_image_pattern,
+                    "constructed_video": True,
+                    "video_fill": "hold_previous_keyframe",
+                },
             )
-        if int(wan_video_target_3FHW.shape[1]) != int(cfg.stage_a_frame_num):
-            raise ValueError(
-                f"loaded {loaded_path} frame count={int(wan_video_target_3FHW.shape[1])}, "
-                f"expected {int(cfg.stage_a_frame_num)}"
-            )
-        H_loaded = int(wan_video_target_3FHW.shape[2])
-        W_loaded = int(wan_video_target_3FHW.shape[3])
-        if H_loaded % 16 != 0 or W_loaded % 16 != 0:
-            raise ValueError(
-                f"loaded {loaded_path} spatial shape=({H_loaded}, {W_loaded}) is not "
-                "aligned to Wan VAE stride 8 and DiT patch size 2"
-            )
-        cfg.stage_a_resolution_hw = (H_loaded, W_loaded)
-        s_0_clean = wan_video_target_3FHW[:, 0].float() / 255.0
-        return wan_video_target_3FHW, s_0_clean
+        raise ValueError(
+            "bootstrap_input_mode must be 'stagea_video' or 'six_images' when "
+            f"skip_b1_stage_a=True; got {mode!r}"
+        )
 
     if cfg.wan_ckpt_dir is None:
         raise ValueError(
@@ -289,11 +474,29 @@ def _run_b1_stage_a(
         wan_size_label=cfg.stage_a_wan_size,
         sampling_steps=cfg.stage_a_sampling_steps,
         guide_scale=cfg.stage_a_guide_scale,
+        sample_shift=cfg.stage_a_sample_shift,
+        sample_solver=cfg.stage_a_sample_solver,
         lang=cfg.stage_a_lang,
+        offload_model=cfg.stage_a_offload_model,
+        convert_model_dtype=cfg.stage_a_convert_model_dtype,
+        t5_cpu=cfg.stage_a_t5_cpu,
+        device_id=cfg.stage_a_device_id,
     )
     cfg.stage_a_resolution_hw = tuple(int(v) for v in stage_a_result.resolution_hw)
     s_0_clean = stage_a_result.wan_video_target_3FHW[:, 0].float() / 255.0
-    return stage_a_result.wan_video_target_3FHW, s_0_clean
+    state_images = _sample_state_images_from_video(
+        stage_a_result.wan_video_target_3FHW,
+        cfg.state_indices,
+    )
+    return BootstrapInputBundle(
+        wan_video_target_3FHW=stage_a_result.wan_video_target_3FHW,
+        s_0_clean=s_0_clean,
+        state_images=state_images,
+        source_meta={
+            "mode": "run_stage_a",
+            "constructed_video": False,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +507,7 @@ def _run_b1_stage_a(
 def _run_b3_b4_stage_b(
     pipe: Any,
     wan_video_target_3FHW: torch.Tensor,
+    state_images: Optional[Sequence[Image.Image]],
     cfg: BootstrapConfig,
     out_dir: str,
 ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray], Optional[Dict[int, torch.Tensor]]]:
@@ -326,8 +530,13 @@ def _run_b3_b4_stage_b(
     K_frames_uint8 = torch.stack(
         [wan_video_target_3FHW[:, idx] for idx in cfg.state_indices], dim=0
     )  # (K, 3, H, W) uint8
-    # Convert to float [0,1] for DINOv2 preprocess
-    K_frames_float = K_frames_uint8.float() / 255.0
+    if state_images is None:
+        state_images = _sample_state_images_from_video(
+            wan_video_target_3FHW,
+            cfg.state_indices,
+        )
+    if len(state_images) != K:
+        raise ValueError(f"len(state_images)={len(state_images)} must equal K={K}")
 
     # DINOv2 preprocess: pipe should expose preprocess_image method or similar
     # Each pipeline implementation may differ; assume the canonical TRELLIS
@@ -338,14 +547,7 @@ def _run_b3_b4_stage_b(
             "convention used in pipelines/recon.py and pipelines/stage_b_scar.py"
         )
 
-    # preprocess_image typically accepts a list of PIL or per-image tensor.
-    # We pass tensors; downstream may convert internally.
-    cond_list = []
-    for k in range(K):
-        # Spec: preprocess + encode_image yields (1, N_tok, D); we batch K-state
-        # tensors below.
-        img_k = K_frames_float[k].to(cfg.device)
-        cond_list.append(img_k)
+    cond_list = [pipe.preprocess_image(img) for img in state_images]
     # Encode K parallel; pipe.get_cond should handle list/batch
     if not hasattr(pipe, "get_cond"):
         raise AttributeError(
@@ -1168,18 +1370,21 @@ def run_bootstrap(
 
     # ---- B1: Stage A -----------------------------------------------------
     print("[bootstrap] B1 Stage A Wan I2V")
-    wan_video_target_3FHW, s_0_clean = _run_b1_stage_a(
+    input_bundle = _run_b1_stage_a(
         s_0_with_carpet=s_0_with_carpet,
         user_motion_prompt=user_motion_prompt,
         cfg=cfg,
         out_dir=out_dir,
     )
+    wan_video_target_3FHW = input_bundle.wan_video_target_3FHW
+    s_0_clean = input_bundle.s_0_clean
 
     # ---- B3 + B4: Stage B Pass-1 + Pass-2 --------------------------------
     print("[bootstrap] B3-B4 Stage B (SCAR + BMCSA)")
     scar_payload, stage_b_artifacts, dit_hidden_cache = _run_b3_b4_stage_b(
         pipe=pipe,
         wan_video_target_3FHW=wan_video_target_3FHW,
+        state_images=input_bundle.state_images,
         cfg=cfg,
         out_dir=out_dir,
     )
@@ -1359,6 +1564,7 @@ def run_bootstrap(
             "stage_a_wan_size": cfg.stage_a_wan_size,
             "stage_a_resolution_hw": list(cfg.stage_a_resolution_hw),
             "stage_a_skipped": cfg.skip_b1_stage_a,
+            "bootstrap_input": input_bundle.source_meta,
             "slat_skipped": cfg.skip_b8_slat,
             "wan_cond_skipped": cfg.skip_b10_wan_cond,
             "wan_vae_skipped": cfg.skip_b11_wan_vae,

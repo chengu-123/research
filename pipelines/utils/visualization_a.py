@@ -1,13 +1,11 @@
 """Stage A (Wan2.2 video generation) debug visualisations.
 
-Five artifacts are produced for every Stage A run:
+Four debug artifacts are produced for every Stage A run:
   - ``wan_video_target.mp4``       full 16-fps video
   - ``wan_video_grid.png``         all F frames laid out as a grid
   - ``keyframes_6.png``            state_indices = [0, 4, 8, 12, 16, 20] frames
                                    (matches Stage B 6-state sampling)
-  - ``optical_flow_per_frame.png`` per-transition mean optical-flow magnitude
-                                   with the sanity threshold line
-  - ``meta.json``                  prompts, seed, resolution, sanity result
+  - ``meta.json``                  prompts, seed, resolution, Wan settings
 
 All inputs are expected as the Stage A canonical
 ``video_3fhw_float01: np.ndarray [3, F, H, W]`` in [0, 1].
@@ -22,9 +20,6 @@ from typing import Iterable, List, Optional
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 import numpy as np
-
-from .optical_flow import OpticalFlowReport
-
 
 def _video_uint8_fhwc(video_3fhw_float01: np.ndarray) -> np.ndarray:
     """[3, F, H, W] float [0, 1] -> [F, H, W, 3] uint8."""
@@ -101,38 +96,6 @@ def save_keyframes(
     plt.close(fig)
 
 
-def save_optical_flow_curve(
-    report: OpticalFlowReport,
-    out_path: str,
-) -> None:
-    """Plot per-frame-transition mean flow magnitude vs the sanity threshold."""
-    disp = report.per_transition_displacement
-    n = len(disp)
-    xs = np.arange(n)
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    ax.plot(xs, disp, marker="o", linewidth=1.2, label="mean flow (px)")
-    ax.axhline(
-        report.threshold_pixels,
-        color="r", linestyle="--", linewidth=1.0,
-        label=f"threshold = {report.threshold_ratio:g}*diag = {report.threshold_pixels:.2f} px",
-    )
-    over_mask = np.array(disp) > report.threshold_pixels
-    if over_mask.any():
-        ax.scatter(xs[over_mask], np.array(disp)[over_mask], c="r", s=40, zorder=3, label="exceed")
-    title = (
-        f"optical flow per transition (passed={report.passed}, "
-        f"moved={report.moved_fraction:.3f} <= max={report.max_moved_fraction:.3f})"
-    )
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("transition index i (f_i -> f_{i+1})")
-    ax.set_ylabel("mean flow magnitude (pixels)")
-    ax.legend(loc="upper right", fontsize=9)
-    ax.grid(alpha=0.3)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
 def save_meta_json(
     out_path: str,
     pos_prompt: str,
@@ -147,7 +110,6 @@ def save_meta_json(
     sample_shift: float,
     sample_solver: str,
     wan_ckpt_dir: str,
-    report: OpticalFlowReport,
     extra: Optional[dict] = None,
 ) -> None:
     payload = {
@@ -163,15 +125,6 @@ def save_meta_json(
         "sample_shift": float(sample_shift),
         "sample_solver": str(sample_solver),
         "wan_ckpt_dir": str(wan_ckpt_dir),
-        "sanity_check": {
-            "passed": bool(report.passed),
-            "moved_fraction": float(report.moved_fraction),
-            "max_moved_fraction": float(report.max_moved_fraction),
-            "threshold_ratio": float(report.threshold_ratio),
-            "threshold_pixels": float(report.threshold_pixels),
-            "bbox_diagonal": float(report.bbox_diagonal),
-            "per_transition_displacement": [float(d) for d in report.per_transition_displacement],
-        },
     }
     if extra is not None:
         payload["extra"] = extra
@@ -183,7 +136,6 @@ def save_meta_json(
 def save_all_stage_a_visualisations(
     video_3fhw_float01: np.ndarray,
     out_dir: str,
-    report: OpticalFlowReport,
     pos_prompt: str,
     neg_prompt: str,
     user_motion_prompt: str,
@@ -200,7 +152,7 @@ def save_all_stage_a_visualisations(
     state_indices: Iterable[int] = (0, 4, 8, 12, 16, 20),
     extra: Optional[dict] = None,
 ) -> List[str]:
-    """Write all five Stage A debug artifacts under ``out_dir``."""
+    """Write the Stage A debug artifacts under ``out_dir``."""
     os.makedirs(out_dir, exist_ok=True)
     paths: List[str] = []
 
@@ -215,10 +167,6 @@ def save_all_stage_a_visualisations(
     p_kf = os.path.join(out_dir, "keyframes_6.png")
     save_keyframes(video_3fhw_float01, p_kf, state_indices=state_indices)
     paths.append(p_kf)
-
-    p_flow = os.path.join(out_dir, "optical_flow_per_frame.png")
-    save_optical_flow_curve(report, p_flow)
-    paths.append(p_flow)
 
     p_meta = os.path.join(out_dir, "meta.json")
     save_meta_json(
@@ -235,7 +183,6 @@ def save_all_stage_a_visualisations(
         sample_shift=sample_shift,
         sample_solver=sample_solver,
         wan_ckpt_dir=wan_ckpt_dir,
-        report=report,
         extra=extra,
     )
     paths.append(p_meta)

@@ -38,6 +38,7 @@ from pipelines.bootstrap import (
     _save_bootstrap_artifacts,
     _se3_prismatic,
     _se3_revolute,
+    _state_images_to_video_tensor,
     _union_voxel_sets,
     _voxel_to_world,
     _world_to_voxel,
@@ -78,10 +79,60 @@ def test_b1_accepts_dynamic_stage_a_resolution():
         pt_path = os.path.join(stage_a_dir, "wan_video_target_3FHW_uint8.pt")
         torch.save(torch.zeros((3, 21, 624, 624), dtype=torch.uint8), pt_path)
 
-        wan_video, s_0 = _run_b1_stage_a(None, "dummy motion", cfg, tmp)
-        assert tuple(wan_video.shape) == (3, 21, 624, 624)
-        assert tuple(s_0.shape) == (3, 624, 624)
+        bundle = _run_b1_stage_a(None, "dummy motion", cfg, tmp)
+        assert tuple(bundle.wan_video_target_3FHW.shape) == (3, 21, 624, 624)
+        assert tuple(bundle.s_0_clean.shape) == (3, 624, 624)
         assert cfg.stage_a_resolution_hw == (624, 624)
+        assert bundle.source_meta["mode"] == "stagea_video"
+
+
+def test_b1_accepts_six_image_input_dir():
+    from PIL import Image
+
+    cfg = BootstrapConfig(skip_b1_stage_a=True)
+    cfg.bootstrap_input_mode = "six_images"
+    cfg.stage_image_pattern = "state_{i:02d}.png"
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg.stage_image_dir = tmp
+        for i in range(6):
+            arr = np.zeros((64, 64, 4), dtype=np.uint8)
+            arr[:, :, 0] = i * 30
+            arr[:, :, 3] = 255
+            Image.fromarray(arr, mode="RGBA").save(
+                os.path.join(tmp, f"state_{i:02d}.png")
+            )
+
+        bundle = _run_b1_stage_a(None, "dummy motion", cfg, tmp)
+        video = bundle.wan_video_target_3FHW
+        assert tuple(video.shape) == (3, 21, 64, 64)
+        assert int(video[0, 0, 0, 0]) == 0
+        assert int(video[0, 4, 0, 0]) == 30
+        assert int(video[0, 20, 0, 0]) == 150
+        assert tuple(bundle.s_0_clean.shape) == (3, 64, 64)
+        assert cfg.stage_a_resolution_hw == (64, 64)
+        assert bundle.source_meta["mode"] == "six_images"
+        assert bundle.source_meta["constructed_video"] is True
+
+
+def test_state_images_to_video_tensor_holds_previous_keyframe():
+    from PIL import Image
+
+    images = []
+    for i in range(6):
+        arr = np.zeros((64, 64, 4), dtype=np.uint8)
+        arr[:, :, 1] = i * 20
+        arr[:, :, 3] = 255
+        images.append(Image.fromarray(arr, mode="RGBA"))
+    video = _state_images_to_video_tensor(
+        images,
+        state_indices=(0, 4, 8, 12, 16, 20),
+        frame_num=21,
+    )
+    assert tuple(video.shape) == (3, 21, 64, 64)
+    assert int(video[1, 3, 0, 0]) == 0
+    assert int(video[1, 4, 0, 0]) == 20
+    assert int(video[1, 19, 0, 0]) == 80
+    assert int(video[1, 20, 0, 0]) == 100
 
 
 def test_voxel_world_roundtrip():

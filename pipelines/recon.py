@@ -59,6 +59,6 @@ def build_trellis_pipeline(
     """
     pipe = TrellisImageTo3DPipeline.from_pretrained(pretrained)
     _load_sparse_structure_encoder(pipe, pretrained)
-    if device == 'cuda' and torch.cuda.is_available():
-        pipe.cuda()
+    if device.startswith('cuda') and torch.cuda.is_available():
+        pipe.to(torch.device(device))
     return pipe

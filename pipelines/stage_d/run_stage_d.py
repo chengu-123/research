@@ -284,7 +284,7 @@ def load_trellis_modules(pretrained: str = "JeffreyXiang/TRELLIS-image-large",
     sys.path.append("TRELLIS")
     from pipelines.recon import build_trellis_pipeline
 
-    pipe = build_trellis_pipeline(device=str(device.type), pretrained=pretrained)
+    pipe = build_trellis_pipeline(device=str(device), pretrained=pretrained)
 
     ss_dit = pipe.models["sparse_structure_flow_model"]
     ss_vae_decoder = pipe.models["sparse_structure_decoder"]

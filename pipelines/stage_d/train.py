@@ -477,7 +477,7 @@ def train_stage_d_p1(
     # ============================================================ #
     # Iter-0 camera sanity check (fail-loud on camera mismatch).    #
     # Render frame 0 of the current 3D (no learnable updates yet)   #
-    # and compare its silhouette to s_0_with_carpet. Mismatch -> a  #
+    # and compare its silhouette to Wan-canonical s_0. Mismatch ->  #
     # clear CameraMismatchError pointing at StageDCameraConfig.     #
     # ============================================================ #
     with torch.no_grad():
@@ -498,6 +498,10 @@ def train_stage_d_p1(
         del rgb_T3HW_init
 
     for it in range(cfg.total_iters):
+        consumed_until_marker = summary.get("_dual_clone_consumed_until")
+        if consumed_until_marker is not None and it < int(consumed_until_marker):
+            continue
+
         f_global = it / max(1, cfg.total_iters - 1)
         phase = phase_of(f_global, cfg)
 
@@ -762,19 +766,11 @@ def train_stage_d_p1(
                 # (Python for-loop var assignment doesn't affect iteration;
                 # instead we'll let _run_dual_clone_to_completion have done
                 # iters [start_iter, end_iter), and the outer loop continues
-                # from start_iter onwards but will skip-over them as no-ops.)
-                # Simplest: use `if dual_clone_consumed_range: continue`.
-                # We implement that flag here:
+                # from start_iter onwards but will skip them at the top of
+                # the loop, before any forward/backward is run.)
                 consumed_until = int(round(cfg.f_main_g1b_end * cfg.total_iters))
-                if it < consumed_until:
-                    # Mark a flag; outer loop checks below.
-                    summary["_dual_clone_consumed_until"] = consumed_until
-
-        # ---- Skip iters consumed by dual-clone ----
-        consumed_until_marker = summary.get("_dual_clone_consumed_until")
-        if consumed_until_marker is not None and it < consumed_until_marker:
-            # Force-advance: nothing to do here this iter; continue.
-            continue
+                summary["_dual_clone_consumed_until"] = consumed_until
+                continue
 
         # ---- Periodic checkpoint ----
         if it > 0 and it % cfg.save_checkpoint_every == 0:
@@ -938,8 +934,11 @@ def _run_dual_clone_to_completion(
             )
         opt_cur.step()
 
-        # Remember final L_sds + L_rgb for each clone's last iter.
-        score_value = float(log["L_sds"]) + float(log["L_rgb"])
+        # Remember final L_sds + lambda_rgb * L_rgb for each clone's last iter.
+        # In the default G1b schedule lambda_rgb is zero, so this compares the
+        # Wan score that actually selects the branch instead of an unweighted
+        # auxiliary pixel term.
+        score_value = float(log["L_sds"]) + float(sched_lambdas[2]) * float(log["L_rgb"])
         if committed_type == "revolute":
             dual_clone.final_loss_rev = score_value
         else:

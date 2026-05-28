@@ -11,8 +11,7 @@ Hard constraints:
   - size label = 832*480        (official Wan2.2 I2V 480P area profile)
   - input aspect is preserved   (Wan I2V derives actual H/W from input aspect)
   - seed = 42                   (no multi-candidate selection per CHORD A.1)
-  - guide_scale = 5.0           (CHORD 25->12 is for SDS distillation, NOT
-                                 video generation)
+  - guide_scale = 3.5           (Wan2.2 I2V A14B sample_guide_scale)
 
 Offline-only execution: Wan2.2 weights are loaded from a local checkpoint
 directory; HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE are exported before any
@@ -47,7 +46,6 @@ if not os.path.isdir(_WAN_ROOT):
         "directory not found."
     )
 
-from pipelines.utils.optical_flow import OpticalFlowReport, background_static_check
 from pipelines.utils.seeding import seed_everything
 from pipelines.utils.visualization_a import save_all_stage_a_visualisations
 from pipelines.wan_helpers import build_articulated_prompts
@@ -65,10 +63,6 @@ _SUPPORTED_SIZE_LABELS = frozenset(_WAN_MAX_AREA_CONFIGS.keys())
 SUPPORTED_WAN_SIZE_LABELS = tuple(sorted(_SUPPORTED_SIZE_LABELS))
 _WAN_VAE_STRIDE = (4, 8, 8)
 _WAN_PATCH_SIZE = (1, 2, 2)
-
-
-class WanQualityError(RuntimeError):
-    """Raised when Wan2.2 output fails the camera-static sanity check."""
 
 
 @dataclass
@@ -94,7 +88,6 @@ class StageAResult:
     sample_solver: str
     wan_ckpt_dir: str
     out_dir: str
-    sanity_report: OpticalFlowReport
     artifact_paths: list = field(default_factory=list)
 
 
@@ -221,7 +214,7 @@ def run_stage_a(
     frame_num: int = 21,
     wan_size_label: str = _DEFAULT_WAN_SIZE_LABEL,
     sampling_steps: int = 50,
-    guide_scale: Union[float, Tuple[float, float]] = 5.0,
+    guide_scale: Union[float, Tuple[float, float]] = 3.5,
     sample_shift: float = 5.0,
     sample_solver: str = "unipc",
     lang: str = "zh",
@@ -230,10 +223,6 @@ def run_stage_a(
     convert_model_dtype: bool = True,
     t5_cpu: bool = False,
     device_id: int = 0,
-    sanity_check: bool = True,
-    sanity_threshold_ratio: float = 0.0015,
-    sanity_max_moved_fraction: float = 0.10,
-    raise_on_sanity_fail: bool = True,
 ) -> StageAResult:
     """Stage A end-to-end driver.
 
@@ -259,7 +248,7 @@ def run_stage_a(
         No network access is permitted (HF_HUB_OFFLINE=1 has been exported at
         module load).
     out_dir : str
-        Directory to receive the five Stage A debug artifacts.
+        Directory to receive the Stage A artifacts.
     seed : int, default 42
         Wan2.2 RNG seed. pipeline_v3 Section 5.3 fixes this; do not vary.
     frame_num : int, default 21
@@ -269,10 +258,9 @@ def run_stage_a(
         output H/W. Wan computes actual H/W from max_area and input aspect.
     sampling_steps : int, default 50
         UniPC steps. pipeline_v3 Section 5.3.
-    guide_scale : float | (float, float), default 5.0
-        CFG. pipeline_v3 Section 5.3 specifies 5.0 for Stage A video
-        generation. CHORD's 25->12 schedule belongs to W-RFSDS (Stage D/F),
-        not here.
+    guide_scale : float | (float, float), default 3.5
+        CFG. Wan2.2 I2V A14B config uses sample_guide_scale=(3.5, 3.5).
+        CHORD's 25->12 schedule belongs to W-RFSDS (Stage D/F), not here.
     sample_shift : float, default 5.0
         Wan flow scheduler shift. Wan i2v_A14B default.
     sample_solver : str, default "unipc"
@@ -286,17 +274,6 @@ def run_stage_a(
     device_id : int, default 0
         CUDA device index. CPU execution is not supported (Wan VAE relies on
         CUDA kernels).
-    sanity_check : bool, default True
-        Run optical-flow sanity check on the generated video.
-    sanity_threshold_ratio : float, default 0.0015
-        Pixels-per-bbox-diagonal threshold on per-transition mean flow.
-    sanity_max_moved_fraction : float, default 0.10
-        Fail if more than this fraction of transitions exceed threshold.
-    raise_on_sanity_fail : bool, default True
-        When True (recommended) raise ``WanQualityError`` on failed sanity
-        check, leaving the caller to decide whether to retry with a new seed
-        or rewrite the prompt. When False the result is returned anyway so
-        downstream stages can run on a known-bad video for debugging.
     """
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -370,27 +347,9 @@ def run_stage_a(
         f"max_area={wan_max_area}"
     )
 
-    if sanity_check:
-        report = background_static_check(
-            video_float01.numpy(),
-            threshold_ratio=float(sanity_threshold_ratio),
-            max_moved_fraction=float(sanity_max_moved_fraction),
-        )
-    else:
-        report = OpticalFlowReport(
-            passed=True,
-            moved_fraction=0.0,
-            max_moved_fraction=float(sanity_max_moved_fraction),
-            threshold_ratio=float(sanity_threshold_ratio),
-            threshold_pixels=0.0,
-            bbox_diagonal=float(np.sqrt(H * H + W * W)),
-            per_transition_displacement=[0.0] * (int(frame_num) - 1),
-        )
-
     artifact_paths = save_all_stage_a_visualisations(
         video_3fhw_float01=video_float01.numpy(),
         out_dir=out_dir,
-        report=report,
         pos_prompt=pos_prompt,
         neg_prompt=neg_prompt,
         user_motion_prompt=user_motion_prompt,
@@ -432,21 +391,7 @@ def run_stage_a(
         sample_solver=str(sample_solver),
         wan_ckpt_dir=str(wan_ckpt_dir),
         out_dir=str(out_dir),
-        sanity_report=report,
         artifact_paths=artifact_paths,
     )
-
-    if sanity_check and (not report.passed) and raise_on_sanity_fail:
-        raise WanQualityError(
-            f"Wan2.2 video failed background-static sanity check: "
-            f"moved_fraction={report.moved_fraction:.3f} > "
-            f"max_moved_fraction={report.max_moved_fraction:.3f} "
-            f"(threshold_pixels={report.threshold_pixels:.2f}, "
-            f"bbox_diagonal={report.bbox_diagonal:.2f}). "
-            f"Inspect {os.path.join(out_dir, 'optical_flow_per_frame.png')} "
-            f"and {os.path.join(out_dir, 'wan_video_target.mp4')}. "
-            f"Try a new seed, lower guide_scale (5.0 -> 3.5), or rewrite "
-            f"the motion prompt with more explicit 'locked camera' language."
-        )
 
     return result

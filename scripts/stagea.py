@@ -5,16 +5,14 @@ The user supplies one RGB(A) image of the object in its closed state (with
 the FreeArt3D grounding disk / carpet already baked in) and a short text
 description of the moving part's motion (e.g. "the drawer slowly slides
 outward"). This script appends the universal locked-camera addon, runs
-Wan2.2-I2V-A14B once (single fixed seed), runs the background-static
-optical-flow sanity check, and writes the Stage A artifact bundle:
+Wan2.2-I2V-A14B once (single fixed seed) and writes the Stage A artifact bundle:
 
     <output_dir>/
         input_s_0_with_carpet.png          RGB input fed to Wan
         wan_video_target.mp4              the generated 16 fps video
         wan_video_grid.png                all 21 frames as a labelled grid
         keyframes_6.png                   states [0,4,8,12,16,20] for Stage B
-        optical_flow_per_frame.png        per-transition mean flow + threshold
-        meta.json                         prompts, seed, sanity report
+        meta.json                         prompts, seed, resolution, Wan settings
         wan_video_target_3FHW_uint8.pt    [3, 21, H, W] uint8 (Stage B input)
 
 Usage:
@@ -97,9 +95,9 @@ def parse_args() -> argparse.Namespace:
                         "Default 832*480 is the 480P profile.")
     p.add_argument("--sampling_steps", type=int, default=50,
                    help="Wan ODE sampling steps. Default 50.")
-    p.add_argument("--guide_scale", type=float, default=5.0,
-                   help="Wan CFG scale for video generation. Default 5.0 (Wan "
-                        "convention). NB: CHORD 25->12 is for W-RFSDS distillation "
+    p.add_argument("--guide_scale", type=float, default=3.5,
+                   help="Wan CFG scale for video generation. Default 3.5 (Wan "
+                        "I2V A14B config). NB: CHORD 25->12 is for W-RFSDS distillation "
                         "in Stage D/F, NOT for video generation here.")
     p.add_argument("--sample_shift", type=float, default=5.0,
                    help="Wan flow scheduler shift. Default 5.0 (Wan i2v_A14B default).")
@@ -120,23 +118,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t5_cpu", action="store_true",
                    help="Run T5 text encoder on CPU. Saves ~10 GB VRAM at "
                         "the cost of ~5 s extra per prompt encode.")
-
-    # ---- sanity check ----
-    p.add_argument("--no_sanity_check", action="store_true",
-                   help="Skip background-static optical-flow sanity check. "
-                        "Not recommended for production runs.")
-    p.add_argument("--sanity_threshold_ratio", type=float, default=0.0015,
-                   help="Per-transition mean flow / bbox_diagonal threshold for "
-                        "calling a frame 'moved'. Default 0.0015 (ViPS arxiv "
-                        "2604.17623 Section 0.F.3).")
-    p.add_argument("--sanity_max_moved_fraction", type=float, default=0.10,
-                   help="Pass criterion: at most this fraction of inter-frame "
-                        "transitions exceed the threshold. Default 0.10 "
-                        "(ViPS reports 0.71%% reject rate at these defaults).")
-    p.add_argument("--no_raise_on_sanity_fail", action="store_true",
-                   help="On sanity fail, write artifacts and return normally "
-                        "instead of raising WanQualityError. Useful for debugging "
-                        "a known-bad video against Stage B.")
 
     # ---- prompt preview (no Wan load) ----
     p.add_argument("--dry_run", action="store_true",
@@ -213,10 +194,6 @@ def main() -> None:
         convert_model_dtype=not bool(args.no_convert_model_dtype),
         t5_cpu=bool(args.t5_cpu),
         device_id=int(args.device_id),
-        sanity_check=not bool(args.no_sanity_check),
-        sanity_threshold_ratio=float(args.sanity_threshold_ratio),
-        sanity_max_moved_fraction=float(args.sanity_max_moved_fraction),
-        raise_on_sanity_fail=not bool(args.no_raise_on_sanity_fail),
     )
 
     print("=" * 78)
@@ -230,12 +207,6 @@ def main() -> None:
     print(f"  guide_scale          = {result.guide_scale}")
     print(f"  sample_shift         = {result.sample_shift}")
     print(f"  sample_solver        = {result.sample_solver}")
-    rep = result.sanity_report
-    print(f"  sanity_passed        = {rep.passed}")
-    print(f"  sanity_moved_frac    = {rep.moved_fraction:.4f}  "
-          f"(max allowed = {rep.max_moved_fraction:.4f})")
-    print(f"  sanity_threshold_px  = {rep.threshold_pixels:.2f}  "
-          f"(bbox_diagonal = {rep.bbox_diagonal:.2f})")
     print("-" * 78)
     print("Artifacts:")
     for p in result.artifact_paths:
