@@ -40,6 +40,7 @@ OUTPUT LAYOUT:
         wan_video_target_3FHW.pt
         s_0_clean.pt
         s_0_pure.pt
+        s_5_pure.pt                       # optional, required by InP L_last
         bootstrap_meta.json
 """
 
@@ -92,7 +93,6 @@ class BootstrapConfig:
     stage_a_sample_solver: str = "unipc"
     stage_a_offload_model: bool = False
     stage_a_convert_model_dtype: bool = True
-    stage_a_t5_cpu: bool = False
     stage_a_device_id: int = 0
     bootstrap_input_mode: str = "stagea_video"
     stage_a_video_path: Optional[str] = None
@@ -100,6 +100,8 @@ class BootstrapConfig:
     stage_image_pattern: str = "rendering_joint_00_state_{i:02d}.png"
     stage_image_paths: Tuple[str, ...] = ()
     s_0_pure_path: Optional[str] = None
+    s_5_pure_path: Optional[str] = None
+    wan_condition_backend: str = "i2v"
 
     # ---- B2 (K=6 frame sampling) -----------------------------------------
     state_indices: Tuple[int, ...] = (0, 4, 8, 12, 16, 20)
@@ -209,6 +211,7 @@ class BootstrapResult:
     wan_video_target_3FHW: torch.Tensor               # (3, F, H, W) uint8
     s_0_clean: torch.Tensor                           # (3, H, W) float [0,1]
     s_0_pure: torch.Tensor                            # (3, H, W) float [0,1], no carpet
+    s_5_pure: Optional[torch.Tensor]                  # (3, H, W) float [0,1], no carpet
 
     # Stage B v3.3.6 secondary outputs (passed through)
     O_base_canonical: torch.Tensor                    # (64, 64, 64) uint8
@@ -517,7 +520,6 @@ def _run_b1_stage_a(
         lang=cfg.stage_a_lang,
         offload_model=cfg.stage_a_offload_model,
         convert_model_dtype=cfg.stage_a_convert_model_dtype,
-        t5_cpu=cfg.stage_a_t5_cpu,
         device_id=cfg.stage_a_device_id,
     )
     cfg.stage_a_resolution_hw = tuple(int(v) for v in stage_a_result.resolution_hw)
@@ -1104,6 +1106,7 @@ def _run_b8_slat_sampler(
 
 def _run_b10_wan_cond(
     s_0_pure: torch.Tensor,
+    s_5_pure: Optional[torch.Tensor],
     user_motion_prompt: str,
     cfg: BootstrapConfig,
     wan_t5: Any = None,
@@ -1124,6 +1127,47 @@ def _run_b10_wan_cond(
     """
     if cfg.skip_b10_wan_cond:
         return None
+    backend = str(cfg.wan_condition_backend)
+    if backend not in ("i2v", "fun_inp"):
+        raise ValueError(
+            f"wan_condition_backend must be 'i2v' or 'fun_inp'; got {backend!r}"
+        )
+    if backend == "fun_inp":
+        from pipelines.wan_helpers.prompts import build_articulated_prompts
+
+        if s_5_pure is None:
+            raise ValueError("wan_condition_backend='fun_inp' requires s_5_pure")
+        if cfg.stage_a_resolution_hw is None:
+            raise ValueError(
+                "cfg.stage_a_resolution_hw is unknown. Run B1 Stage A or load a "
+                "Stage A artifact before building Wan Fun-InP conditioning."
+            )
+        H, W = int(cfg.stage_a_resolution_hw[0]), int(cfg.stage_a_resolution_hw[1])
+        F_count = int(cfg.stage_a_frame_num)
+        s0 = s_0_pure.to(device=torch.device(cfg.device), dtype=torch.float32)
+        s5 = s_5_pure.to(device=torch.device(cfg.device), dtype=torch.float32)
+        if s0.shape != (3, H, W):
+            raise ValueError(f"s_0_pure shape mismatch for Fun-InP: {tuple(s0.shape)}")
+        if s5.shape != (3, H, W):
+            raise ValueError(f"s_5_pure shape mismatch for Fun-InP: {tuple(s5.shape)}")
+        fun_video = torch.zeros((1, 3, F_count, H, W), device=s0.device, dtype=torch.float32)
+        fun_video[:, :, 0] = s0
+        fun_video[:, :, -1] = s5
+        fun_mask = torch.full((1, 1, F_count, H, W), 255.0, device=s0.device, dtype=torch.float32)
+        fun_mask[:, :, 0] = 0.0
+        fun_mask[:, :, -1] = 0.0
+        pos_prompt, neg_prompt = build_articulated_prompts(user_motion_prompt, lang=cfg.stage_a_lang)
+        return {
+            "backend": "fun_inp",
+            "fun_video": fun_video,
+            "fun_mask": fun_mask,
+            "pos_prompt": pos_prompt,
+            "neg_prompt": neg_prompt,
+            "frame_num": int(F_count),
+            "resolution_hw": (int(H), int(W)),
+            "vae_stride": (4, 8, 8),
+            "mask_semantics": "known_frames_zero_unknown_255",
+        }
     if wan_t5 is None or wan_vae is None:
         raise AttributeError(
             "B10 requires wan_t5 (umt5-xxl encoder) and wan_vae (Wan2.1 VAE). "
@@ -1193,6 +1237,7 @@ def _run_b10_wan_cond(
     max_seq_len = (F_lat * lat_h * lat_w) // (patch_size[1] * patch_size[2])
 
     return {
+        "backend": "i2v",
         "context": context,                # List[Tensor [L_text, 4096]]
         "context_null": context_null,
         "seq_len": int(max_seq_len),
@@ -1323,6 +1368,7 @@ def _save_bootstrap_artifacts(result: BootstrapResult, out_dir: str, cfg: Bootst
     _save_tensor("wan_video_target_3FHW", result.wan_video_target_3FHW)
     _save_tensor("s_0_clean", result.s_0_clean)
     _save_tensor("s_0_pure", result.s_0_pure)
+    _save_tensor("s_5_pure", result.s_5_pure)
     if result.z_wan_target is not None:
         _save_tensor("z_wan_target", result.z_wan_target)
     if result.wan_cond_cached is not None:
@@ -1428,6 +1474,13 @@ def run_bootstrap(
         cfg.s_0_pure_path,
         target_hw=(int(wan_video_target_3FHW.shape[2]), int(wan_video_target_3FHW.shape[3])),
     )
+    if cfg.s_5_pure_path is not None:
+        s_5_pure = _load_s0_pure_reference(
+            cfg.s_5_pure_path,
+            target_hw=(int(wan_video_target_3FHW.shape[2]), int(wan_video_target_3FHW.shape[3])),
+        )
+    else:
+        s_5_pure = None
 
     # ---- B3 + B4: Stage B Pass-1 + Pass-2 --------------------------------
     print("[bootstrap] B3-B4 Stage B (SCAR + BMCSA)")
@@ -1560,7 +1613,9 @@ def run_bootstrap(
 
     # ---- B10: build_wan_i2v_cond ---------------------------------------
     print("[bootstrap] B10 build_wan_i2v_cond")
-    wan_cond_cached = _run_b10_wan_cond(s_0_pure, user_motion_prompt, cfg, wan_t5, wan_vae)
+    wan_cond_cached = _run_b10_wan_cond(
+        s_0_pure, s_5_pure, user_motion_prompt, cfg, wan_t5, wan_vae
+    )
 
     # ---- B11: Wan VAE encoding -----------------------------------------
     print("[bootstrap] B11 Wan VAE encoding")
@@ -1602,6 +1657,7 @@ def run_bootstrap(
         wan_video_target_3FHW=wan_video_target_3FHW,
         s_0_clean=s_0_clean,
         s_0_pure=s_0_pure,
+        s_5_pure=s_5_pure,
         O_base_canonical=O_base_canonical,
         O_move_per_state=O_move_per_state,
         P_base_canonical=P_base_canonical,
@@ -1617,7 +1673,15 @@ def run_bootstrap(
             "stage_a_skipped": cfg.skip_b1_stage_a,
             "bootstrap_input": input_bundle.source_meta,
             "s_0_pure_path": os.path.abspath(os.fspath(cfg.s_0_pure_path)),
-            "wan_condition_source": "s_0_pure",
+            "s_5_pure_path": (
+                os.path.abspath(os.fspath(cfg.s_5_pure_path))
+                if cfg.s_5_pure_path is not None else None
+            ),
+            "wan_condition_backend": str(cfg.wan_condition_backend),
+            "wan_condition_source": (
+                "s_0_pure+s_5_pure" if str(cfg.wan_condition_backend) == "fun_inp"
+                else "s_0_pure"
+            ),
             "slat_skipped": cfg.skip_b8_slat,
             "wan_cond_skipped": cfg.skip_b10_wan_cond,
             "wan_vae_skipped": cfg.skip_b11_wan_vae,

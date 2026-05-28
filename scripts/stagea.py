@@ -51,6 +51,7 @@ if _MINE_DIR not in sys.path:
 
 from PIL import Image
 
+from pipelines.stage_a_fun_inp import run_stage_a_fun_inp
 from pipelines.stage_a_wan import SUPPORTED_WAN_SIZE_LABELS, run_stage_a
 from pipelines.wan_helpers import build_articulated_prompts
 
@@ -61,17 +62,21 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ---- required ----
+    p.add_argument("--backend", default="i2v", choices=["i2v", "fun_inp"],
+                   help="Stage A backend. i2v uses Wan2.2-I2V-A14B; fun_inp "
+                        "uses Wan2.2-Fun-A14B-InP with start/end images.")
     p.add_argument("--image", required=True,
-                   help="Path to the closed-state input image (RGB or RGBA, "
+                   help="Path to the start-state input image (RGB or RGBA, "
                         "carpet/grounding disk already baked in).")
+    p.add_argument("--image_end", default=None,
+                   help="Path to the end-state image. Required for --backend fun_inp.")
     p.add_argument("--motion", required=True,
                    help="Per-object motion description, e.g. "
                         "\"the drawer slowly slides outward in a continuous motion\". "
                         "The universal camera-lock addon is appended automatically.")
     p.add_argument("--wan_ckpt", required=True, dest="wan_ckpt_dir",
-                   help="Local Wan2.2-I2V-A14B checkpoint directory containing "
-                        "low_noise_model/, high_noise_model/, google/umt5-xxl/, "
-                        "models_t5_umt5-xxl-enc-bf16.pth, Wan2.1_VAE.pth.")
+                   help="Local checkpoint directory. For i2v use Wan2.2-I2V-A14B; "
+                        "for fun_inp use Wan2.2-Fun-A14B-InP.")
     p.add_argument("--output_dir", required=True,
                    help="Destination directory (created if missing). Receives the "
                         "five debug artifacts plus the uint8 tensor consumed by Stage B.")
@@ -95,10 +100,11 @@ def parse_args() -> argparse.Namespace:
                         "Default 832*480 is the 480P profile.")
     p.add_argument("--sampling_steps", type=int, default=50,
                    help="Wan ODE sampling steps. Default 50.")
-    p.add_argument("--guide_scale", type=float, default=3.5,
-                   help="Wan CFG scale for video generation. Default 3.5 (Wan "
-                        "I2V A14B config). NB: CHORD 25->12 is for W-RFSDS distillation "
-                        "in Stage D/F, NOT for video generation here.")
+    p.add_argument("--guide_scale", type=float, default=None,
+                   help="Wan CFG scale for video generation. Defaults are backend "
+                        "specific: 3.5 for i2v, 6.0 for fun_inp. NB: CHORD "
+                        "25->12 is for W-RFSDS distillation in Stage D/F, NOT "
+                        "for video generation here.")
     p.add_argument("--sample_shift", type=float, default=5.0,
                    help="Wan flow scheduler shift. Default 5.0 (Wan i2v_A14B default).")
     p.add_argument("--sample_solver", default="unipc", choices=["unipc", "dpm++"],
@@ -107,17 +113,14 @@ def parse_args() -> argparse.Namespace:
                    help="MP4 writer frame rate. Default 16 (Wan sample_fps default).")
     p.add_argument("--device_id", type=int, default=0,
                    help="CUDA device index. CPU is not supported (Wan VAE requires CUDA).")
+    p.add_argument("--fun_config", default=None,
+                   help="VideoX-Fun config path for --backend fun_inp. Defaults "
+                        "to $VIDEOX_FUN_ROOT/config/wan2.2/wan_civitai_i2v.yaml.")
 
-    # ---- VRAM controls ----
-    p.add_argument("--no_offload_model", action="store_true",
-                   help="Disable per-step CPU offload of inactive sub-models. "
-                        "Lower latency but adds ~24 GB peak VRAM.")
+    # ---- dtype control ----
     p.add_argument("--no_convert_model_dtype", action="store_true",
                    help="Keep DiT/VAE in their original mixed-precision dtype. "
                         "Default converts to bf16, which saves VRAM with no quality loss.")
-    p.add_argument("--t5_cpu", action="store_true",
-                   help="Run T5 text encoder on CPU. Saves ~10 GB VRAM at "
-                        "the cost of ~5 s extra per prompt encode.")
 
     # ---- prompt preview (no Wan load) ----
     p.add_argument("--dry_run", action="store_true",
@@ -134,6 +137,13 @@ def _validate_inputs(args: argparse.Namespace) -> None:
     if not os.path.isfile(image_path):
         raise FileNotFoundError(f"--image not a file: {image_path}")
     args.image = image_path
+    if str(args.backend) == "fun_inp":
+        if args.image_end is None:
+            raise ValueError("--image_end is required when --backend fun_inp")
+        image_end_path = os.path.abspath(args.image_end)
+        if not os.path.isfile(image_end_path):
+            raise FileNotFoundError(f"--image_end not a file: {image_end_path}")
+        args.image_end = image_end_path
 
     if not args.dry_run:
         wan_ckpt_dir = os.path.abspath(args.wan_ckpt_dir)
@@ -175,26 +185,49 @@ def main() -> None:
         return
 
     image = Image.open(args.image)
-
-    result = run_stage_a(
-        image=image,
-        user_motion_prompt=args.motion,
-        wan_ckpt_dir=args.wan_ckpt_dir,
-        out_dir=args.output_dir,
-        seed=int(args.seed),
-        frame_num=int(args.frame_num),
-        wan_size_label=str(args.size),
-        sampling_steps=int(args.sampling_steps),
-        guide_scale=float(args.guide_scale),
-        sample_shift=float(args.sample_shift),
-        sample_solver=str(args.sample_solver),
-        lang=str(args.lang),
-        fps=int(args.fps),
-        offload_model=not bool(args.no_offload_model),
-        convert_model_dtype=not bool(args.no_convert_model_dtype),
-        t5_cpu=bool(args.t5_cpu),
-        device_id=int(args.device_id),
+    guide_scale = (
+        float(args.guide_scale) if args.guide_scale is not None
+        else (6.0 if str(args.backend) == "fun_inp" else 3.5)
     )
+
+    if str(args.backend) == "fun_inp":
+        image_end = Image.open(args.image_end)
+        result = run_stage_a_fun_inp(
+            start_image=image,
+            end_image=image_end,
+            user_motion_prompt=args.motion,
+            model_dir=args.wan_ckpt_dir,
+            out_dir=args.output_dir,
+            fun_config_path=args.fun_config,
+            seed=int(args.seed),
+            frame_num=int(args.frame_num),
+            wan_size_label=str(args.size),
+            sampling_steps=int(args.sampling_steps),
+            guide_scale=guide_scale,
+            sample_shift=float(args.sample_shift),
+            lang=str(args.lang),
+            fps=int(args.fps),
+            device_id=int(args.device_id),
+        )
+    else:
+        result = run_stage_a(
+            image=image,
+            user_motion_prompt=args.motion,
+            wan_ckpt_dir=args.wan_ckpt_dir,
+            out_dir=args.output_dir,
+            seed=int(args.seed),
+            frame_num=int(args.frame_num),
+            wan_size_label=str(args.size),
+            sampling_steps=int(args.sampling_steps),
+            guide_scale=guide_scale,
+            sample_shift=float(args.sample_shift),
+            sample_solver=str(args.sample_solver),
+            lang=str(args.lang),
+            fps=int(args.fps),
+            offload_model=False,
+            convert_model_dtype=not bool(args.no_convert_model_dtype),
+            device_id=int(args.device_id),
+        )
 
     print("=" * 78)
     print(f"[stage_a]  Wrote {len(result.artifact_paths)} artifacts to:")

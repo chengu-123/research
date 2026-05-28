@@ -219,9 +219,8 @@ def run_stage_a(
     sample_solver: str = "unipc",
     lang: str = "zh",
     fps: int = 16,
-    offload_model: bool = True,
+    offload_model: bool = False,
     convert_model_dtype: bool = True,
-    t5_cpu: bool = False,
     device_id: int = 0,
 ) -> StageAResult:
     """Stage A end-to-end driver.
@@ -269,8 +268,9 @@ def run_stage_a(
         Prompt language for the camera-lock addon and negative prompt.
     fps : int, default 16
         MP4 writer frame rate. wan_shared_cfg.sample_fps default.
-    offload_model, convert_model_dtype, t5_cpu : bool
-        VRAM controls forwarded to ``WanI2V``.
+    offload_model, convert_model_dtype : bool
+        VRAM controls forwarded to ``WanI2V``. ``offload_model`` defaults to
+        False so the Wan components stay resident on GPU for H800-class runs.
     device_id : int, default 0
         CUDA device index. CPU execution is not supported (Wan VAE relies on
         CUDA kernels).
@@ -307,6 +307,7 @@ def run_stage_a(
     wan_cfg, WanI2V = _load_wan_i2v_components()
     wan_max_area = int(_WAN_MAX_AREA_CONFIGS[wan_size_label])
     expected_hw = _predict_wan_output_hw(input_hw, wan_max_area)
+    init_on_cpu = bool(offload_model)
 
     wan = WanI2V(
         config=wan_cfg,
@@ -316,8 +317,7 @@ def run_stage_a(
         t5_fsdp=False,
         dit_fsdp=False,
         use_sp=False,
-        t5_cpu=bool(t5_cpu),
-        init_on_cpu=True,
+        init_on_cpu=init_on_cpu,
         convert_model_dtype=bool(convert_model_dtype),
     )
 
@@ -368,6 +368,9 @@ def run_stage_a(
             "wan_max_area": int(wan_max_area),
             "input_hw": [int(input_hw[0]), int(input_hw[1])],
             "aspect_preserved": True,
+            "offload_model": bool(offload_model),
+            "init_on_cpu": init_on_cpu,
+            "convert_model_dtype": bool(convert_model_dtype),
         },
     )
 

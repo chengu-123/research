@@ -6,6 +6,7 @@ method.md section 9.1 enumerates the full loss list:
             + lambda_lat   * L_lat_rec    (auxiliary, off by default; C2)
             + lambda_rgb   * L_rgb_rec    (L1 + LPIPS vs Wan video target)
             + lambda_first * L_first      (frame 0 vs no-carpet s_0_pure)
+            + lambda_last  * L_last       (frame F-1 vs no-carpet s_5_pure)
             + lambda_contact * L_contact  (axis-through-anchor-band prior)
             + lambda_gate  * L_gate       (encourages g, m -> {0, 1})
             + lambda_shell * L_shell      (sparsity on uncertain shell voxels)
@@ -160,6 +161,30 @@ def loss_first_frame_anchor(
     return l1 + lp
 
 
+def loss_last_frame_anchor(
+    rgb_T3HW: torch.Tensor,
+    s_5_pure_3HW: torch.Tensor,
+    lpips_module: LPIPSModule,
+) -> torch.Tensor:
+    """Final rendered frame vs the no-carpet end-state reference."""
+    if rgb_T3HW.ndim != 4 or rgb_T3HW.shape[1] != 3:
+        raise ValueError(
+            f"rgb_T3HW must be [F, 3, H, W]; got {tuple(rgb_T3HW.shape)}"
+        )
+    expected_s5 = (3, int(rgb_T3HW.shape[2]), int(rgb_T3HW.shape[3]))
+    if s_5_pure_3HW.shape != expected_s5:
+        raise ValueError(
+            f"s_5_pure must be {expected_s5}; "
+            f"got {tuple(s_5_pure_3HW.shape)}"
+        )
+    frame_last = rgb_T3HW[-1:].contiguous()
+    target = s_5_pure_3HW.unsqueeze(0).to(frame_last.dtype)
+    target = target.to(frame_last.device)
+    l1 = F.l1_loss(frame_last, target)
+    lp = lpips_module(frame_last, target)
+    return l1 + lp
+
+
 def loss_contact_anchor(
     axis: torch.Tensor,
     origin: torch.Tensor,
@@ -303,6 +328,7 @@ class LossInputs:
     # Static Bootstrap-derived inputs
     wan_video_target_T3HW_01: torch.Tensor  # [F, 3, H, W] in [0, 1]
     s_0_pure_3HW_01: torch.Tensor           # [3, H, W] in [0, 1]
+    s_5_pure_3HW_01: Optional[torch.Tensor] # [3, H, W] in [0, 1]
     z_wan_target: torch.Tensor              # [16, F_lat, H_lat, W_lat]
     anchors_world: torch.Tensor             # [N_a, 3]
     shell_mask: torch.Tensor                # [N_obj] bool
@@ -319,6 +345,7 @@ def aggregate_loss(
     ctx: WanRFSDSContext,
     lpips_module: LPIPSModule,
     cfg_lambdas_first: float,
+    cfg_lambdas_last: float,
     cfg_lambdas_contact: float,
     cfg_lambdas_gate: float,
     cfg_lambdas_z: float,
@@ -392,6 +419,16 @@ def aggregate_loss(
     total = total + cfg_lambdas_first * L_first
     log["L_first"] = float(L_first.detach().item())
 
+    # ---- L_last (frame F-1 vs no-carpet s_5_pure; used by InP only) ----
+    if cfg_lambdas_last > 0.0:
+        if inp.s_5_pure_3HW_01 is None:
+            raise ValueError("cfg_lambdas_last > 0 requires s_5_pure_3HW_01")
+        L_last = loss_last_frame_anchor(rgb_T3HW, inp.s_5_pure_3HW_01, lpips_module)
+        total = total + cfg_lambdas_last * L_last
+        log["L_last"] = float(L_last.detach().item())
+    else:
+        log["L_last"] = 0.0
+
     # ---- L_contact (axis-anchor band) ----
     L_contact = loss_contact_anchor(inp.axis, inp.origin, inp.anchors_world)
     total = total + cfg_lambdas_contact * L_contact
@@ -429,7 +466,8 @@ def aggregate_loss(
 
 __all__ = [
     "LPIPSModule",
-    "loss_rgb_recon", "loss_first_frame_anchor", "loss_contact_anchor",
+    "loss_rgb_recon", "loss_first_frame_anchor", "loss_last_frame_anchor",
+    "loss_contact_anchor",
     "loss_gate_sharpening", "loss_shell_sparsity", "loss_m_prior",
     "loss_delta_z_stability",
     "LossInputs", "aggregate_loss",

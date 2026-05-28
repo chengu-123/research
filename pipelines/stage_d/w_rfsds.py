@@ -32,12 +32,14 @@ Memory:
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .config import (
     WAN_VAE_STRIDE,
@@ -90,6 +92,9 @@ class WanRFSDSContext:
     w_latent: int
     device: torch.device
     dtype: torch.dtype
+    backend: str = "i2v"
+    fun_pipeline: Any = None
+    fun_boundary_normalized: Optional[float] = None
 
 
 def load_wan_for_rfsds(
@@ -142,7 +147,6 @@ def load_wan_for_rfsds(
         t5_fsdp=False,
         dit_fsdp=False,
         use_sp=False,
-        t5_cpu=False,
         convert_model_dtype=convert_model_dtype,
         init_on_cpu=False,
     )
@@ -167,8 +171,6 @@ def load_wan_for_rfsds(
     # Drop T5 text encoder reference (we use cached context tensors).
     if hasattr(i2v, "text_encoder"):
         del i2v.text_encoder
-    if hasattr(i2v, "t5_cpu"):
-        i2v.t5_cpu = True   # ensure no accidental .to(device) on encoder
 
     # ``boundary * num_train_timesteps`` gives the cutoff in [0, 1000) scale
     # (matches wan/image2video.py:341).
@@ -221,6 +223,189 @@ def load_wan_for_rfsds(
         w_latent=int(w_latent),
         device=device,
         dtype=param_dtype,
+    )
+
+
+def _resolve_fun_config_path(fun_config_path: Optional[str]) -> str:
+    if fun_config_path is not None:
+        path = os.path.abspath(os.fspath(fun_config_path))
+    else:
+        videox_root = os.environ.get("VIDEOX_FUN_ROOT")
+        if videox_root is None:
+            videox_root = os.path.abspath(os.path.expanduser("~/VideoX-Fun"))
+        path = os.path.join(videox_root, "config", "wan2.2", "wan_civitai_i2v.yaml")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"VideoX-Fun config not found: {path}. Set fun_inp_config_path or VIDEOX_FUN_ROOT."
+        )
+    return path
+
+
+def _ensure_videox_fun_on_sys_path(fun_config_path: str) -> None:
+    videox_root = os.environ.get("VIDEOX_FUN_ROOT")
+    if videox_root is None:
+        root = os.path.abspath(os.path.join(os.path.dirname(fun_config_path), os.pardir, os.pardir))
+    else:
+        root = os.path.abspath(os.fspath(videox_root))
+    if not os.path.isdir(os.path.join(root, "videox_fun")):
+        raise FileNotFoundError(
+            f"VideoX-Fun source tree not found at {root}. Set VIDEOX_FUN_ROOT."
+        )
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _filter_init_kwargs(cls: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    import inspect
+
+    allowed = set(inspect.signature(cls.__init__).parameters.keys())
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def load_wan_fun_inp_for_rfsds(
+    model_dir: str,
+    repo_root: str,
+    device: torch.device,
+    fun_config_path: Optional[str] = None,
+    device_id: int = 0,
+    sample_shift: float = 5.0,
+    frame_num: int = 21,
+    resolution_hw: Tuple[int, int] = (464, 832),
+    weight_dtype: torch.dtype = torch.bfloat16,
+) -> WanRFSDSContext:
+    """Load VideoX-Fun Wan2.2-Fun-A14B-InP for W-RFSDS.
+
+    The returned context uses the same public ``w_rfsds_loss`` entry point as
+    I2V, but the loss dispatches to the Fun-InP transformer API and its
+    first/last-frame ``video``/``mask_video`` condition.
+    """
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    _ = repo_root
+    _ = device_id
+
+    model_dir = os.path.abspath(os.fspath(model_dir))
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Fun-InP model_dir not found: {model_dir}")
+    config_path = _resolve_fun_config_path(fun_config_path)
+    _ensure_videox_fun_on_sys_path(config_path)
+
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from omegaconf import OmegaConf
+    from videox_fun.models import (
+        AutoencoderKLWan,
+        AutoencoderKLWan3_8,
+        AutoTokenizer,
+        Wan2_2Transformer3DModel,
+        WanT5EncoderModel,
+    )
+    from videox_fun.pipeline import Wan2_2FunInpaintPipeline
+    from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+    from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+    config = OmegaConf.load(config_path)
+    transformer_kwargs = OmegaConf.to_container(config["transformer_additional_kwargs"])
+
+    low_subpath = transformer_kwargs.get("transformer_low_noise_model_subpath", "transformer")
+    high_subpath = transformer_kwargs.get("transformer_high_noise_model_subpath", "transformer")
+    transformer = Wan2_2Transformer3DModel.from_pretrained(
+        os.path.join(model_dir, low_subpath),
+        transformer_additional_kwargs=transformer_kwargs,
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    )
+    if transformer_kwargs.get("transformer_combination_type", "single") == "moe":
+        transformer_2 = Wan2_2Transformer3DModel.from_pretrained(
+            os.path.join(model_dir, high_subpath),
+            transformer_additional_kwargs=transformer_kwargs,
+            low_cpu_mem_usage=True,
+            torch_dtype=weight_dtype,
+        )
+    else:
+        transformer_2 = None
+
+    vae_kwargs = OmegaConf.to_container(config["vae_kwargs"])
+    vae_cls = {
+        "AutoencoderKLWan": AutoencoderKLWan,
+        "AutoencoderKLWan3_8": AutoencoderKLWan3_8,
+    }[vae_kwargs.get("vae_type", "AutoencoderKLWan")]
+    vae = vae_cls.from_pretrained(
+        os.path.join(model_dir, vae_kwargs.get("vae_subpath", "vae")),
+        additional_kwargs=vae_kwargs,
+    ).to(weight_dtype)
+
+    text_kwargs = OmegaConf.to_container(config["text_encoder_kwargs"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(model_dir, text_kwargs.get("tokenizer_subpath", "tokenizer"))
+    )
+    text_encoder = WanT5EncoderModel.from_pretrained(
+        os.path.join(model_dir, text_kwargs.get("text_encoder_subpath", "text_encoder")),
+        additional_kwargs=text_kwargs,
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    ).eval()
+
+    scheduler_name = str(config.get("scheduler_name", "Flow"))
+    scheduler_cls = {
+        "Flow": FlowMatchEulerDiscreteScheduler,
+        "Flow_Unipc": FlowUniPCMultistepScheduler,
+        "Flow_DPM++": FlowDPMSolverMultistepScheduler,
+    }[scheduler_name]
+    scheduler_kwargs = OmegaConf.to_container(config["scheduler_kwargs"])
+    scheduler = scheduler_cls(**_filter_init_kwargs(scheduler_cls, scheduler_kwargs))
+
+    pipe = Wan2_2FunInpaintPipeline(
+        transformer=transformer,
+        transformer_2=transformer_2,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scheduler=scheduler,
+    )
+    pipe.to(device=device)
+
+    for module in (pipe.transformer, pipe.transformer_2, pipe.text_encoder, pipe.vae):
+        if module is None:
+            continue
+        for p in module.parameters():
+            p.requires_grad_(False)
+        module.eval()
+
+    H, W = int(resolution_hw[0]), int(resolution_hw[1])
+    F_count = int(frame_num)
+    if H % 16 != 0 or W % 16 != 0:
+        raise ValueError(
+            f"resolution_hw=({H}, {W}) must align to Wan VAE stride 8 and DiT patch size 2"
+        )
+    if F_count <= 1 or (F_count - 1) % int(WAN_VAE_STRIDE[0]) != 0:
+        raise ValueError(
+            f"frame_num must be of the form 4n+1 for Wan VAE stride 4; got {F_count}"
+        )
+
+    num_train_ts = int(getattr(pipe.scheduler.config, "num_train_timesteps", WAN_NUM_TRAIN_TIMESTEPS))
+    boundary = float(transformer_kwargs.get("boundary", 0.875))
+    f_latent = (F_count - 1) // int(WAN_VAE_STRIDE[0]) + 1
+    h_latent = H // int(WAN_VAE_STRIDE[1])
+    w_latent = W // int(WAN_VAE_STRIDE[2])
+
+    return WanRFSDSContext(
+        wan_vae=pipe.vae,
+        low_noise_model=pipe.transformer,
+        high_noise_model=pipe.transformer_2,
+        boundary_in_t_units=boundary * float(num_train_ts),
+        num_train_timesteps=num_train_ts,
+        sample_shift=float(sample_shift),
+        frame_num=F_count,
+        resolution_hw=(H, W),
+        f_latent=int(f_latent),
+        h_latent=int(h_latent),
+        w_latent=int(w_latent),
+        device=device,
+        dtype=weight_dtype,
+        backend="fun_inp",
+        fun_pipeline=pipe,
+        fun_boundary_normalized=boundary,
     )
 
 
@@ -277,6 +462,9 @@ def wan_vae_encode_grad(
         Grad-enabled VAE latent. ``z.requires_grad`` is True iff the input
         rgb has ``requires_grad`` (true for our differentiable renderer).
     """
+    if ctx.backend == "fun_inp":
+        return _fun_inp_vae_encode_grad(rgb_3FHW_float01, ctx)
+
     expected_rgb = (3, int(ctx.frame_num), int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1]))
     if rgb_3FHW_float01.shape != expected_rgb:
         raise ValueError(
@@ -304,6 +492,140 @@ def wan_vae_encode_grad(
             f"got {tuple(z.shape)}"
         )
     return z.unsqueeze(0)                              # [1, 16, F_lat, H_lat, W_lat]
+
+
+def _fun_inp_vae_encode_grad(
+    rgb_3FHW_float01: torch.Tensor,
+    ctx: WanRFSDSContext,
+) -> torch.Tensor:
+    expected_rgb = (3, int(ctx.frame_num), int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1]))
+    if rgb_3FHW_float01.shape != expected_rgb:
+        raise ValueError(
+            f"rgb_3FHW must be {expected_rgb}, "
+            f"got {tuple(rgb_3FHW_float01.shape)}"
+        )
+    video = _to_wan_vae_input(rgb_3FHW_float01).unsqueeze(0).to(
+        device=ctx.device, dtype=ctx.fun_pipeline.vae.dtype
+    )
+    z = ctx.fun_pipeline.vae.encode(video)[0].mode()
+    expected = (
+        1,
+        WAN_LATENT_CH,
+        int(ctx.f_latent),
+        int(ctx.h_latent),
+        int(ctx.w_latent),
+    )
+    if tuple(z.shape) != expected:
+        raise RuntimeError(
+            f"Fun-InP VAE latent shape mismatch: expected {expected}, got {tuple(z.shape)}"
+        )
+    return z
+
+
+def _prepare_fun_inp_rfsds_condition(
+    wan_cond: Dict[str, Any],
+    ctx: WanRFSDSContext,
+) -> Dict[str, Any]:
+    if wan_cond.get("_prepared_backend") == "fun_inp":
+        return wan_cond
+    if wan_cond.get("backend") != "fun_inp":
+        raise ValueError("Fun-InP W-RFSDS requires wan_cond['backend'] == 'fun_inp'")
+    pipe = ctx.fun_pipeline
+    H, W = int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1])
+    F_count = int(ctx.frame_num)
+    video = wan_cond["fun_video"].to(device=ctx.device, dtype=torch.float32)
+    mask_video = wan_cond["fun_mask"].to(device=ctx.device, dtype=torch.float32)
+    if tuple(video.shape) != (1, 3, F_count, H, W):
+        raise ValueError(f"fun_video shape mismatch: got {tuple(video.shape)}")
+    if tuple(mask_video.shape) != (1, 1, F_count, H, W):
+        raise ValueError(f"fun_mask shape mismatch: got {tuple(mask_video.shape)}")
+
+    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+        wan_cond["pos_prompt"],
+        wan_cond["neg_prompt"],
+        True,
+        num_videos_per_prompt=1,
+        max_sequence_length=512,
+        device=ctx.device,
+    )
+    if isinstance(prompt_embeds, torch.Tensor):
+        in_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+    else:
+        in_prompt_embeds = negative_prompt_embeds + prompt_embeds
+
+    flat_video = video.permute(0, 2, 1, 3, 4).reshape(F_count, 3, H, W)
+    init_video = pipe.image_processor.preprocess(flat_video, height=H, width=W)
+    init_video = init_video.to(device=ctx.device, dtype=torch.float32)
+    init_video = init_video.reshape(1, F_count, 3, H, W).permute(0, 2, 1, 3, 4)
+
+    flat_mask = mask_video.permute(0, 2, 1, 3, 4).reshape(F_count, 1, H, W)
+    mask_condition = pipe.mask_processor.preprocess(flat_mask, height=H, width=W)
+    mask_condition = mask_condition.to(device=ctx.device, dtype=torch.float32)
+    mask_condition = mask_condition.reshape(1, F_count, 1, H, W).permute(0, 2, 1, 3, 4)
+
+    masked_video = init_video * (torch.tile(mask_condition, [1, 3, 1, 1, 1]) < 0.5)
+    _, masked_video_latents = pipe.prepare_mask_latents(
+        None,
+        masked_video,
+        1,
+        H,
+        W,
+        ctx.dtype,
+        ctx.device,
+        None,
+        True,
+        noise_aug_strength=None,
+    )
+    mask_condition = torch.concat(
+        [
+            torch.repeat_interleave(mask_condition[:, :, 0:1], repeats=4, dim=2),
+            mask_condition[:, :, 1:],
+        ],
+        dim=2,
+    )
+    mask_condition = mask_condition.view(1, mask_condition.shape[2] // 4, 4, H, W)
+    mask_condition = mask_condition.transpose(1, 2)
+    mask_latents = _resize_mask_like_official(1 - mask_condition, masked_video_latents, True)
+    mask_latents = mask_latents.to(device=ctx.device, dtype=ctx.dtype)
+    masked_video_latents = masked_video_latents.to(device=ctx.device, dtype=ctx.dtype)
+
+    y = torch.cat(
+        [torch.cat([mask_latents, mask_latents], dim=0),
+         torch.cat([masked_video_latents, masked_video_latents], dim=0)],
+        dim=1,
+    ).to(device=ctx.device, dtype=ctx.dtype)
+
+    patch_size = tuple(int(v) for v in pipe.transformer.config.patch_size)
+    seq_len = int(math.ceil((ctx.h_latent * ctx.w_latent) / (patch_size[1] * patch_size[2]) * ctx.f_latent))
+
+    wan_cond["in_context"] = in_prompt_embeds
+    wan_cond["y_guidance"] = y
+    wan_cond["seq_len"] = int(seq_len)
+    wan_cond["_prepared_backend"] = "fun_inp"
+    return wan_cond
+
+
+def _resize_mask_like_official(
+    mask: torch.Tensor,
+    latent: torch.Tensor,
+    process_first_frame_only: bool = True,
+) -> torch.Tensor:
+    latent_size = latent.size()
+    if process_first_frame_only:
+        target_size = list(latent_size[2:])
+        target_size[0] = 1
+        first_frame_resized = F.interpolate(
+            mask[:, :, 0:1, :, :], size=target_size, mode="trilinear", align_corners=False
+        )
+        target_size = list(latent_size[2:])
+        target_size[0] = target_size[0] - 1
+        if target_size[0] != 0:
+            remaining_frames_resized = F.interpolate(
+                mask[:, :, 1:, :, :], size=target_size, mode="trilinear", align_corners=False
+            )
+            return torch.cat([first_frame_resized, remaining_frames_resized], dim=2)
+        return first_frame_resized
+    return F.interpolate(mask, size=list(latent_size[2:]), mode="trilinear", align_corners=False)
 
 
 # =============================================================================
@@ -378,6 +700,17 @@ def w_rfsds_loss(
     -------
     loss : Tensor scalar  (or (loss, z_theta) if return_z_theta=True)
     """
+    if ctx.backend == "fun_inp":
+        return _w_rfsds_loss_fun_inp(
+            rgb_3FHW_float01,
+            wan_cond,
+            ctx,
+            tau=tau,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            return_z_theta=return_z_theta,
+        )
+
     # ---- 1) Encode rendered video to VAE latent (grad-enabled) ----
     z_theta = wan_vae_encode_grad(rgb_3FHW_float01, ctx)
     # z_theta: [1, 16, F_lat, H_lat, W_lat]
@@ -427,6 +760,64 @@ def w_rfsds_loss(
         residual = (v_pred - eps + z_theta.detach()).detach()
 
     # ---- 5) Form surrogate loss whose gradient w.r.t. theta equals SDS ----
+    loss = (residual * z_theta).sum() / float(z_theta.numel())
+    if return_z_theta:
+        return loss, z_theta
+    return loss
+
+
+def _select_fun_inp_transformer(tau: float, ctx: WanRFSDSContext) -> Any:
+    t_in_train_units = float(tau) * (float(ctx.num_train_timesteps) - 1.0)
+    if ctx.high_noise_model is not None and t_in_train_units >= ctx.boundary_in_t_units:
+        return ctx.high_noise_model
+    return ctx.low_noise_model
+
+
+def _w_rfsds_loss_fun_inp(
+    rgb_3FHW_float01: torch.Tensor,
+    wan_cond: Dict[str, Any],
+    ctx: WanRFSDSContext,
+    tau: float,
+    cfg_scale: float,
+    seed: Optional[int] = None,
+    return_z_theta: bool = False,
+) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
+    wan_cond = _prepare_fun_inp_rfsds_condition(wan_cond, ctx)
+    z_theta = _fun_inp_vae_encode_grad(rgb_3FHW_float01, ctx)
+
+    sigma = _shifted_sigma(float(tau), ctx.sample_shift)
+    with torch.no_grad():
+        if seed is not None:
+            gen = torch.Generator(device=z_theta.device).manual_seed(int(seed))
+            eps = torch.randn(z_theta.shape, generator=gen,
+                              device=z_theta.device, dtype=z_theta.dtype)
+        else:
+            eps = torch.randn_like(z_theta)
+        z_sigma = (1.0 - sigma) * z_theta.detach() + sigma * eps
+
+    t_wan = torch.tensor(
+        [float(tau) * (float(ctx.num_train_timesteps) - 1.0)],
+        device=ctx.device,
+        dtype=torch.float32,
+    )
+    latent_model_input = torch.cat([z_sigma, z_sigma], dim=0)
+    if hasattr(ctx.fun_pipeline.scheduler, "scale_model_input"):
+        latent_model_input = ctx.fun_pipeline.scheduler.scale_model_input(latent_model_input, t_wan)
+
+    timestep = t_wan.expand(latent_model_input.shape[0])
+    transformer = _select_fun_inp_transformer(float(tau), ctx)
+    with torch.no_grad():
+        noise_pred = transformer(
+            x=latent_model_input.to(ctx.dtype),
+            context=wan_cond["in_context"],
+            t=timestep,
+            seq_len=int(wan_cond["seq_len"]),
+            y=wan_cond["y_guidance"],
+        )
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        v_pred = noise_pred_uncond + float(cfg_scale) * (noise_pred_text - noise_pred_uncond)
+        residual = (v_pred.to(z_theta.dtype) - eps + z_theta.detach()).detach()
+
     loss = (residual * z_theta).sum() / float(z_theta.numel())
     if return_z_theta:
         return loss, z_theta
@@ -483,6 +874,6 @@ def latent_recon_loss(
 
 
 __all__ = [
-    "WanRFSDSContext", "load_wan_for_rfsds",
+    "WanRFSDSContext", "load_wan_for_rfsds", "load_wan_fun_inp_for_rfsds",
     "wan_vae_encode_grad", "w_rfsds_loss", "latent_recon_loss",
 ]

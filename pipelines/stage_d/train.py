@@ -152,6 +152,7 @@ class BootstrapBundle:
     z_wan_target: torch.Tensor                # [16, F_lat, H_lat, W_lat]
     wan_video_target_T3HW_01: torch.Tensor    # [F, 3, H, W] in [0, 1]
     s_0_pure_3HW_01: torch.Tensor             # [3, H, W] in [0, 1]
+    s_5_pure_3HW_01: Optional[torch.Tensor]   # [3, H, W] in [0, 1]
     frame_num: int
     resolution_hw: Tuple[int, int]
     latent_hw: Tuple[int, int]
@@ -471,6 +472,7 @@ def train_stage_d_p1(
 
     # Resolution-format target so we don't permute every iter.
     wan_target_T3HW = bootstrap.wan_video_target_T3HW_01     # [F, 3, H, W] in [0, 1]
+    lambda_last_active = cfg.lambda_last if str(cfg.wan_backend) == "fun_inp" else 0.0
 
     summary: Dict[str, Any] = {"committed_type": None, "n_iters_run": 0}
 
@@ -547,6 +549,7 @@ def train_stage_d_p1(
             alpha_m=learnable.alpha_m,
             wan_video_target_T3HW_01=wan_target_T3HW,
             s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
+            s_5_pure_3HW_01=bootstrap.s_5_pure_3HW_01,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,
@@ -563,6 +566,7 @@ def train_stage_d_p1(
         total_loss, log = aggregate_loss(
             loss_inputs, wan_ctx, lpips_module,
             cfg_lambdas_first=cfg.lambda_first,
+            cfg_lambdas_last=lambda_last_active,
             cfg_lambdas_contact=cfg.lambda_contact,
             cfg_lambdas_gate=cfg.lambda_gate,
             cfg_lambdas_z=cfg.lambda_z,
@@ -906,6 +910,7 @@ def _run_dual_clone_to_completion(
             alpha_m=learnable_cur.alpha_m,
             wan_video_target_T3HW_01=bootstrap.wan_video_target_T3HW_01,
             s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
+            s_5_pure_3HW_01=bootstrap.s_5_pure_3HW_01,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,
@@ -916,6 +921,7 @@ def _run_dual_clone_to_completion(
         total_loss, log = aggregate_loss(
             loss_inputs, wan_ctx, lpips_module,
             cfg_lambdas_first=cfg.lambda_first,
+            cfg_lambdas_last=(cfg.lambda_last if str(cfg.wan_backend) == "fun_inp" else 0.0),
             cfg_lambdas_contact=cfg.lambda_contact,
             cfg_lambdas_gate=cfg.lambda_gate,
             cfg_lambdas_z=cfg.lambda_z,

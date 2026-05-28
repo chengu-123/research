@@ -39,7 +39,7 @@ from .feature_sample import voxel_to_world
 from .losses import LPIPSModule
 from .render import StageDCameraConfig, build_locked_camera
 from .train import BootstrapBundle, TrellisModules, train_stage_d_p1
-from .w_rfsds import load_wan_for_rfsds
+from .w_rfsds import load_wan_for_rfsds, load_wan_fun_inp_for_rfsds
 
 
 logger = logging.getLogger(__name__)
@@ -238,6 +238,18 @@ def load_bootstrap_bundle(
             f"s_0_pure shape mismatch: expected "
             f"(3, {H_loaded}, {W_loaded}); got {tuple(s_0_pure.shape)}"
         )
+    s5_pure_path = os.path.join(bootstrap_dir, "s_5_pure.pt")
+    if os.path.isfile(s5_pure_path):
+        s_5_pure = _load_pt(s5_pure_path).to(device)
+        if s_5_pure.dtype == torch.uint8:
+            s_5_pure = s_5_pure.float() / 255.0
+        if s_5_pure.shape != (3, H_loaded, W_loaded):
+            raise RuntimeError(
+                f"s_5_pure shape mismatch: expected "
+                f"(3, {H_loaded}, {W_loaded}); got {tuple(s_5_pure.shape)}"
+            )
+    else:
+        s_5_pure = None
 
     return BootstrapBundle(
         z_s0=z_s0,
@@ -255,6 +267,7 @@ def load_bootstrap_bundle(
         wan_cond=wan_cond_on_dev, z_wan_target=z_wan_target,
         wan_video_target_T3HW_01=wan_video_target_T3HW_01,
         s_0_pure_3HW_01=s_0_pure,
+        s_5_pure_3HW_01=s_5_pure,
         frame_num=int(F_FRAMES),
         resolution_hw=(H_loaded, W_loaded),
         latent_hw=(expected_z[2], expected_z[3]),
@@ -343,13 +356,37 @@ def run_stage_d_main(
     logger.info("[stage_d] loading TRELLIS modules")
     trellis = load_trellis_modules(pretrained=trellis_pretrained, device=dev)
 
-    logger.info("[stage_d] loading Wan2.2 for W-RFSDS from %s", wan_ckpt_dir)
-    wan_ctx = load_wan_for_rfsds(
-        wan_ckpt_dir=wan_ckpt_dir, repo_root=repo_root, device=dev,
-        convert_model_dtype=True, device_id=device_id,
-        frame_num=bootstrap.frame_num,
-        resolution_hw=bootstrap.resolution_hw,
-    )
+    wan_backend = str(cfg.wan_backend)
+    if wan_backend == "i2v":
+        logger.info("[stage_d] loading Wan2.2 I2V for W-RFSDS from %s", wan_ckpt_dir)
+        wan_ctx = load_wan_for_rfsds(
+            wan_ckpt_dir=wan_ckpt_dir, repo_root=repo_root, device=dev,
+            convert_model_dtype=True, device_id=device_id,
+            frame_num=bootstrap.frame_num,
+            resolution_hw=bootstrap.resolution_hw,
+        )
+    elif wan_backend == "fun_inp":
+        if bootstrap.s_5_pure_3HW_01 is None:
+            raise FileNotFoundError(
+                "StageDConfig.wan_backend='fun_inp' requires bootstrap/s_5_pure.pt"
+            )
+        if cfg.lambda_last <= 0.0:
+            logger.warning(
+                "[stage_d] wan_backend=fun_inp but lambda_last <= 0; "
+                "final-frame pure anchor is disabled."
+            )
+        logger.info("[stage_d] loading Wan2.2-Fun-A14B-InP for W-RFSDS from %s", wan_ckpt_dir)
+        wan_ctx = load_wan_fun_inp_for_rfsds(
+            model_dir=wan_ckpt_dir,
+            repo_root=repo_root,
+            device=dev,
+            fun_config_path=cfg.fun_inp_config_path,
+            device_id=device_id,
+            frame_num=bootstrap.frame_num,
+            resolution_hw=bootstrap.resolution_hw,
+        )
+    else:
+        raise ValueError(f"StageDConfig.wan_backend must be 'i2v' or 'fun_inp'; got {wan_backend!r}")
 
     logger.info("[stage_d] building camera + LPIPS")
     if camera is None:

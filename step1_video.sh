@@ -5,7 +5,6 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=160G
 #SBATCH --time=4:00:00
 #SBATCH --output=step1_video_%j.out
 #SBATCH --error=step1_video_%j.err
@@ -46,7 +45,6 @@ python generate_video.py \
     --save_file "${VIDEO_PATH}" \
     --size 832*480 \
     --frame_num 81 \
-    --base_seed 42 \
-    --offload_model True
+    --base_seed 42
 
 echo "Step 1 complete. Video saved to ${VIDEO_PATH}"

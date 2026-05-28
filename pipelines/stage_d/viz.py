@@ -350,9 +350,9 @@ def save_p1_final_summary(
 # =============================================================================
 
 # Default keys to plot. Aggregator writes L_sds, L_lat, L_rgb, L_first,
-# L_contact, L_gate, L_shell, L_m_prior, L_z, L_total (see losses.py).
+# L_last, L_contact, L_gate, L_shell, L_m_prior, L_z, L_total (see losses.py).
 _DEFAULT_LOSS_KEYS: tuple = (
-    "L_total", "L_sds", "L_first", "L_rgb", "L_contact",
+    "L_total", "L_sds", "L_first", "L_last", "L_rgb", "L_contact",
     "L_gate", "L_shell", "L_m_prior", "L_z",
 )
 

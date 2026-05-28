@@ -127,6 +127,9 @@ class StageDConfig:
     grad_clip_norm: float = 1.0
 
     # ---- W-RFSDS Wan ----
+    wan_backend: str = "i2v"              # "i2v" or "fun_inp"
+    fun_inp_config_path: Optional[str] = None
+
     # CFG schedule (CHORD A.1: 25 -> 12 linear decay over training).
     cfg_warmup_g0: float = 25.0
     cfg_main_g1_end: float = 20.0
@@ -162,6 +165,7 @@ class StageDConfig:
 
     # ---- Loss weights (phase-gated; see schedules.py) ----
     lambda_first: float = 1.0           # frame 0 anchor to no-carpet s_0_pure
+    lambda_last: float = 1.0            # frame F-1 anchor to no-carpet s_5_pure
     lambda_contact: float = 0.2         # axis-through-anchor band
     lambda_gate: float = 0.05           # rounds g, m to {0, 1}
     lambda_shell_main: float = 0.02     # shell sparsity (D-v3.14)

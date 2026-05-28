@@ -4,8 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=180G
+#SBATCH --cpus-per-task=30
 #SBATCH --time=8:00:00
 #SBATCH --output=bootstrap_%j.out
 #SBATCH --error=bootstrap_%j.err
@@ -17,6 +16,7 @@
 #   sbatch bootstrap.sh outputs/30857 "A brown wooden desk. The right drawer slides open, smoothly and completely pulling outward. "
 #   BOOTSTRAP_INPUT_MODE=six_images IMAGE_DIR=~/hf_models/PartNet/30857 sbatch bootstrap.sh outputs/30857 "..."
 #   PURE_IMAGE=~/hf_models/PartNet/30857/00_pure.png sbatch bootstrap.sh outputs/30857 "..."
+#   WAN_BACKEND=fun_inp PURE_END_IMAGE=~/hf_models/PartNet/30857/05_pure.png sbatch bootstrap.sh outputs/30857 "..."
 #
 # Stage A video input:
 #   outputs/30857/stage_a/wan_video_target_3FHW_uint8.pt
@@ -54,6 +54,8 @@ STAGEA_VIDEO="${STAGEA_VIDEO:-}"
 IMAGE_DIR="${IMAGE_DIR:-}"
 IMAGE_PATTERN="${IMAGE_PATTERN:-rendering_joint_00_state_{i:02d}.png}"
 PURE_IMAGE="${PURE_IMAGE:-}"
+PURE_END_IMAGE="${PURE_END_IMAGE:-}"
+WAN_BACKEND="${WAN_BACKEND:-i2v}"
 
 INPUT_ARGS=(--input_mode "${BOOTSTRAP_INPUT_MODE}")
 if [[ "${BOOTSTRAP_INPUT_MODE}" == "stagea_video" ]]; then
@@ -84,6 +86,21 @@ if [[ ! -f "${PURE_IMAGE}" ]]; then
   echo "Set PURE_IMAGE to the no-carpet 00_pure.png that matches the Stage A 00_seg.png." >&2
   exit 2
 fi
+if [[ -z "${PURE_END_IMAGE}" ]]; then
+  if [[ -n "${IMAGE_DIR}" ]]; then
+    PURE_END_IMAGE="${IMAGE_DIR}/05_pure.png"
+  else
+    RUN_ID="$(basename "${OUTPUT_ROOT}")"
+    PURE_END_IMAGE="${HOME}/hf_models/PartNet/${RUN_ID}/05_pure.png"
+  fi
+fi
+PURE_END_ARGS=()
+if [[ -f "${PURE_END_IMAGE}" ]]; then
+  PURE_END_ARGS+=(--s5_pure "${PURE_END_IMAGE}")
+elif [[ "${WAN_BACKEND}" == "fun_inp" ]]; then
+  echo "ERROR: PURE_END_IMAGE not found for WAN_BACKEND=fun_inp: ${PURE_END_IMAGE}" >&2
+  exit 2
+fi
 if [[ ! -f "${TRELLIS_PRETRAINED}/pipeline.json" ]]; then
   echo "ERROR: TRELLIS_PRETRAINED must point to local TRELLIS-image-large with pipeline.json." >&2
   echo "Current TRELLIS_PRETRAINED=${TRELLIS_PRETRAINED}" >&2
@@ -94,6 +111,8 @@ python scripts/bootstrap.py \
     --output_dir "${OUTPUT_ROOT}" \
     "${INPUT_ARGS[@]}" \
     --s0_pure "${PURE_IMAGE}" \
+    "${PURE_END_ARGS[@]}" \
+    --wan_backend "${WAN_BACKEND}" \
     --motion "${PROMPT}" \
     --wan_ckpt "${WAN_CKPT}" \
     --trellis_pretrained "${TRELLIS_PRETRAINED}" \

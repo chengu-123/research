@@ -68,7 +68,6 @@ def _load_wan_condition_modules(
     wan_ckpt_dir: str,
     device_id: int,
     convert_model_dtype: bool,
-    t5_cpu: bool,
 ) -> Any:
     from pipelines.stage_a_wan import _load_wan_i2v_components
 
@@ -81,10 +80,10 @@ def _load_wan_condition_modules(
         t5_fsdp=False,
         dit_fsdp=False,
         use_sp=False,
-        t5_cpu=bool(t5_cpu),
-        init_on_cpu=True,
+        init_on_cpu=False,
         convert_model_dtype=bool(convert_model_dtype),
     )
+    wan.text_encoder.model.to(torch.device(f"cuda:{int(device_id)}"))
     del wan.low_noise_model
     del wan.high_noise_model
     torch.cuda.empty_cache()
@@ -116,6 +115,11 @@ def parse_args() -> argparse.Namespace:
                    help="No-carpet frame-0 image, typically 00_pure.png in the "
                         "same source directory as 00_seg.png. Used only for "
                         "Stage D supervision and cached Wan conditioning.")
+    p.add_argument("--s5_pure", default=None,
+                   help="No-carpet final-state image, typically 05_pure.png. "
+                        "Required for --wan_backend fun_inp and Stage D L_last.")
+    p.add_argument("--wan_backend", default="i2v", choices=["i2v", "fun_inp"],
+                   help="Cached Wan condition backend for Stage D W-RFSDS.")
     p.add_argument("--motion", required=True,
                    help="Same user motion prompt used for Stage A.")
     p.add_argument("--wan_ckpt", required=True, dest="wan_ckpt_dir",
@@ -138,8 +142,6 @@ def parse_args() -> argparse.Namespace:
                    help="Recorded Stage A guide scale for metadata.")
     p.add_argument("--no_convert_model_dtype", action="store_true",
                    help="Keep Wan models in their checkpoint dtype.")
-    p.add_argument("--t5_cpu", action="store_true",
-                   help="Run Wan T5 text encoder on CPU.")
     p.add_argument("--no_remove_disk", action="store_true",
                    help="Do not remove the FreeArt3D grounding disk in Stage B.")
     return p.parse_args()
@@ -151,6 +153,7 @@ def main() -> None:
     wan_ckpt_dir = os.path.abspath(args.wan_ckpt_dir)
     config_path = os.path.abspath(args.config)
     s0_pure_path = os.path.abspath(args.s0_pure)
+    s5_pure_path = os.path.abspath(args.s5_pure) if args.s5_pure is not None else None
 
     stagea_video_path = None
     image_dir = None
@@ -186,6 +189,13 @@ def main() -> None:
         raise FileNotFoundError(f"--config not found: {config_path}")
     if not os.path.isfile(s0_pure_path):
         raise FileNotFoundError(f"--s0_pure not found: {s0_pure_path}")
+    if str(args.wan_backend) == "fun_inp":
+        if s5_pure_path is None:
+            raise ValueError("--s5_pure is required when --wan_backend fun_inp")
+        if not os.path.isfile(s5_pure_path):
+            raise FileNotFoundError(f"--s5_pure not found: {s5_pure_path}")
+    elif s5_pure_path is not None and not os.path.isfile(s5_pure_path):
+        raise FileNotFoundError(f"--s5_pure not found: {s5_pure_path}")
 
     from pipelines.bootstrap import BootstrapConfig, run_bootstrap
     from pipelines.recon import build_trellis_pipeline
@@ -200,12 +210,13 @@ def main() -> None:
         stage_image_pattern=str(args.image_pattern),
         stage_image_paths=state_images,
         s_0_pure_path=s0_pure_path,
+        s_5_pure_path=s5_pure_path,
+        wan_condition_backend=str(args.wan_backend),
         stage_a_wan_size=str(args.stage_a_size),
         stage_a_frame_num=int(args.stage_a_frame_num),
         stage_a_lang=str(args.lang),
         stage_a_guide_scale=float(args.guide_scale),
         stage_a_convert_model_dtype=not bool(args.no_convert_model_dtype),
-        stage_a_t5_cpu=bool(args.t5_cpu),
         stage_a_device_id=int(args.device_id),
         cfg_scar=_section(raw_cfg, "scar"),
         cfg_sdedit=_section(raw_cfg, "stage_b_sdedit"),
@@ -224,7 +235,6 @@ def main() -> None:
         wan_ckpt_dir=wan_ckpt_dir,
         device_id=int(args.device_id),
         convert_model_dtype=not bool(args.no_convert_model_dtype),
-        t5_cpu=bool(args.t5_cpu),
     )
 
     result = run_bootstrap(
