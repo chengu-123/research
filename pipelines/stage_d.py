@@ -52,6 +52,9 @@ from pipelines.stage_d.run_stage_d import run_stage_d_main
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
+    os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
+)
 
 
 # =============================================================================
@@ -65,7 +68,7 @@ def run_stage_d(
     *,
     device: str = "cuda",
     device_id: int = 0,
-    trellis_pretrained: str = "JeffreyXiang/TRELLIS-image-large",
+    trellis_pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
     camera: Optional[StageDCameraConfig] = None,
     lpips_net: str = "vgg",
     cfg_overrides: Optional[Dict[str, Any]] = None,
@@ -88,7 +91,7 @@ def run_stage_d(
     device_id : int        default 0
     trellis_pretrained : str
         TRELLIS pipeline pretrained tag, default
-        ``"JeffreyXiang/TRELLIS-image-large"`` (matches ``recon.py``).
+        Local TRELLIS-image-large directory containing ``pipeline.json``.
     camera : Optional[StageDCameraConfig]
         Explicit camera override. When None, defaults to
         ``StageDCameraConfig.freeart3d_canonical()`` (+Z up, FreeArt3D
@@ -192,8 +195,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device_id", type=int, default=0,
                     help="CUDA device index. Default 0.")
     p.add_argument("--trellis_pretrained", type=str,
-                    default="JeffreyXiang/TRELLIS-image-large",
-                    help="TRELLIS pretrained tag (HF hub or local cache key).")
+                    default=_DEFAULT_TRELLIS_PRETRAINED,
+                    help="Local TRELLIS-image-large directory containing pipeline.json.")
     p.add_argument("--lpips_net", type=str, default="vgg",
                     choices=["vgg", "alex", "squeeze"],
                     help="LPIPS backbone for L_rgb / L_first.")

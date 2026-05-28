@@ -49,6 +49,9 @@ if _MINE_DIR not in sys.path:
 _TRELLIS_DIR = os.path.join(_MINE_DIR, "TRELLIS")
 if _TRELLIS_DIR not in sys.path:
     sys.path.insert(0, _TRELLIS_DIR)
+_DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
+    os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
+)
 
 import torch
 from omegaconf import OmegaConf
@@ -123,8 +126,8 @@ def parse_args() -> argparse.Namespace:
                    help="Torch device for TRELLIS and Bootstrap. Default cuda.")
     p.add_argument("--device_id", type=int, default=0,
                    help="CUDA device index used by Wan modules. Default 0.")
-    p.add_argument("--trellis_pretrained", default="JeffreyXiang/TRELLIS-image-large",
-                   help="TRELLIS pretrained tag or local path.")
+    p.add_argument("--trellis_pretrained", default=_DEFAULT_TRELLIS_PRETRAINED,
+                   help="Local TRELLIS-image-large directory containing pipeline.json.")
     p.add_argument("--stage_a_size", default="832*480",
                    help="Wan area profile used by the existing Stage A artifact.")
     p.add_argument("--stage_a_frame_num", type=int, default=21,

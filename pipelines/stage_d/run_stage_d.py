@@ -43,6 +43,9 @@ from .w_rfsds import load_wan_for_rfsds
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
+    os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
+)
 
 
 # =============================================================================
@@ -262,7 +265,7 @@ def load_bootstrap_bundle(
 # TRELLIS module loader
 # =============================================================================
 
-def load_trellis_modules(pretrained: str = "JeffreyXiang/TRELLIS-image-large",
+def load_trellis_modules(pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
                           device: torch.device = torch.device("cuda")) -> TrellisModules:
     """Load the four frozen TRELLIS modules Stage D needs.
 
@@ -305,7 +308,7 @@ def run_stage_d_main(
     repo_root: Optional[str] = None,
     device: str = "cuda",
     device_id: int = 0,
-    trellis_pretrained: str = "JeffreyXiang/TRELLIS-image-large",
+    trellis_pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
     camera: Optional[StageDCameraConfig] = None,
     lpips_net: str = "vgg",
 ) -> Dict[str, Any]:

@@ -46,6 +46,7 @@ OUTPUT_ROOT="$1"
 PROMPT="$2"
 
 WAN_CKPT="${WAN_CKPT:-${HOME}/hf_models/Wan2.2-I2V-A14B}"
+TRELLIS_PRETRAINED="${TRELLIS_PRETRAINED:-${HOME}/hf_models/TRELLIS-image-large}"
 DEVICE="${DEVICE:-cuda}"
 DEVICE_ID="${DEVICE_ID:-0}"
 BOOTSTRAP_INPUT_MODE="${BOOTSTRAP_INPUT_MODE:-stagea_video}"
@@ -83,6 +84,11 @@ if [[ ! -f "${PURE_IMAGE}" ]]; then
   echo "Set PURE_IMAGE to the no-carpet 00_pure.png that matches the Stage A 00_seg.png." >&2
   exit 2
 fi
+if [[ ! -f "${TRELLIS_PRETRAINED}/pipeline.json" ]]; then
+  echo "ERROR: TRELLIS_PRETRAINED must point to local TRELLIS-image-large with pipeline.json." >&2
+  echo "Current TRELLIS_PRETRAINED=${TRELLIS_PRETRAINED}" >&2
+  exit 2
+fi
 
 python scripts/bootstrap.py \
     --output_dir "${OUTPUT_ROOT}" \
@@ -90,5 +96,6 @@ python scripts/bootstrap.py \
     --s0_pure "${PURE_IMAGE}" \
     --motion "${PROMPT}" \
     --wan_ckpt "${WAN_CKPT}" \
+    --trellis_pretrained "${TRELLIS_PRETRAINED}" \
     --device "${DEVICE}" \
     --device_id "${DEVICE_ID}"

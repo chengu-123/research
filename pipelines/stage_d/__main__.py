@@ -10,6 +10,9 @@ import sys
 from typing import Any, Dict, Optional
 
 from .config import StageDConfig
+_DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
+    os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
+)
 
 
 def _repo_root() -> str:
@@ -43,8 +46,8 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Torch device string. Default cuda.")
     p.add_argument("--device_id", type=int, default=0,
                    help="CUDA device index used by Wan. Default 0.")
-    p.add_argument("--trellis_pretrained", default="JeffreyXiang/TRELLIS-image-large",
-                   help="TRELLIS pretrained tag or local path.")
+    p.add_argument("--trellis_pretrained", default=_DEFAULT_TRELLIS_PRETRAINED,
+                   help="Local TRELLIS-image-large directory containing pipeline.json.")
     p.add_argument("--lpips_net", default="vgg", choices=["vgg", "alex", "squeeze"],
                    help="LPIPS backbone. Default vgg.")
     p.add_argument("--cfg", action="append", default=None, metavar="key=json",

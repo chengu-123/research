@@ -9,6 +9,28 @@ import torch
 from trellis.pipelines import TrellisImageTo3DPipeline
 
 
+DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
+    os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
+)
+
+
+def resolve_trellis_pretrained(pretrained: str | None = None) -> str:
+    """Resolve TRELLIS weights to a local directory and refuse HF repo ids."""
+    raw = pretrained if pretrained is not None else DEFAULT_TRELLIS_PRETRAINED
+    path = os.path.abspath(os.path.expanduser(os.fspath(raw)))
+    pipeline_json = os.path.join(path, "pipeline.json")
+    if not os.path.isfile(pipeline_json):
+        raise FileNotFoundError(
+            f"TRELLIS pretrained path must be a local directory containing "
+            f"pipeline.json; got {raw!r} -> {path!r}. This pipeline runs with "
+            "HF_HUB_OFFLINE=1, so HuggingFace repo ids such as "
+            "'JeffreyXiang/TRELLIS-image-large' are not valid here. Set "
+            "TRELLIS_PRETRAINED or pass --trellis_pretrained to the local "
+            "TRELLIS-image-large directory."
+        )
+    return path
+
+
 def _load_sparse_structure_encoder(pipe: TrellisImageTo3DPipeline,
                                    pretrained: str) -> None:
     """Attach the SS VAE encoder to ``pipe.models`` under the key
@@ -44,7 +66,7 @@ def _load_sparse_structure_encoder(pipe: TrellisImageTo3DPipeline,
 
 def build_trellis_pipeline(
     device: str = 'cuda',
-    pretrained: str = 'JeffreyXiang/TRELLIS-image-large',
+    pretrained: str | None = None,
 ) -> TrellisImageTo3DPipeline:
     """Instantiate and move a TRELLIS image-to-3D pipeline to the target device.
 
@@ -57,8 +79,9 @@ def build_trellis_pipeline(
     SDEdit guide encoding step (not in the default pipeline.json bundle). We
     load it explicitly here; failure is non-fatal (Pass 2 degrades to Pass 1).
     """
-    pipe = TrellisImageTo3DPipeline.from_pretrained(pretrained)
-    _load_sparse_structure_encoder(pipe, pretrained)
+    pretrained_path = resolve_trellis_pretrained(pretrained)
+    pipe = TrellisImageTo3DPipeline.from_pretrained(pretrained_path)
+    _load_sparse_structure_encoder(pipe, pretrained_path)
     if device.startswith('cuda') and torch.cuda.is_available():
         pipe.to(torch.device(device))
     return pipe
