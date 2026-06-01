@@ -167,6 +167,8 @@ def _build_sdedit_cfg(cfg, args) -> Dict[str, Any]:
     sdedit_cfg.setdefault("attn_m_tau", 0.05)
     sdedit_cfg.setdefault("guide_mode", "augmented_intersection")
     sdedit_cfg.setdefault("guide_excl_threshold", 0.83)
+    sdedit_cfg.setdefault("move_temporal_filter_enabled", True)
+    sdedit_cfg.setdefault("move_temporal_filter_dilation_radius", 1)
     # v3.3 BMCSA M-compute defaults (method.md section 5.2).
     sdedit_cfg.setdefault("M_compute_mode", "dynamic")
     sdedit_cfg.setdefault("tau_M_dynamic", 0.7)

@@ -89,6 +89,121 @@ class SCARResult:
     icp_capped: List[bool] = field(default_factory=list)
 
 
+def _dilate_mask_3d(mask: np.ndarray, radius: int = 1) -> np.ndarray:
+    """Chebyshev dilation for a 3D boolean mask."""
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.ndim != 3:
+        raise ValueError(f"mask must be 3D; got shape {mask_bool.shape}")
+    r = int(radius)
+    if r < 0:
+        raise ValueError(f"radius must be >= 0; got {radius}")
+    if r == 0:
+        return mask_bool.copy()
+    padded = np.pad(mask_bool, ((r, r), (r, r), (r, r)), mode="constant")
+    D, H, W = mask_bool.shape
+    out = np.zeros_like(mask_bool, dtype=bool)
+    for dx in range(2 * r + 1):
+        for dy in range(2 * r + 1):
+            for dz in range(2 * r + 1):
+                out |= padded[dx:dx + D, dy:dy + H, dz:dz + W]
+    return out
+
+
+def _connected_components_26(mask: np.ndarray) -> List[np.ndarray]:
+    """Return 26-connected components as coordinate arrays."""
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.ndim != 3:
+        raise ValueError(f"mask must be 3D; got shape {mask_bool.shape}")
+    D, H, W = mask_bool.shape
+    visited = np.zeros_like(mask_bool, dtype=bool)
+    offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if not (dx == 0 and dy == 0 and dz == 0)
+    ]
+    components: List[np.ndarray] = []
+    seeds = np.argwhere(mask_bool)
+    for seed_arr in seeds:
+        sx, sy, sz = (int(seed_arr[0]), int(seed_arr[1]), int(seed_arr[2]))
+        if visited[sx, sy, sz]:
+            continue
+        stack = [(sx, sy, sz)]
+        visited[sx, sy, sz] = True
+        comp = []
+        while stack:
+            x, y, z = stack.pop()
+            comp.append((x, y, z))
+            for dx, dy, dz in offsets:
+                nx, ny, nz = x + dx, y + dy, z + dz
+                if nx < 0 or nx >= D or ny < 0 or ny >= H or nz < 0 or nz >= W:
+                    continue
+                if mask_bool[nx, ny, nz] and not visited[nx, ny, nz]:
+                    visited[nx, ny, nz] = True
+                    stack.append((nx, ny, nz))
+        components.append(np.asarray(comp, dtype=np.int16))
+    return components
+
+
+def _filter_move_components_temporal(
+    O_move_per_state: np.ndarray,
+    dilation_radius: int = 1,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Remove move components without overlap to dilated adjacent states."""
+    move = np.asarray(O_move_per_state, dtype=bool)
+    if move.ndim != 4:
+        raise ValueError(f"O_move_per_state must be 4D; got shape {move.shape}")
+    K = int(move.shape[0])
+    filtered = np.zeros_like(move, dtype=bool)
+    dilated = [_dilate_mask_3d(move[k], radius=dilation_radius) for k in range(K)]
+    report: Dict[str, Any] = {
+        "enabled": True,
+        "rule": "26-connected components kept when overlapping any dilated adjacent state",
+        "dilation_radius": int(dilation_radius),
+        "states": [],
+    }
+
+    for k in range(K):
+        comps = _connected_components_26(move[k])
+        state_report = {
+            "state": int(k),
+            "input_voxels": int(move[k].sum()),
+            "component_count": int(len(comps)),
+            "kept_component_count": 0,
+            "removed_component_count": 0,
+            "kept_voxels": 0,
+            "removed_voxels": 0,
+        }
+        has_left = k > 0
+        has_right = k < K - 1
+        for comp in comps:
+            if comp.size == 0:
+                continue
+            xs = comp[:, 0]
+            ys = comp[:, 1]
+            zs = comp[:, 2]
+            left_overlap = int(dilated[k - 1][xs, ys, zs].sum()) if has_left else 0
+            right_overlap = int(dilated[k + 1][xs, ys, zs].sum()) if has_right else 0
+            keep = (left_overlap > 0) or (right_overlap > 0)
+            if not has_left and not has_right:
+                keep = True
+            n_voxels = int(comp.shape[0])
+            if keep:
+                filtered[k, xs, ys, zs] = True
+                state_report["kept_component_count"] += 1
+                state_report["kept_voxels"] += n_voxels
+            else:
+                state_report["removed_component_count"] += 1
+                state_report["removed_voxels"] += n_voxels
+        report["states"].append(state_report)
+
+    report["input_voxels"] = int(move.sum())
+    report["kept_voxels"] = int(filtered.sum())
+    report["removed_voxels"] = int(move.sum() - filtered.sum())
+    return filtered.astype(np.uint8), report
+
+
 # ---------------------------------------------------------------------------
 # v8 DiT 1024-dim hidden state capture (2026-04-24).
 #
@@ -2592,9 +2707,30 @@ def run_scar(
     O_base_canonical = (votes_p2 >= min_votes).astype(np.uint8)           # (64, 64, 64)
 
     binary_p1_np = binary_p1.detach().cpu().numpy().astype(bool)          # (K, 64, 64, 64)
-    O_move_per_state = (
+    O_move_per_state_raw = (
         binary_p1_np & ~O_base_canonical[None].astype(bool)
     ).astype(np.uint8)                                                    # (K, 64, 64, 64)
+    move_filter_cfg = cfg_sdedit or {}
+    move_filter_enabled = bool(move_filter_cfg.get("move_temporal_filter_enabled", True))
+    move_filter_radius = int(move_filter_cfg.get("move_temporal_filter_dilation_radius", 1))
+    if move_filter_enabled:
+        O_move_per_state, move_filter_report = _filter_move_components_temporal(
+            O_move_per_state_raw,
+            dilation_radius=move_filter_radius,
+        )
+    else:
+        O_move_per_state = O_move_per_state_raw.copy()
+        move_filter_report = {
+            "enabled": False,
+            "dilation_radius": move_filter_radius,
+            "input_voxels": int(O_move_per_state_raw.sum()),
+            "kept_voxels": int(O_move_per_state.sum()),
+            "removed_voxels": 0,
+            "states": [],
+        }
+    O_move_removed_per_state = (
+        O_move_per_state_raw.astype(bool) & ~O_move_per_state.astype(bool)
+    ).astype(np.uint8)
 
     # ---- SECONDARY: soft fields (no var_penalty; Stage C MRF unary) ----
     mean_p2 = soft_p2_np.mean(axis=0)                                     # (64, 64, 64)
@@ -2607,11 +2743,17 @@ def run_scar(
     P_move_evidence_per_state = np.clip(
         soft_p1_np - alpha_base * P_base_canonical[None], 0.0, 1.0,
     ).astype(np.float32)                                                  # SOFT secondary
+    P_move_evidence_per_state *= O_move_per_state.astype(np.float32)
     move_confidence_per_state = P_move_evidence_per_state.copy()          # alias
 
     # ---- Save: hard PRIMARY first, soft SECONDARY second ----
     save_voxel_grid(os.path.join(out_dir, "O_base_canonical.npy"), O_base_canonical)
+    save_voxel_grid(os.path.join(out_dir, "O_move_per_state_raw.npy"), O_move_per_state_raw)
     save_voxel_grid(os.path.join(out_dir, "O_move_per_state.npy"), O_move_per_state)
+    save_voxel_grid(
+        os.path.join(out_dir, "O_move_temporal_removed.npy"),
+        O_move_removed_per_state,
+    )
     save_voxel_grid(os.path.join(out_dir, "P_base_canonical.npy"), P_base_canonical)
     save_voxel_grid(os.path.join(out_dir, "base_confidence.npy"), base_confidence)
     save_voxel_grid(
@@ -2619,16 +2761,22 @@ def run_scar(
         P_move_evidence_per_state,
     )
     save_voxel_grid(os.path.join(out_dir, "move_confidence.npy"), move_confidence_per_state)
+    with open(os.path.join(out_dir, "move_temporal_filter_report.json"), "w") as f:
+        json.dump(move_filter_report, f, indent=2)
 
     base_hard_count = int(O_base_canonical.sum())
+    move_raw_counts = [int(O_move_per_state_raw[k].sum()) for k in range(K_v)]
     move_hard_counts = [int(O_move_per_state[k].sum()) for k in range(K_v)]
+    move_removed_counts = [int(O_move_removed_per_state[k].sum()) for k in range(K_v)]
     base_soft_mass = float(P_base_canonical.sum())
     move_soft_masses = [float(P_move_evidence_per_state[k].sum()) for k in range(K_v)]
     print(
         f"[run_scar] v3.3.3 output:\n"
         f"  PRIMARY hard  O_base_canonical = K-vote >= {min_votes}/{K_v} "
         f"= {base_hard_count} voxels\n"
-        f"  PRIMARY hard  O_move_per_state per K = {move_hard_counts}\n"
+        f"  PRIMARY hard  O_move_per_state raw per K = {move_raw_counts}\n"
+        f"  PRIMARY hard  O_move_per_state filtered per K = {move_hard_counts}\n"
+        f"  PRIMARY hard  O_move temporal removed per K = {move_removed_counts}\n"
         f"  SECONDARY soft P_base_canonical    soft_mass = {base_soft_mass:.1f}\n"
         f"  SECONDARY soft P_move_evidence     soft_mass = {move_soft_masses}"
     )
@@ -2643,11 +2791,27 @@ def run_scar(
         ),
     )
     save_voxel_stack_html(
+        O_move_per_state_raw.astype(np.float32),
+        os.path.join(viz_dir, "O_move_per_state_raw.html"),
+        title=(
+            f"O_move_per_state_raw = Pass-1 raw AND NOT O_base_canonical; "
+            f"K={K_v}"
+        ),
+    )
+    save_voxel_stack_html(
         O_move_per_state.astype(np.float32),
         os.path.join(viz_dir, "O_move_per_state.html"),
         title=(
-            f"O_move_per_state (PRIMARY) = Pass-1 raw AND NOT O_base_canonical "
-            f"— per-K motion candidate (Stage C must validate); K={K_v}"
+            f"O_move_per_state (PRIMARY) = raw move after temporal component "
+            f"filter; dilation_radius={move_filter_radius}; K={K_v}"
+        ),
+    )
+    save_voxel_stack_html(
+        O_move_removed_per_state.astype(np.float32),
+        os.path.join(viz_dir, "O_move_temporal_removed.html"),
+        title=(
+            f"O_move_temporal_removed = raw move components without adjacent "
+            f"dilated-state overlap; dilation_radius={move_filter_radius}; K={K_v}"
         ),
     )
     # Viz: soft SECONDARY

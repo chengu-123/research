@@ -124,6 +124,11 @@ stage_b_sdedit:
   guide_excl_threshold: 0.83              # add only very confident target-exclusive
                                           # evidence; aligned base is passed as soft
                                           # P_base without thresholding.
+  move_temporal_filter_enabled: true      # filter raw move components that have no
+                                          # overlap with either adjacent state's
+                                          # dilated move mask.
+  move_temporal_filter_dilation_radius: 1 # one-voxel Chebyshev dilation for adjacent
+                                          # state overlap checks.
 
   # ---- BMCSA (v4 only; ignored when mode=v3) ----
   pass2_steps: 12                         # fixed Euler step count for Pass 2;
