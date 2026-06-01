@@ -615,8 +615,7 @@ def _build_augmented_intersection_guide(
     target_state: int = 0,
     guide_mode: str = "augmented_intersection",
     P_base_shared: Optional[torch.Tensor] = None,
-    guide_base_threshold: float = 0.3,
-    guide_excl_threshold: float = 0.5,
+    guide_excl_threshold: float = 0.83,
     return_intermediates: bool = False,
 ) -> Any:
     """Construct the SDEdit guide latent for ``target_state`` refinement.
@@ -652,12 +651,9 @@ def _build_augmented_intersection_guide(
           extended drawer for state K-1).
         - ``"pure_intersection"``: non-target intersection only. Target's
           unique voxels are dropped; SDEdit must regenerate them from c_k.
-    guide_base_threshold : float
-        Threshold for binarising the aligned shared-base branch. Lower than
-        the exclusive threshold to favour base recall before Pass-2 alignment.
     guide_excl_threshold : float
-        Threshold for binarising target-exclusive evidence. Kept stricter to
-        avoid injecting unaligned per-state support into the base guide.
+        Threshold for binarising target-exclusive evidence. Kept strict to
+        avoid injecting unaligned per-state support into the aligned base guide.
 
     Returns
     -------
@@ -666,10 +662,6 @@ def _build_augmented_intersection_guide(
     """
     if P_stack.ndim != 4:
         raise ValueError(f"P_stack must be (K, D, H, W); got shape {tuple(P_stack.shape)}")
-    if not (0.0 < float(guide_base_threshold) < 1.0):
-        raise ValueError(
-            f"guide_base_threshold must be in (0, 1); got {guide_base_threshold}"
-        )
     if not (0.0 < float(guide_excl_threshold) < 1.0):
         raise ValueError(
             f"guide_excl_threshold must be in (0, 1); got {guide_excl_threshold}"
@@ -713,12 +705,13 @@ def _build_augmented_intersection_guide(
             f"unknown guide_mode {guide_mode!r}; expected 'augmented_intersection' or 'pure_intersection'"
         )
 
-    # Binarise to match encoder training distribution (Objaverse binary
-    # occupancy). Use split thresholds: high recall for aligned shared base,
-    # stricter threshold for target-exclusive evidence.
-    O_base_bin = P_base > float(guide_base_threshold)
-    O_excl_bin = P_excl > float(guide_excl_threshold)
-    O_guide_bin = (O_base_bin | O_excl_bin).to(dtype=torch.float32)
+    # Guide occupancy for the encoder: preserve the aligned base as a soft
+    # field, and add only very confident target-exclusive evidence as hard
+    # occupancy. This keeps Pass-2 anchored to the aligned base instead of
+    # re-injecting each target state's full unaligned support.
+    O_base_bin = P_base.clamp(0.0, 1.0)
+    O_excl_bin = (P_excl > float(guide_excl_threshold)).to(dtype=P_base.dtype)
+    O_guide_bin = torch.maximum(O_base_bin, O_excl_bin).to(dtype=torch.float32)
     O_guide = O_guide_bin.unsqueeze(0).unsqueeze(0)
 
     # Encoder can be fp16; cast input to its parameter dtype.
@@ -741,7 +734,6 @@ def _build_augmented_intersection_guide(
             "O_guide_bin": O_guide_bin.detach().cpu(),
             "target_state": int(target_state),
             "P_base_source": "shared" if P_base_shared is not None else "per_target_min",
-            "guide_base_threshold": float(guide_base_threshold),
             "guide_excl_threshold": float(guide_excl_threshold),
         }
         return z_guide, intermediates
@@ -1361,8 +1353,7 @@ def run_scar(
         # Per-state guides: start from Pass-1 latents (identity), then override
         # each target with its own augmented-intersection guide (guide build is
         # shared between v3 and bmcsa modes; only the Pass-2 sampler differs).
-        guide_base_threshold = float(cfg_sdedit.get("guide_base_threshold", 0.3))
-        guide_excl_threshold = float(cfg_sdedit.get("guide_excl_threshold", 0.5))
+        guide_excl_threshold = float(cfg_sdedit.get("guide_excl_threshold", 0.83))
         guides = z_final.clone()                            # (K, 8, 16, 16, 16)
         guide_intermediates_by_target: Dict[int, Dict[str, Any]] = {}
         for tgt in refine_states_list:
@@ -1373,7 +1364,6 @@ def run_scar(
                 guide_mode=guide_mode,
                 return_intermediates=True,
                 P_base_shared=P_base_shared_64,             # filtered when attn_m applies at guide
-                guide_base_threshold=guide_base_threshold,
                 guide_excl_threshold=guide_excl_threshold,
             )                                               # z_guide_t: (1, 8, 16, 16, 16)
             z_guide_t = z_guide_t.to(device=z_final.device, dtype=z_final.dtype)
@@ -1628,7 +1618,6 @@ def run_scar(
         sdedit_report.update({
             "mode": mode,
             "guide_mode": guide_mode,
-            "guide_base_threshold": guide_base_threshold,
             "guide_excl_threshold": guide_excl_threshold,
             "t_star": t_star,
             "pass2_steps": pass2_steps_effective,
@@ -2236,7 +2225,6 @@ def run_scar(
             O_base_np = inter["O_base_guide_bin"].numpy().astype(np.float32)
             O_excl_np = inter["O_excl_guide_bin"].numpy().astype(np.float32)
             O_bin_np = inter["O_guide_bin"].numpy().astype(np.float32)
-            thr_base = float(inter["guide_base_threshold"])
             thr_excl = float(inter["guide_excl_threshold"])
 
             save_soft_voxel_html(
@@ -2260,7 +2248,7 @@ def run_scar(
             save_voxel_html(
                 O_base_np,
                 os.path.join(viz_guide_dir, f"{tag}_O_base_guide_bin.html"),
-                title=f"O_base_guide_bin = P_base > {thr_base:.3f}, target={tgt}",
+                title=f"O_base_guide_bin = P_base soft guide, target={tgt}",
             )
             save_voxel_html(
                 O_excl_np,
@@ -2271,8 +2259,8 @@ def run_scar(
                 O_bin_np,
                 os.path.join(viz_guide_dir, f"{tag}_O_guide_bin.html"),
                 title=(
-                    f"O_guide_bin = (P_base > {thr_base:.3f}) OR "
-                    f"(P_excl > {thr_excl:.3f}), target={tgt}"
+                    f"O_guide_bin = max(P_base, P_excl > {thr_excl:.3f}), "
+                    f"target={tgt}"
                 ),
             )
             # Also save the numpy arrays for downstream ablation / inspection.

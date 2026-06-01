@@ -121,12 +121,9 @@ stage_b_sdedit:
   t_star: 0.5                             # noise level at Pass 2 start;
                                           # x_{t*} = (1-t*)*z_guide + sigma_{t*}*eps_shared
   guide_mode: augmented_intersection      # "augmented_intersection" or "pure_intersection"
-  guide_base_threshold: 0.3               # binarise aligned base as P_base > threshold.
-                                          # Lower than 0.5 to keep low-confidence
-                                          # backside/base support before Pass-2 alignment.
-  guide_excl_threshold: 0.5               # binarise target-exclusive evidence as
-                                          # P_excl > threshold; stricter to avoid
-                                          # injecting unaligned per-state support.
+  guide_excl_threshold: 0.83              # add only very confident target-exclusive
+                                          # evidence; aligned base is passed as soft
+                                          # P_base without thresholding.
 
   # ---- BMCSA (v4 only; ignored when mode=v3) ----
   pass2_steps: 12                         # fixed Euler step count for Pass 2;
