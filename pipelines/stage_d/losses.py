@@ -198,6 +198,119 @@ def loss_motion_ownership(
     return L_cover, L_suppress
 
 
+def _morph_open_B1HW(m: torch.Tensor, erode_px: int, dilate_px: int) -> torch.Tensor:
+    """Morphological opening (erode then dilate) on a [B, 1, H, W] mask in [0, 1].
+
+    Removes the thin boundary loop produced when two INDEPENDENT per-state keyframe
+    recons disagree on the static silhouette edge by a few pixels (same fix as
+    ``dynamic_mask``). The solid emerged/static region survives the erosion.
+    """
+    x = m
+    if erode_px > 0:
+        x = -F.max_pool2d(-x, kernel_size=2 * erode_px + 1, stride=1, padding=erode_px)
+    if dilate_px > 0:
+        x = F.max_pool2d(x, kernel_size=2 * dilate_px + 1, stride=1, padding=dilate_px)
+    return x.clamp(0.0, 1.0)
+
+
+def loss_motion_ownership_3d(
+    move_sil_SV1HW: torch.Tensor,
+    base_sil_V1HW: torch.Tensor,
+    obs_sil_SV1HW: torch.Tensor,
+    canonical_idx: int,
+    fg_thresh: float = 0.04,
+    static_vote_frac: float = 0.8,
+    erode_px: int = 3,
+    dilate_px: int = 3,
+    static_exclude_V1HW: Optional[torch.Tensor] = None,
+    eps: float = 1.0e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Directional transform-consistency ownership (P0b; STAGED_REDESIGN.md section 6).
+
+    Replaces the symmetric-``D`` ``loss_motion_ownership``. Instead of "is the move
+    silhouette inside the changed 2D region" (ray-ambiguous, leaks static structures
+    that project into the swept area), it asks: does the move branch -- TRANSFORMED by
+    the joint to each state -- explain the geometry that NEWLY APPEARED, and is the
+    never-moving region owned by base. Works for revolute and prismatic identically
+    because the transform is already baked into ``move_sil`` upstream
+    (``render_move_silhouettes`` with the committed type's phi).
+
+    Parameters
+    ----------
+    move_sil_SV1HW : Tensor [S, V, 1, H, W]   grad-on; move branch (opacity_move=g*m)
+        transformed by SE(3)(phi_state) for the committed type, per state, per view.
+        ``move_sil_SV1HW[canonical_idx]`` is the identity-transformed (phi_c=0) move.
+    base_sil_V1HW : Tensor [V, 1, H, W]        grad-on; base branch (opacity_base=g*(1-m)),
+        state-INVARIANT (base never moves), per view.
+    obs_sil_SV1HW : Tensor [S, V, 1, H, W]     DETACHED observation silhouettes (per-state
+        keyframe recon rendered at the same V cameras). Domain must match the move/base render.
+    canonical_idx : int   index along S of the canonical state c (NOT necessarily closed;
+        c = CANONICAL_STATE_IDX, may be a middle state). E/STATIC/V are built relative to c.
+    static_vote_frac : float   STATIC = foreground in >= this fraction of states (robust vote,
+        NOT a hard min -- min is destroyed by per-state recon jitter; R1).
+    erode_px, dilate_px : int  morphological opening on E/V to kill the cross-recon boundary loop.
+    static_exclude_V1HW : Tensor [V, 1, H, W] or None   optional contact-band mask (near the
+        joint axis-line) to EXCLUDE from STATIC, so the near-hinge move band is not forced to
+        base (R4). In [0, 1]; STATIC is multiplied by (1 - this).
+
+    Returns
+    -------
+    (L_emerge, L_base_static, L_vacate) : scalars
+        L_emerge       -- transformed move (k != c) must cover the emerged region E_k.
+        L_base_static  -- base must cover the never-moving region STATIC. (fixes the rod leak)
+        L_vacate       -- canonical move must cover the vacated region V_k (revolute-weighted upstream).
+    """
+    if move_sil_SV1HW.ndim != 5 or move_sil_SV1HW.shape[2] != 1:
+        raise ValueError(f"move_sil must be [S,V,1,H,W], got {tuple(move_sil_SV1HW.shape)}")
+    S, V, _, H, W = move_sil_SV1HW.shape
+    if base_sil_V1HW.shape != (V, 1, H, W):
+        raise ValueError(
+            f"base_sil must be [V,1,H,W]=[{V},1,{H},{W}], got {tuple(base_sil_V1HW.shape)}"
+        )
+    if obs_sil_SV1HW.shape != move_sil_SV1HW.shape:
+        raise ValueError(
+            f"obs_sil must match move_sil {tuple(move_sil_SV1HW.shape)}, "
+            f"got {tuple(obs_sil_SV1HW.shape)}"
+        )
+    if not (0 <= canonical_idx < S):
+        raise ValueError(f"canonical_idx={canonical_idx} out of range [0,{S})")
+
+    # --- detached observation-derived masks ---
+    obs = obs_sil_SV1HW.detach()
+    fg = (obs > float(fg_thresh)).to(obs.dtype)               # [S,V,1,H,W] binary
+    fg_c = fg[canonical_idx].unsqueeze(0)                     # [1,V,1,H,W]
+
+    E = (fg - fg_c).clamp_min(0.0)                            # emerged: present at k, not at c
+    Vm = (fg_c - fg).clamp_min(0.0)                           # vacated: present at c, not at k
+    E = _morph_open_B1HW(E.reshape(S * V, 1, H, W), erode_px, dilate_px).reshape(S, V, 1, H, W)
+    Vm = _morph_open_B1HW(Vm.reshape(S * V, 1, H, W), erode_px, dilate_px).reshape(S, V, 1, H, W)
+
+    vote = fg.mean(dim=0)                                     # [V,1,H,W] fraction of states FG
+    STATIC = (vote >= float(static_vote_frac)).to(obs.dtype)  # robust vote (R1)
+    STATIC = _morph_open_B1HW(STATIC, 1, 1)                   # light clean
+    if static_exclude_V1HW is not None:
+        STATIC = (STATIC * (1.0 - static_exclude_V1HW.detach().clamp(0.0, 1.0))).clamp(0.0, 1.0)
+
+    # --- non-canonical state selector ---
+    noncanon = torch.ones(S, dtype=torch.bool, device=move_sil_SV1HW.device)
+    noncanon[canonical_idx] = False
+
+    move = move_sil_SV1HW.clamp(0.0, 1.0)
+    base = base_sil_V1HW.clamp(0.0, 1.0)
+    move_c = move[canonical_idx].unsqueeze(0)                 # [1,V,1,H,W]
+
+    E_nc = E[noncanon]
+    move_nc = move[noncanon]
+    L_emerge = (F.relu(E_nc - move_nc) * E_nc).sum() / (E_nc.sum() + eps)
+
+    L_base_static = (F.relu(STATIC - base) * STATIC).sum() / (STATIC.sum() + eps)
+
+    V_nc = Vm[noncanon]
+    L_vacate = (F.relu(V_nc - move_c) * V_nc).sum() / (V_nc.sum() + eps)
+
+    return L_emerge, L_base_static, L_vacate
+
+
 def _pure_geometry_loss(
     pred_N3HW: torch.Tensor,
     target_N3HW: torch.Tensor,

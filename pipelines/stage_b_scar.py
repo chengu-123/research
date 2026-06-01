@@ -2360,23 +2360,25 @@ def run_scar(
                 title=f"P_guide = max(P_base, P_excl), target={tgt}",
                 threshold=0.15,
             )
-            save_voxel_html(
+            save_soft_voxel_html(
                 O_base_np,
                 os.path.join(viz_guide_dir, f"{tag}_O_base_guide_bin.html"),
                 title=f"O_base_guide_bin = P_base soft guide, target={tgt}",
+                threshold=0.15,
             )
             save_voxel_html(
                 O_excl_np,
                 os.path.join(viz_guide_dir, f"{tag}_O_excl_guide_bin.html"),
                 title=f"O_excl_guide_bin = P_excl > {thr_excl:.3f}, target={tgt}",
             )
-            save_voxel_html(
+            save_soft_voxel_html(
                 O_bin_np,
                 os.path.join(viz_guide_dir, f"{tag}_O_guide_bin.html"),
                 title=(
                     f"O_guide_bin = max(P_base, P_excl > {thr_excl:.3f}), "
                     f"target={tgt}"
                 ),
+                threshold=0.15,
             )
             # Also save the numpy arrays for downstream ablation / inspection.
             save_voxel_grid(
