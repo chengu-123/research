@@ -143,6 +143,15 @@ def dynamic_mask(
     fg_first = (first.abs().sum(dim=0, keepdim=True) > float(thresh)).to(dtype=first.dtype)
     fg_last = (last.abs().sum(dim=0, keepdim=True) > float(thresh)).to(dtype=first.dtype)
     mask = (fg_first - fg_last).abs()
+    # Opening (erode-then-dilate): the two INDEPENDENT keyframe recons disagree on the
+    # static cabinet EDGE by a few px, which the silhouette XOR captures as a thin loop.
+    # Erosion removes that thin boundary mismatch while the SOLID moving region survives
+    # (verified on baseanchor_v1 it600: erode3 -> top contamination 10743 -> 98, door kept).
+    erode_px = 3
+    ek = 2 * erode_px + 1
+    mask = -F.max_pool2d(
+        (-mask).unsqueeze(0), kernel_size=ek, stride=1, padding=erode_px
+    ).squeeze(0)
     if int(dilate_px) > 0:
         radius = int(dilate_px)
         kernel = 2 * radius + 1
@@ -543,6 +552,7 @@ def aggregate_loss(
     move_floor_frac: float = 0.0,
     cfg_lambda_move_ceiling: float = 0.0,
     move_ceiling_frac: float = 1.0,
+    w_rfsds_n_eps: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compose all loss components and return (total_loss, log_dict).
 
@@ -574,7 +584,7 @@ def aggregate_loss(
         result = w_rfsds_loss(
             rgb_3FHW, inp.wan_cond, ctx,
             tau=inp.tau, cfg_scale=inp.cfg_scale, seed=seed_for_eps,
-            return_z_theta=need_z,
+            return_z_theta=need_z, n_eps=w_rfsds_n_eps,
         )
         if need_z:
             L_sds, z_theta_cached = result

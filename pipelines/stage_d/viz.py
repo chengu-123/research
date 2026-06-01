@@ -33,6 +33,7 @@ import torch
 from PIL import Image
 
 from .config import STATE_INDICES, TRELLIS_OCC_RES
+from .postprocess import purge_move_components
 
 # Optional plotly-based HTML viz. Import is guarded so the rest of viz.py
 # (PNG strips + metrics.json) still works in minimal environments.
@@ -299,15 +300,25 @@ def save_iter_snapshot(
 
     # Gate arrays (for offline HTML voxel viz)
     if U_object is not None and g_per_voxel is not None and m_per_voxel is not None:
+        m_np = m_per_voxel.detach().cpu().float().numpy()
         arrays = {
             "U_object": U_object,
             "g": g_per_voxel.detach().cpu().float().numpy(),
-            "m": m_per_voxel.detach().cpu().float().numpy(),
+            "m": m_np,
         }
         if base_anchor_per_voxel is not None:
             arrays["base_anchor"] = (
                 base_anchor_per_voxel.detach().cpu().bool().numpy()
             )
+        # Connectivity purge: relabel detached move components (a leaked static
+        # rod / specks) to base. Non-destructive -- stored alongside raw m so the
+        # downstream mesh split can consume the clean move mask while raw m stays
+        # available for debugging. See postprocess.purge_move_components.
+        move_purged, purge_info = purge_move_components(
+            np.asarray(U_object), m_np > 0.5,
+        )
+        arrays["move_purged"] = move_purged
+        arrays["purge_sizes"] = np.asarray(purge_info["sizes"], dtype=np.int64)
         np.savez_compressed(
             os.path.join(snap_dir, "gates.npz"),
             **arrays,

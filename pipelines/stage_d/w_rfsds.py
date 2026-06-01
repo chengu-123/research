@@ -832,6 +832,7 @@ def w_rfsds_loss(
     cfg_scale: float,
     seed: Optional[int] = None,
     return_z_theta: bool = False,
+    n_eps: int = 1,
 ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
     """Compute the W-RFSDS surrogate loss (CHORD Eq. 3) with Wan-shifted sigma.
 
@@ -876,6 +877,7 @@ def w_rfsds_loss(
             cfg_scale=cfg_scale,
             seed=seed,
             return_z_theta=return_z_theta,
+            n_eps=n_eps,
         )
 
     # ---- 1) Encode rendered video to VAE latent (grad-enabled) ----
@@ -993,52 +995,53 @@ def _w_rfsds_loss_fun_inp(
     cfg_scale: float,
     seed: Optional[int] = None,
     return_z_theta: bool = False,
+    n_eps: int = 1,
 ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
     wan_cond = _prepare_fun_inp_rfsds_condition(wan_cond, ctx)
     z_theta = _fun_inp_vae_encode_grad(rgb_3FHW_float01, ctx)
 
     sigma = _shifted_sigma(float(tau), ctx.sample_shift)
-    with torch.no_grad():
-        if seed is not None:
-            gen = torch.Generator(device=z_theta.device).manual_seed(int(seed))
-            eps = torch.randn(z_theta.shape, generator=gen,
-                              device=z_theta.device, dtype=z_theta.dtype)
-        else:
-            eps = torch.randn_like(z_theta)
-        z_sigma = (1.0 - sigma) * z_theta.detach() + sigma * eps
-
     t_wan = torch.tensor(
         [float(tau) * (float(ctx.num_train_timesteps) - 1.0)],
         device=ctx.device,
         dtype=torch.float32,
     )
-    latent_model_input = torch.cat([z_sigma, z_sigma], dim=0)
-    if hasattr(ctx.fun_pipeline.scheduler, "scale_model_input"):
-        latent_model_input = ctx.fun_pipeline.scheduler.scale_model_input(latent_model_input, t_wan)
-
     transformer = _select_fun_inp_transformer(float(tau), ctx)
-    # Dual-GPU: the experts live on ctx.teacher_device. Move the (tiny, already
-    # detached) latent + timestep there for the no_grad teacher forward, then
-    # bring the score back to ctx.device. Single-GPU: teacher_device == device,
-    # so every .to() is a no-op. in_context / y_guidance were cached on the
-    # teacher device by _prepare_fun_inp_rfsds_condition.
+    # Dual-GPU: experts live on ctx.teacher_device; move the tiny detached latent there
+    # for the no_grad teacher forward and bring the score back. Single-GPU: no-op.
     tdev = ctx.teacher_device or ctx.device
-    timestep = t_wan.expand(latent_model_input.shape[0]).to(tdev)
-    # The Wan DiT is bf16 and its time_embedding feeds the fp32 timestep
-    # sinusoid into a bf16 Linear; the model is designed to run under autocast
-    # (matching the in-house path's ``with torch.no_grad(), autocast(...)``).
-    # Without it: "mat1 and mat2 must have the same dtype, Float vs BFloat16".
+    n = max(1, int(n_eps))
+    # Multi-eps variance reduction (CHORD batch-style averaging, paper batch=4): average
+    # the SDS residual over n independent eps draws at the SAME (annealed) sigma -> the
+    # gradient variance scales ~1/n. This matters most for the low-dim joint params that
+    # ACCUMULATE the per-pixel SDS noise into 4 numbers. Only the n no_grad teacher
+    # forwards multiply; the expensive grad VAE encode (z_theta) is done once.
+    residual_acc: Optional[torch.Tensor] = None
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=ctx.dtype):
-        noise_pred = transformer(
-            x=latent_model_input.to(device=tdev, dtype=ctx.dtype),
-            context=wan_cond["in_context"],
-            t=timestep,
-            seq_len=int(wan_cond["seq_len"]),
-            y=wan_cond["y_guidance"],
-        ).to(ctx.device)
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        v_pred = noise_pred_uncond + float(cfg_scale) * (noise_pred_text - noise_pred_uncond)
-        residual = (v_pred.to(z_theta.dtype) - eps + z_theta.detach()).detach()
+        for i in range(n):
+            if seed is not None:
+                gen = torch.Generator(device=z_theta.device).manual_seed(int(seed) + i)
+                eps = torch.randn(z_theta.shape, generator=gen,
+                                  device=z_theta.device, dtype=z_theta.dtype)
+            else:
+                eps = torch.randn_like(z_theta)
+            z_sigma = (1.0 - sigma) * z_theta.detach() + sigma * eps
+            latent_model_input = torch.cat([z_sigma, z_sigma], dim=0)
+            if hasattr(ctx.fun_pipeline.scheduler, "scale_model_input"):
+                latent_model_input = ctx.fun_pipeline.scheduler.scale_model_input(latent_model_input, t_wan)
+            timestep = t_wan.expand(latent_model_input.shape[0]).to(tdev)
+            noise_pred = transformer(
+                x=latent_model_input.to(device=tdev, dtype=ctx.dtype),
+                context=wan_cond["in_context"],
+                t=timestep,
+                seq_len=int(wan_cond["seq_len"]),
+                y=wan_cond["y_guidance"],
+            ).to(ctx.device)
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            v_pred = noise_pred_uncond + float(cfg_scale) * (noise_pred_text - noise_pred_uncond)
+            res_i = v_pred.to(z_theta.dtype) - eps + z_theta.detach()
+            residual_acc = res_i if residual_acc is None else residual_acc + res_i
+        residual = (residual_acc / float(n)).detach()
 
     loss = (residual * z_theta).sum() / float(z_theta.numel())
     if return_z_theta:
