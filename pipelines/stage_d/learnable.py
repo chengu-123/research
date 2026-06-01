@@ -5,7 +5,9 @@ a clean parameter group structure and gradient checkpointing wraps a single
 forward.
 
 Convention:
-  - Scalars and per-voxel logits get smaller LR (``lr_scalar``).
+  - ``Delta_z_s`` gets the small SLAT LR (``lr_scalar``).
+  - Per-voxel gate logits get their own LR (``lr_gate``).
+  - Joint scalars get their own LR (``lr_joint``).
   - Adapter MLPs (inserted inside SS-DiT) get ``lr_adapter``.
   - Output heads (H_sup / H_part / H_joint) get ``lr_head``.
   - psi_param's seven content slots (axis 3, origin 3, type_logit 1) come
@@ -72,15 +74,27 @@ class ZeroInitAdapter(nn.Module):
         return self.fc2(self.act(self.fc1(self.norm(h))))
 
 
-class ZeroInitMLP(nn.Module):
-    """Zero-init residual MLP used for H_sup / H_part / H_joint output heads.
+class SmallInitMLP(nn.Module):
+    """Small-output-init residual MLP for the H_sup / H_part / H_joint heads.
 
-    Final linear is zero-initialized so heads contribute 0 at iter 0
-    (lambda ramp-ins in schedules.py also start at 0, providing extra safety).
+    The final linear is initialized small but NON-zero (xavier scaled by
+    ``out_init_gain``). A pure zero-init (the earlier design) makes
+    ``d(head_out)/d(feat) == 0`` at the output projection, so the shared
+    SS-DiT adapter -- which receives task gradient ONLY through these heads --
+    is starved (``grad_norm_adapter`` stays ~0) and the geometry-aware
+    segmentation path never wakes. A small non-zero output weight unblocks
+    that gradient path so the adapter (and thus segmentation) can learn.
+
+    Iter-0 stability is still guaranteed by (a) the ``lambda_*`` schedule
+    ramps starting at 0 and (b) the ``tanh * head_logit_residual_bound`` cap
+    on each head's contribution in train.py. Set ``out_init_gain=0.0`` to
+    recover the original zero-init behaviour.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
+                 out_init_gain: float = 0.1) -> None:
         super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
         self.fc1 = nn.Linear(in_dim, hidden_dim, bias=True)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.fc3 = nn.Linear(hidden_dim, out_dim, bias=True)
@@ -90,11 +104,14 @@ class ZeroInitMLP(nn.Module):
         nn.init.zeros_(self.fc1.bias)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
-        nn.init.zeros_(self.fc3.weight)
+        if out_init_gain > 0.0:
+            nn.init.xavier_uniform_(self.fc3.weight, gain=out_init_gain)
+        else:
+            nn.init.zeros_(self.fc3.weight)
         nn.init.zeros_(self.fc3.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.fc1(x))
+        h = self.act(self.fc1(self.norm(x)))
         h = self.act(self.fc2(h))
         return self.fc3(h)
 
@@ -152,12 +169,12 @@ def encode_delta_phi_init(phi_0: torch.Tensor,
 
 
 def init_alpha_m_from_M_attn(M_attn_at_U: torch.Tensor) -> torch.Tensor:
-    """Initialize per-voxel move-gate logit from BMCSA cross-state agreement.
+    """Initialize per-voxel move-gate logit from a base-like Stage B prior.
 
-    M_attn high  -> base-like -> alpha_m should be low (logit negative)
-    M_attn low   -> move-like -> alpha_m should be high (logit positive)
+    prior high  -> base-like -> alpha_m should be low (logit negative)
+    prior low   -> move-like -> alpha_m should be high (logit positive)
 
-    We sample M_attn at U_object voxel coords (already done outside) and
+    We sample the prior at U_object voxel coords (already done outside) and
     map (clamped) [0.05, 0.95] to ``logit(1 - M)``: M=0 -> logit(1) = +inf,
     M=1 -> logit(0) = -inf, M=0.5 -> 0. The 0.05/0.95 clamp keeps it finite.
     """
@@ -198,9 +215,11 @@ class StageDLearnable(nn.Module):
         )
 
         # ---- Per-voxel gate logits ----
-        # alpha_g zero-init: gate logit reduces to occ_at_U + lambda_sup * H_sup.
+        # U_object is already the Bootstrap support candidate set. Start with
+        # every candidate active, then let Stage D prune it by losses/heads.
         self.alpha_g = nn.Parameter(
-            torch.zeros(n_obj, device=device, dtype=dtype)
+            torch.full((n_obj,), float(cfg.alpha_g_init_logit),
+                       device=device, dtype=dtype)
         )
         # alpha_m: BCE-anchored to BMCSA's M_attn in warmup_g0; logit(1 - M_clamped).
         self.alpha_m = nn.Parameter(
@@ -227,14 +246,17 @@ class StageDLearnable(nn.Module):
         # ---- Output heads ----
         # H_sup, H_part: per-voxel scalar logit residual.
         # H_joint: 19-dim residual on psi_param (same layout).
-        self.H_sup = ZeroInitMLP(
-            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=1
+        self.H_sup = SmallInitMLP(
+            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=1,
+            out_init_gain=cfg.head_out_init_gain,
         )
-        self.H_part = ZeroInitMLP(
-            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=1
+        self.H_part = SmallInitMLP(
+            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=1,
+            out_init_gain=cfg.head_out_init_gain,
         )
-        self.H_joint = ZeroInitMLP(
-            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=PSI_PARAM_DIM
+        self.H_joint = SmallInitMLP(
+            in_dim=cfg.feat_dim, hidden_dim=cfg.head_hidden_dim, out_dim=PSI_PARAM_DIM,
+            out_init_gain=cfg.head_out_init_gain,
         )
 
         # ---- Non-learnable EMA buffer for psi gradient ramp-in ----
@@ -254,9 +276,11 @@ class StageDLearnable(nn.Module):
         """Group parameters by category so AdamW can use category-specific LR.
 
         Categories:
-          - "adapter":  the three adapter MLPs
-          - "head":     H_sup, H_part, H_joint
-          - "scalar":   Delta_z_s, alpha_g, alpha_m, psi_param, delta_phi
+          - "adapter": the three adapter MLPs
+          - "head":    H_sup, H_part, H_joint
+          - "z":       Delta_z_s
+          - "gate":    alpha_g, alpha_m
+          - "joint":   psi_param, delta_phi
         """
         adapter_params: List[nn.Parameter] = []
         for adapter in self.adapters.values():
@@ -268,18 +292,17 @@ class StageDLearnable(nn.Module):
             + list(self.H_joint.parameters())
         )
 
-        scalar_params: List[nn.Parameter] = [
-            self.Delta_z_s, self.alpha_g, self.alpha_m,
-            self.psi_param, self.delta_phi,
-        ]
-
         return [
             {"params": adapter_params, "lr": self.cfg.lr_adapter,
              "weight_decay": self.cfg.weight_decay, "name": "adapter"},
             {"params": head_params, "lr": self.cfg.lr_head,
              "weight_decay": self.cfg.weight_decay, "name": "head"},
-            {"params": scalar_params, "lr": self.cfg.lr_scalar,
-             "weight_decay": self.cfg.weight_decay, "name": "scalar"},
+            {"params": [self.Delta_z_s], "lr": self.cfg.lr_scalar,
+             "weight_decay": self.cfg.weight_decay, "name": "z"},
+            {"params": [self.alpha_g, self.alpha_m], "lr": self.cfg.lr_gate,
+             "weight_decay": self.cfg.weight_decay, "name": "gate"},
+            {"params": [self.psi_param, self.delta_phi], "lr": self.cfg.lr_joint,
+             "weight_decay": self.cfg.weight_decay, "name": "joint"},
         ]
 
 
@@ -299,7 +322,7 @@ class TypeVoteCloneState:
 
 
 __all__ = [
-    "ZeroInitAdapter", "ZeroInitMLP",
+    "ZeroInitAdapter", "SmallInitMLP",
     "encode_joint_init", "encode_delta_phi_init", "init_alpha_m_from_M_attn",
     "StageDLearnable", "TypeVoteCloneState",
 ]

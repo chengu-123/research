@@ -165,6 +165,8 @@ class CandidateScore:
     arc_balance: float = 0.0
     radius_stability: float = 0.0
     axis_stability: float = 0.0
+    axis_prior: float = 1.0
+    axis_prior_confidence: float = 0.0
 
 
 def reverse_align_and_score(
@@ -363,11 +365,15 @@ def freeart3d_axis_invariant(
             weights.append(float(min(Vi.shape[0], Vj.shape[0]) ** 0.5))
 
     if not diffs:
+        for V in V_per_state_world:
+            if V is not None:
+                zero = torch.zeros(3, device=V.device, dtype=V.dtype)
+                return zero, zero
         zero = torch.zeros(3)
         return zero, zero
 
     D = torch.stack(diffs, dim=0)              # (M, 3)
-    W = torch.tensor(weights, dtype=D.dtype).unsqueeze(-1)   # (M, 1)
+    W = torch.tensor(weights, device=D.device, dtype=D.dtype).unsqueeze(-1)   # (M, 1)
     # Weighted sum of |proj| per cardinal axis
     abs_proj = (D.abs() * W).sum(dim=0) / W.sum()            # (3,)
     return abs_proj, abs_proj.clone()  # pris uses argmax, rev uses argmin -> same vector

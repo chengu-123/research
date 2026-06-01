@@ -26,13 +26,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 
-from .config import TRELLIS_OCC_RES
+from .config import STATE_INDICES, TRELLIS_OCC_RES
 
 # Optional plotly-based HTML viz. Import is guarded so the rest of viz.py
 # (PNG strips + metrics.json) still works in minimal environments.
@@ -62,15 +62,210 @@ def _frames_to_strip(frames_T3HW_01: torch.Tensor) -> np.ndarray:
     return strip
 
 
+def _mask_to_rgb_frame(mask_1HW: torch.Tensor) -> torch.Tensor:
+    if mask_1HW.ndim != 3 or mask_1HW.shape[0] != 1:
+        raise ValueError(f"expected [1, H, W], got {tuple(mask_1HW.shape)}")
+    return mask_1HW.detach().float().clamp(0.0, 1.0).expand(3, -1, -1)
+
+
+def save_motion_ownership_debug(
+    out_root: str,
+    iter_idx: int,
+    move_sil_K1HW: torch.Tensor,
+    dynamic_mask_1HW: torch.Tensor,
+    static_mask_1HW: torch.Tensor,
+    ref_first_3HW: torch.Tensor,
+    ref_last_3HW: torch.Tensor,
+) -> None:
+    """Save endpoint ownership masks used by the motion-ownership loss."""
+    snap_dir = os.path.join(out_root, "viz", f"iter_{iter_idx:06d}")
+    os.makedirs(snap_dir, exist_ok=True)
+    if move_sil_K1HW.ndim != 4 or move_sil_K1HW.shape[1] != 1:
+        raise ValueError(f"expected [K, 1, H, W], got {tuple(move_sil_K1HW.shape)}")
+    move_rgb = move_sil_K1HW.detach().float().clamp(0.0, 1.0).expand(-1, 3, -1, -1)
+    frames = torch.cat(
+        [
+            ref_first_3HW.detach().float().clamp(0.0, 1.0).unsqueeze(0),
+            ref_last_3HW.detach().float().clamp(0.0, 1.0).unsqueeze(0),
+            _mask_to_rgb_frame(dynamic_mask_1HW).unsqueeze(0),
+            _mask_to_rgb_frame(static_mask_1HW).unsqueeze(0),
+            move_rgb,
+        ],
+        dim=0,
+    )
+    Image.fromarray(_frames_to_strip(frames)).save(
+        os.path.join(snap_dir, "motion_ownership_debug.png")
+    )
+    np.savez_compressed(
+        os.path.join(snap_dir, "motion_ownership_masks.npz"),
+        move_sil=move_sil_K1HW.detach().cpu().float().numpy(),
+        dynamic=dynamic_mask_1HW.detach().cpu().float().numpy(),
+        static=static_mask_1HW.detach().cpu().float().numpy(),
+    )
+
+
+def _foreground_bbox(frame_3HW_01: torch.Tensor, thresh: float = 1.0e-3) -> Optional[Tuple[int, int, int, int]]:
+    mask = frame_3HW_01.detach().float().abs().sum(dim=0) > float(thresh)
+    if not bool(mask.any().item()):
+        return None
+    ys, xs = torch.where(mask)
+    return (
+        int(xs.min().item()),
+        int(ys.min().item()),
+        int(xs.max().item()) + 1,
+        int(ys.max().item()) + 1,
+    )
+
+
+def _bbox_hw(bbox: Optional[Tuple[int, int, int, int]]) -> Tuple[int, int]:
+    if bbox is None:
+        return (0, 0)
+    return (int(bbox[3] - bbox[1]), int(bbox[2] - bbox[0]))
+
+
+def save_initial_render_contract_diagnostics(
+    out_root: str,
+    canonical_3HW_01: torch.Tensor,
+    support_3HW_01: torch.Tensor,
+    initial_warp_frame0_3HW_01: torch.Tensor,
+    s0_pure_3HW_01: torch.Tensor,
+    sc_pure_3HW_01: Optional[torch.Tensor] = None,
+    canonical_state_idx: int = 0,
+) -> Dict[str, object]:
+    """Save initial camera/render contract diagnostics before optimization."""
+    snap_dir = os.path.join(out_root, "viz")
+    os.makedirs(snap_dir, exist_ok=True)
+    target = s0_pure_3HW_01.to(device=canonical_3HW_01.device, dtype=canonical_3HW_01.dtype)
+    diff = (canonical_3HW_01 - target).abs().clamp(0.0, 0.25) * 4.0
+    strip = _frames_to_strip(torch.stack([
+        canonical_3HW_01,
+        support_3HW_01.to(device=canonical_3HW_01.device, dtype=canonical_3HW_01.dtype),
+        initial_warp_frame0_3HW_01.to(device=canonical_3HW_01.device, dtype=canonical_3HW_01.dtype),
+        target,
+        diff,
+    ], dim=0))
+    Image.fromarray(strip).save(os.path.join(snap_dir, "canonical_render_vs_s0_pure.png"))
+
+    b_can = _foreground_bbox(canonical_3HW_01)
+    b_sup = _foreground_bbox(support_3HW_01)
+    b_warp = _foreground_bbox(initial_warp_frame0_3HW_01)
+    b_tgt = _foreground_bbox(target)
+    h_can, w_can = _bbox_hw(b_can)
+    h_tgt, w_tgt = _bbox_hw(b_tgt)
+    metrics: Dict[str, object] = {
+        "canonical_bbox_xyxy": b_can,
+        "support_bbox_xyxy": b_sup,
+        "initial_warp_frame0_bbox_xyxy": b_warp,
+        "s0_pure_bbox_xyxy": b_tgt,
+        "canonical_bbox_hw": [h_can, w_can],
+        "s0_pure_bbox_hw": [h_tgt, w_tgt],
+        "canonical_to_target_height_ratio": (
+            float(h_can) / float(h_tgt) if h_tgt > 0 else None
+        ),
+        "canonical_to_target_width_ratio": (
+            float(w_can) / float(w_tgt) if w_tgt > 0 else None
+        ),
+        "mean_abs_diff_canonical_s0": float((canonical_3HW_01 - target).abs().mean().item()),
+    }
+    with open(os.path.join(snap_dir, "canonical_render_vs_s0_pure.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=True)
+
+    if sc_pure_3HW_01 is not None:
+        target_c = sc_pure_3HW_01.to(device=canonical_3HW_01.device, dtype=canonical_3HW_01.dtype)
+        diff_c = (canonical_3HW_01 - target_c).abs().clamp(0.0, 0.25) * 4.0
+        strip_c = _frames_to_strip(torch.stack([
+            canonical_3HW_01,
+            support_3HW_01.to(device=canonical_3HW_01.device, dtype=canonical_3HW_01.dtype),
+            target_c,
+            diff_c,
+        ], dim=0))
+        Image.fromarray(strip_c).save(os.path.join(snap_dir, "canonical_render_vs_sc_pure.png"))
+
+        b_tgt_c = _foreground_bbox(target_c)
+        h_tgt_c, w_tgt_c = _bbox_hw(b_tgt_c)
+        metrics_c: Dict[str, object] = {
+            "canonical_state_idx": int(canonical_state_idx),
+            "canonical_bbox_xyxy": b_can,
+            "support_bbox_xyxy": b_sup,
+            "sc_pure_bbox_xyxy": b_tgt_c,
+            "canonical_bbox_hw": [h_can, w_can],
+            "sc_pure_bbox_hw": [h_tgt_c, w_tgt_c],
+            "canonical_to_target_height_ratio": (
+                float(h_can) / float(h_tgt_c) if h_tgt_c > 0 else None
+            ),
+            "canonical_to_target_width_ratio": (
+                float(w_can) / float(w_tgt_c) if w_tgt_c > 0 else None
+            ),
+            "mean_abs_diff_canonical_sc": float((canonical_3HW_01 - target_c).abs().mean().item()),
+        }
+        with open(os.path.join(snap_dir, "canonical_render_vs_sc_pure.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics_c, f, indent=2, ensure_ascii=True)
+        metrics["canonical_vs_sc_pure"] = metrics_c
+    return metrics
+
+
+def _foreground_mean_rgb(frame_3HW_01: torch.Tensor, thresh: float = 1.0e-3) -> Optional[Tuple[float, float, float]]:
+    frame = frame_3HW_01.detach().float()
+    mask = frame.abs().sum(dim=0) > float(thresh)
+    if not bool(mask.any().item()):
+        return None
+    mean_rgb = frame[:, mask].mean(dim=1)
+    return (
+        float(mean_rgb[0].item()),
+        float(mean_rgb[1].item()),
+        float(mean_rgb[2].item()),
+    )
+
+
+def save_no_learning_gs_ablation(
+    out_root: str,
+    canonical_3HW_01: torch.Tensor,
+    support_3HW_01: torch.Tensor,
+    base_only_3HW_01: torch.Tensor,
+    move_only_3HW_01: torch.Tensor,
+    s0_pure_3HW_01: torch.Tensor,
+) -> Dict[str, object]:
+    """Save frozen-GS ablations that must not learn or overwrite texture."""
+    snap_dir = os.path.join(out_root, "viz")
+    os.makedirs(snap_dir, exist_ok=True)
+    device = canonical_3HW_01.device
+    dtype = canonical_3HW_01.dtype
+    target = s0_pure_3HW_01.to(device=device, dtype=dtype)
+    frames = torch.stack([
+        canonical_3HW_01,
+        support_3HW_01.to(device=device, dtype=dtype),
+        base_only_3HW_01.to(device=device, dtype=dtype),
+        move_only_3HW_01.to(device=device, dtype=dtype),
+        target,
+    ], dim=0)
+    Image.fromarray(_frames_to_strip(frames)).save(
+        os.path.join(snap_dir, "no_learning_gs_ablation.png")
+    )
+    names = ["canonical", "support", "base_only", "move_only", "s0_pure"]
+    metrics: Dict[str, object] = {}
+    for name, frame in zip(names, frames):
+        bbox = _foreground_bbox(frame)
+        h, w = _bbox_hw(bbox)
+        metrics[name] = {
+            "bbox_xyxy": bbox,
+            "bbox_hw": [h, w],
+            "foreground_mean_rgb": _foreground_mean_rgb(frame),
+        }
+    with open(os.path.join(snap_dir, "no_learning_gs_ablation.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=True)
+    return metrics
+
+
 def save_iter_snapshot(
     out_root: str,
     iter_idx: int,
     rgb_T3HW_01: torch.Tensor,
-    wan_target_T3HW_01: torch.Tensor,
+    pure_state_targets_K3HW_01: torch.Tensor,
     metrics: Dict[str, float],
     U_object: Optional[np.ndarray] = None,
     g_per_voxel: Optional[torch.Tensor] = None,
     m_per_voxel: Optional[torch.Tensor] = None,
+    base_anchor_per_voxel: Optional[torch.Tensor] = None,
 ) -> None:
     """Write the iter ``it`` snapshot under ``<out_root>/viz/iter_{it:06d}/``.
 
@@ -89,24 +284,33 @@ def save_iter_snapshot(
     # Frame strips
     if rgb_T3HW_01 is not None:
         rendered = _frames_to_strip(rgb_T3HW_01)
+        Image.fromarray(rendered).save(os.path.join(snap_dir, "dense_render_21.png"))
         Image.fromarray(rendered).save(os.path.join(snap_dir, "rendered.png"))
-    if wan_target_T3HW_01 is not None:
-        target = _frames_to_strip(wan_target_T3HW_01)
-        Image.fromarray(target).save(os.path.join(snap_dir, "target.png"))
-
-    if rgb_T3HW_01 is not None and wan_target_T3HW_01 is not None:
-        diff = (rgb_T3HW_01 - wan_target_T3HW_01).abs().clamp(0.0, 0.25) * 4.0
+    if rgb_T3HW_01 is not None and pure_state_targets_K3HW_01 is not None:
+        state_idx = torch.tensor(STATE_INDICES, device=rgb_T3HW_01.device, dtype=torch.long)
+        six_render = rgb_T3HW_01.index_select(0, state_idx)
+        target = pure_state_targets_K3HW_01.to(device=six_render.device, dtype=six_render.dtype)
+        Image.fromarray(_frames_to_strip(six_render)).save(os.path.join(snap_dir, "six_render.png"))
+        Image.fromarray(_frames_to_strip(target)).save(os.path.join(snap_dir, "six_target.png"))
+        diff = (six_render - target).abs().clamp(0.0, 0.25) * 4.0
         Image.fromarray(_frames_to_strip(diff)).save(
-            os.path.join(snap_dir, "diff.png")
+            os.path.join(snap_dir, "six_diff.png")
         )
 
     # Gate arrays (for offline HTML voxel viz)
     if U_object is not None and g_per_voxel is not None and m_per_voxel is not None:
+        arrays = {
+            "U_object": U_object,
+            "g": g_per_voxel.detach().cpu().float().numpy(),
+            "m": m_per_voxel.detach().cpu().float().numpy(),
+        }
+        if base_anchor_per_voxel is not None:
+            arrays["base_anchor"] = (
+                base_anchor_per_voxel.detach().cpu().bool().numpy()
+            )
         np.savez_compressed(
             os.path.join(snap_dir, "gates.npz"),
-            U_object=U_object,
-            g=g_per_voxel.detach().cpu().float().numpy(),
-            m=m_per_voxel.detach().cpu().float().numpy(),
+            **arrays,
         )
 
 
@@ -284,7 +488,7 @@ def save_phi_curve_html(
 def save_p1_final_summary(
     out_root: str,
     final_rgb_T3HW_01: torch.Tensor,
-    wan_target_T3HW_01: torch.Tensor,
+    pure_state_targets_K3HW_01: torch.Tensor,
     U_object_np: np.ndarray,
     g_per_voxel_np: np.ndarray,
     m_per_voxel_np: np.ndarray,
@@ -297,8 +501,10 @@ def save_p1_final_summary(
     """Write end-of-P1 deliverables under ``<out_root>/viz/p1_final/``.
 
     Files:
-        final_rendered.png       21-frame strip of final P1 render
-        final_diff.png           pixel difference vs Wan target (x4 contrast)
+        dense_render_21.png      21-frame strip of final P1 render
+        six_render.png           selected states [0,4,8,12,16,20]
+        six_target.png           six pure observed states
+        six_diff.png             pixel difference vs six pure targets
         final_base_move.html     committed base/move 3D viz
         final_axis.html          committed joint axis viz
         summary.json             dict of (committed_type, losses, IoU, ...)
@@ -308,15 +514,20 @@ def save_p1_final_summary(
 
     # Final RGB strips.
     Image.fromarray(_frames_to_strip(final_rgb_T3HW_01)).save(
+        os.path.join(snap_dir, "dense_render_21.png")
+    )
+    Image.fromarray(_frames_to_strip(final_rgb_T3HW_01)).save(
         os.path.join(snap_dir, "final_rendered.png")
     )
-    Image.fromarray(_frames_to_strip(wan_target_T3HW_01)).save(
-        os.path.join(snap_dir, "final_target.png")
-    )
-    diff = (final_rgb_T3HW_01 - wan_target_T3HW_01).abs().clamp(0.0, 0.25) * 4.0
-    Image.fromarray(_frames_to_strip(diff)).save(
-        os.path.join(snap_dir, "final_diff.png")
-    )
+    state_idx = torch.tensor(STATE_INDICES, device=final_rgb_T3HW_01.device, dtype=torch.long)
+    six_render = final_rgb_T3HW_01.index_select(0, state_idx)
+    six_target = pure_state_targets_K3HW_01.to(device=six_render.device, dtype=six_render.dtype)
+    Image.fromarray(_frames_to_strip(six_render)).save(os.path.join(snap_dir, "six_render.png"))
+    Image.fromarray(_frames_to_strip(six_target)).save(os.path.join(snap_dir, "six_target.png"))
+    diff = (six_render - six_target).abs().clamp(0.0, 0.25) * 4.0
+    Image.fromarray(_frames_to_strip(diff)).save(os.path.join(snap_dir, "six_diff.png"))
+    Image.fromarray(_frames_to_strip(diff)).save(os.path.join(snap_dir, "final_diff.png"))
+    Image.fromarray(_frames_to_strip(six_target)).save(os.path.join(snap_dir, "final_target.png"))
 
     # 3D state HTMLs (reuse save_3d_state_html by writing to a different dir).
     if _VOXEL_VIZ_OK:
@@ -490,7 +701,10 @@ def save_loss_curves_html(
 
 __all__ = [
     "save_iter_snapshot", "save_phi_curve",
+    "save_motion_ownership_debug",
     "save_3d_state_html", "save_phi_curve_html",
+    "save_initial_render_contract_diagnostics",
+    "save_no_learning_gs_ablation",
     "save_p1_final_summary",
     "save_loss_curves_html",
 ]

@@ -91,6 +91,13 @@ class StageAResult:
     artifact_paths: list = field(default_factory=list)
 
 
+def _composite_rgba_on_white(image: Image.Image) -> Image.Image:
+    """Composite transparent pixels on white before feeding RGB-only video models."""
+    rgba = image.convert("RGBA")
+    white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(white, rgba).convert("RGB")
+
+
 def _coerce_input_image(image: Union[Image.Image, np.ndarray, torch.Tensor]) -> Image.Image:
     """Coerce the user's input into RGB PIL without changing aspect or size."""
     if isinstance(image, Image.Image):
@@ -118,7 +125,7 @@ def _coerce_input_image(image: Union[Image.Image, np.ndarray, torch.Tensor]) -> 
         raise TypeError(f"unsupported image type {type(image)!r}")
 
     if pil.mode == "RGBA":
-        pil = pil.convert("RGB")
+        pil = _composite_rgba_on_white(pil)
     elif pil.mode != "RGB":
         pil = pil.convert("RGB")
 

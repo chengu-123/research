@@ -115,10 +115,12 @@ def extract_anchors(
     M_motion_corridor_64: Optional[torch.Tensor],   # (64, 64, 64) float, optional
     O_base_canonical: Optional[torch.Tensor],       # (64, 64, 64) uint8/bool, optional
     P_base_canonical: Optional[torch.Tensor],       # (64, 64, 64) float, optional fallback
+    move_union_voxel: Optional[torch.Tensor],       # (N, 3) int cleaned move evidence
     is_carpet_mask_flat: torch.Tensor,              # (res^3,) bool
     corridor_threshold: float = 0.1,
     base_threshold: float = 0.5,
     dilate_radius: int = 1,
+    near_move_radius: int = 3,
     target_count: int = 48,                          # v3: ignored (no FPS subsample)
     min_count: int = 8,
     res: int = 64,
@@ -139,7 +141,53 @@ def extract_anchors(
     anchors_object : (N_a, 3) int32 voxel coords, N_a == min(target_count, candidates_after_dilate)
     diag           : dict with intermediate counts for viz / sanity
     """
-    if M_motion_corridor_64 is None:
+    if O_base_canonical is not None:
+        base_mask_for_contact = O_base_canonical > 0
+    elif P_base_canonical is not None:
+        base_mask_for_contact = P_base_canonical > base_threshold
+    else:
+        base_mask_for_contact = None
+
+    cand_mask = None
+    diag = {}
+    if (
+        move_union_voxel is not None
+        and move_union_voxel.shape[0] > 0
+        and base_mask_for_contact is not None
+    ):
+        move_grid = torch.zeros(res, res, res, device=move_union_voxel.device, dtype=torch.bool)
+        coords = move_union_voxel.to(device=move_grid.device, dtype=torch.long)
+        coords = coords[
+            (coords[:, 0] >= 0) & (coords[:, 0] < res)
+            & (coords[:, 1] >= 0) & (coords[:, 1] < res)
+            & (coords[:, 2] >= 0) & (coords[:, 2] < res)
+        ]
+        move_grid[coords[:, 0], coords[:, 1], coords[:, 2]] = True
+        near_move = torch.nn.functional.max_pool3d(
+            move_grid.unsqueeze(0).unsqueeze(0).float(),
+            kernel_size=2 * near_move_radius + 1,
+            stride=1,
+            padding=near_move_radius,
+        ).squeeze(0).squeeze(0) > 0.5
+        base_float = base_mask_for_contact.float()
+        avg = torch.nn.functional.avg_pool3d(
+            base_float.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1,
+        ).squeeze(0).squeeze(0)
+        base_surface = (avg > 0.1) & (avg < 0.9) & base_mask_for_contact
+        local_contact = base_surface & near_move
+        if int(local_contact.sum().item()) >= min_count:
+            cand_mask = local_contact
+            diag = {
+                "source": "local_base_move_contact",
+                "move_union_count": int(coords.shape[0]),
+                "base_count": int(base_mask_for_contact.sum().item()),
+                "candidates_pre_dilate": int(cand_mask.sum().item()),
+            }
+            if M_motion_corridor_64 is not None:
+                corridor_mask = M_motion_corridor_64 > corridor_threshold
+                diag["corridor_count"] = int(corridor_mask.sum().item())
+
+    if cand_mask is None and M_motion_corridor_64 is None:
         # Without motion corridor we cannot do v3.3.6 anchor extraction.
         # Fall back to: just use O_base_canonical boundary voxels.
         if O_base_canonical is None:
@@ -159,7 +207,7 @@ def extract_anchors(
             "source": "base_boundary_fallback",
             "candidates_pre_dilate": int(cand_mask.sum().item()),
         }
-    else:
+    elif cand_mask is None:
         # v3.3.6 normal path: M_motion_corridor_64 > thr AND base voxel
         corridor_mask = M_motion_corridor_64 > corridor_threshold
         if O_base_canonical is not None:

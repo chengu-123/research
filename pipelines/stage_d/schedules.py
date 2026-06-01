@@ -287,14 +287,16 @@ def schedule_w_rfsds_weights(f_global: float, cfg: StageDConfig
     """
     phase = phase_of(f_global, cfg)
     if phase == "warmup_g_minus":
-        return 0.0, 0.0, 0.0
-    if phase == "warmup_g0":
-        return 1.0, 0.0, 0.0
-    if phase in ("main_g1a", "main_g1b"):
-        return 1.0, 0.0, 0.0
-    if phase == "transition":
-        return 0.5, 0.0, 0.0
-    return 0.2, 0.0, 0.0    # post / handed off to Stage F
+        sds = 0.0
+    elif phase == "warmup_g0":
+        sds = 1.0
+    elif phase in ("main_g1a", "main_g1b"):
+        sds = 1.0
+    elif phase == "transition":
+        sds = 0.5
+    else:
+        sds = 0.2              # post / handed off to Stage F
+    return sds * float(cfg.lambda_sds_scale), 0.0, 0.0
 
 
 def schedule_lambda_shell(f_global: float, cfg: StageDConfig) -> float:
@@ -313,7 +315,7 @@ def schedule_lambda_shell(f_global: float, cfg: StageDConfig) -> float:
 
 
 def schedule_lambda_m_prior(f_global: float, cfg: StageDConfig) -> float:
-    """``L_m_prior`` weight: only nonzero in warmup_g0; decays to 0 by 30%."""
+    """``L_m_prior`` weight: warmup anchor, then optional weak main anchor."""
     if f_global < cfg.f_warmup_g_minus_end:
         return 0.0
     if f_global < cfg.f_warmup_g0_end:
@@ -321,8 +323,28 @@ def schedule_lambda_m_prior(f_global: float, cfg: StageDConfig) -> float:
     decay_end = cfg.f_warmup_g0_end + 0.20
     if f_global < decay_end:
         s = _phase_progress(f_global, cfg.f_warmup_g0_end, decay_end)
-        return _lerp(cfg.lambda_m_prior_warmup, 0.0, s)
-    return 0.0
+        return _lerp(cfg.lambda_m_prior_warmup, cfg.lambda_m_prior_main, s)
+    return cfg.lambda_m_prior_main
+
+
+def schedule_lambda_gate(f_global: float, cfg: StageDConfig) -> float:
+    """Delayed hardening for binary gates.
+
+    Early sharpening locks the STE gates before motion ownership has separated
+    move from base. Keep it off until ``gate_hardening_start_frac``, then ramp to
+    ``lambda_gate`` over ``gate_hardening_ramp_frac``.
+    """
+    start = float(cfg.gate_hardening_start_frac)
+    ramp = float(cfg.gate_hardening_ramp_frac)
+    target = float(cfg.lambda_gate)
+    if f_global < start:
+        return 0.0
+    if ramp <= 0.0:
+        return target
+    if f_global >= start + ramp:
+        return target
+    s = _phase_progress(f_global, start, start + ramp)
+    return _lerp(0.0, target, s)
 
 
 # =============================================================================
@@ -343,6 +365,7 @@ def schedule_snapshot(f_global: float, cfg: StageDConfig,
     l_sds, l_lat, l_rgb = schedule_w_rfsds_weights(f_global, cfg)
     l_shell = schedule_lambda_shell(f_global, cfg)
     l_m_prior = schedule_lambda_m_prior(f_global, cfg)
+    l_gate = schedule_lambda_gate(f_global, cfg)
     return {
         "phase": phase,
         "f_global": f_global,
@@ -351,6 +374,7 @@ def schedule_snapshot(f_global: float, cfg: StageDConfig,
         "lambda_sup": l_sup, "lambda_part": l_part, "lambda_joint": l_joint,
         "lambda_sds": l_sds, "lambda_lat": l_lat, "lambda_rgb": l_rgb,
         "lambda_shell": l_shell, "lambda_m_prior": l_m_prior,
+        "lambda_gate": l_gate,
     }
 
 
@@ -360,6 +384,6 @@ __all__ = [
     "schedule_cfg", "sample_t_ss",
     "schedule_gate_temperature",
     "schedule_head_lambdas", "schedule_w_rfsds_weights",
-    "schedule_lambda_shell", "schedule_lambda_m_prior",
+    "schedule_lambda_shell", "schedule_lambda_m_prior", "schedule_lambda_gate",
     "schedule_snapshot",
 ]

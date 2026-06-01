@@ -64,6 +64,7 @@ import torch
 from omegaconf import OmegaConf
 
 from pipelines.recon import build_trellis_pipeline
+from pipelines.stage_b_sampler import attach_stage_b_sampler
 from pipelines.stage_b_scar import run_scar
 from pipelines.utils.seeding import seed_everything
 from pipelines.utils.state_input import (
@@ -137,76 +138,13 @@ def _build_sampler(pipe, cfg, args, total_steps: int) -> str:
     The sampler name is returned so that downstream config blocks can be
     selected (e.g. 'scar' uses cfg.scar; 'vgcf' uses cfg.vgcf).
     """
-    from trellis.pipelines.samplers import (
-        SCARSampler, BCACSampler, VGCFSampler, generate_alpha_schedule,
+    return attach_stage_b_sampler(
+        pipe=pipe,
+        cfg=cfg,
+        total_steps=total_steps,
+        force_sampler=args.force_sampler,
+        mix_space=args.mix_space,
     )
-
-    sampler_choice = (
-        args.force_sampler
-        if args.force_sampler is not None
-        else str(cfg.get("stage_b", {}).get("sampler", "scar")).lower()
-    )
-    sigma_min = pipe.sparse_structure_sampler.sigma_min
-
-    if sampler_choice == "scar":
-        scar_cfg = cfg.get("scar", {})
-        if "alpha_schedule" in scar_cfg and scar_cfg["alpha_schedule"] is not None:
-            alpha_schedule = tuple(scar_cfg["alpha_schedule"])
-        else:
-            alpha_schedule = tuple(generate_alpha_schedule(
-                peak=float(scar_cfg.get("alpha_peak", 0.0)),
-                total_steps=total_steps,
-                decay=str(scar_cfg.get("alpha_decay", "quadratic")),
-            ))
-        mix_space = (
-            args.mix_space
-            if args.mix_space is not None
-            else str(scar_cfg.get("mix_space", "x_0"))
-        )
-        pipe.sparse_structure_sampler = SCARSampler(
-            sigma_min=sigma_min,
-            alpha_schedule=alpha_schedule,
-            active_fraction=float(scar_cfg.get("active_fraction", 0.1)),
-            tau_percentile=float(scar_cfg.get("tau_percentile", 0.65)),
-            eps_log=float(scar_cfg.get("eps_log", 1.0e-6)),
-            eta=float(scar_cfg.get("eta", 0.5)),
-            mix_steps=int(scar_cfg.get("mix_steps", 8)),
-            mix_weights=tuple(scar_cfg.get("mix_weights", [0.3, 0.4, 0.3])),
-            extreme_mix_mode=str(scar_cfg.get("extreme_mix_mode", "symmetric")),
-            w_floor=float(scar_cfg.get("w_floor", 0.0)),
-            scar_enabled=True,
-            mix_space=mix_space,
-        )
-    elif sampler_choice == "bcac":
-        bcac_cfg = cfg.get("bcac", {})
-        pipe.sparse_structure_sampler = BCACSampler(
-            sigma_min=sigma_min,
-            block_start=int(bcac_cfg.get("block_start", 4)),
-            block_end=int(bcac_cfg.get("block_end", 9)),
-            t_full=float(bcac_cfg.get("t_full", 0.7)),
-            t_release=float(bcac_cfg.get("t_release", 0.3)),
-            alpha_max=float(bcac_cfg.get("alpha_max", 1.0)),
-            tau_percentile=float(bcac_cfg.get("tau_percentile", 0.65)),
-            active_fraction=float(bcac_cfg.get("active_fraction", 0.8)),
-            eps_log=float(bcac_cfg.get("eps_log", 1e-6)),
-            eta=float(bcac_cfg.get("eta", 0.5)),
-        )
-    elif sampler_choice == "vgcf":
-        vgcf_cfg = cfg.get("vgcf", {})
-        pipe.sparse_structure_sampler = VGCFSampler(
-            sigma_min=sigma_min,
-            lambda_max=float(vgcf_cfg.get("lambda_max", 1.0)),
-            t_stop=float(vgcf_cfg.get("t_stop", 0.2)),
-            eta=float(vgcf_cfg.get("eta", 0.5)),
-            vgcf_enabled=bool(vgcf_cfg.get("enabled", True)),
-            active_fraction=float(vgcf_cfg.get("active_fraction", 0.8)),
-            tau_percentile=float(vgcf_cfg.get("tau_percentile", 0.65)),
-            eps_log=float(vgcf_cfg.get("eps_log", 1.0e-6)),
-            lambda_schedule=str(vgcf_cfg.get("lambda_schedule", "warmup")),
-        )
-    else:
-        raise ValueError(f"unknown sampler: {sampler_choice!r}")
-    return sampler_choice
 
 
 def _build_sdedit_cfg(cfg, args) -> Dict[str, Any]:

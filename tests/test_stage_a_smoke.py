@@ -72,6 +72,22 @@ def test_stage_a_preserves_input_aspect_ratio_for_square_images():
     assert _predict_wan_output_hw((pil.height, pil.width), max_area) == (624, 624)
 
 
+def test_stage_a_composites_rgba_input_on_white():
+    from pipelines.stage_a_wan import _coerce_input_image
+
+    arr = np.zeros((2, 2, 4), dtype=np.uint8)
+    arr[:, :, :3] = 197
+    arr[:, :, 3] = 0
+    arr[0, 0] = [10, 20, 30, 255]
+    image = Image.fromarray(arr, mode="RGBA")
+
+    pil = _coerce_input_image(image)
+    out = np.array(pil)
+    assert pil.mode == "RGB"
+    assert out[1, 1].tolist() == [255, 255, 255]
+    assert out[0, 0].tolist() == [10, 20, 30]
+
+
 def test_stage_a_shape_check_uses_predicted_wan_output_shape():
     import torch
 

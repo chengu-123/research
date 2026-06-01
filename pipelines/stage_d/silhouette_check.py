@@ -240,7 +240,7 @@ def periodic_silhouette_check(
     cfg_n_states: int,
     sample_state_indices: Sequence[int],
     rendered_T3HW_01: torch.Tensor,
-    wan_video_target_T3HW_01: torch.Tensor,
+    pure_state_targets_K3HW_01: torch.Tensor,
 ) -> Optional[SilhouetteCheckReport]:
     """Run the silhouette IoU check; return None unless this iter is on cadence.
 
@@ -257,9 +257,8 @@ def periodic_silhouette_check(
     rendered_T3HW_01 : Tensor [F, 3, H, W] in [0, 1]
         Current iter's rendered video (no_grad needed; caller may pass
         ``rgb_T3HW.detach()``).
-    wan_video_target_T3HW_01 : Tensor [F, 3, H, W] in [0, 1]
-        From Bootstrap; ``[F, 3, H, W]`` after permute from the stored
-        ``[3, F, H, W]`` uint8 buffer.
+    pure_state_targets_K3HW_01 : Tensor [K, 3, H, W] in [0, 1]
+        Six observed no-background states from Bootstrap.
 
     Returns
     -------
@@ -278,16 +277,21 @@ def periodic_silhouette_check(
             f"rendered must have F={F_FRAMES} frames; "
             f"got {rendered_T3HW_01.shape[0]}"
         )
-    if wan_video_target_T3HW_01.shape[0] != F_FRAMES:
+    if pure_state_targets_K3HW_01.ndim != 4 or pure_state_targets_K3HW_01.shape[1] != 3:
         raise ValueError(
-            f"target must have F={F_FRAMES} frames; "
-            f"got {wan_video_target_T3HW_01.shape[0]}"
+            f"pure_state_targets_K3HW_01 must be [K, 3, H, W]; "
+            f"got {tuple(pure_state_targets_K3HW_01.shape)}"
         )
 
     per_state_iou: List[float] = []
     for idx in sample_state_indices:
+        if idx not in STATE_INDICES:
+            raise ValueError(
+                f"silhouette check frame {idx} is not one of STATE_INDICES={STATE_INDICES}"
+            )
+        k = STATE_INDICES.index(int(idx))
         sil_pred = silhouette_from_rgb(rendered_T3HW_01[idx:idx + 1])
-        sil_target = silhouette_from_rgb(wan_video_target_T3HW_01[idx:idx + 1])
+        sil_target = silhouette_from_rgb(pure_state_targets_K3HW_01[k:k + 1])
         iou = silhouette_iou(sil_pred, sil_target)
         per_state_iou.append(iou)
 
@@ -339,16 +343,20 @@ def periodic_silhouette_check(
 def default_check_state_indices(cfg_n_states: int) -> List[int]:
     """Pick ``cfg_n_states`` evenly-spaced indices over ``F_FRAMES`` frames.
 
-    For ``cfg_n_states = 4``: returns ``[0, 7, 14, 20]`` (frames 0, 7, 14,
-    20 from the 21-frame sequence). Endpoints always included so we check
+    For ``cfg_n_states = 4``: returns four entries sampled from
+    ``STATE_INDICES``. Endpoints always included so we check
     both closed (frame 0) and most-open (frame 20) state alignments.
     """
     if cfg_n_states < 2:
         raise ValueError(f"cfg_n_states must be >= 2, got {cfg_n_states}")
     if cfg_n_states == 2:
         return [0, F_FRAMES - 1]
-    # endpoints + evenly distributed interior points
-    interior = np.linspace(0, F_FRAMES - 1, cfg_n_states, dtype=int).tolist()
+    if cfg_n_states > len(STATE_INDICES):
+        raise ValueError(
+            f"cfg_n_states must be <= {len(STATE_INDICES)}, got {cfg_n_states}"
+        )
+    positions = np.linspace(0, len(STATE_INDICES) - 1, cfg_n_states, dtype=int).tolist()
+    interior = [int(STATE_INDICES[pos]) for pos in positions]
     # de-dupe while preserving order
     seen = set()
     out: List[int] = []

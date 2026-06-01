@@ -595,9 +595,10 @@ def _candidate_centers_np(
     for coords in state_sets:
         if coords.size:
             move_union[coords[:, 0], coords[:, 1], coords[:, 2]] = True
-    near_move = _binary_dilation_np(move_union, radius=2)
+    near_move = _binary_dilation_np(move_union, radius=3)
     contact = _base_surface_np(base) & near_move
-    contact |= base & _binary_dilation_np(corridor > 0.08, radius=1)
+    if int(contact.sum()) == 0 and corridor.size:
+        contact = base & _binary_dilation_np(corridor > 0.12, radius=1) & near_move
     d0, d1 = _plane_dims(axis_dim)
     coords = np.argwhere(contact)
     if coords.size == 0:
@@ -650,6 +651,39 @@ def _candidate_centers_np(
         centers.append((a, b, val))
         used.append((int(a), int(b)))
     return centers
+
+
+def _axis_prior_from_geom_np(
+    scores: np.ndarray,
+    axis_dim: int,
+    mode: str,
+) -> Tuple[float, float]:
+    arr = np.asarray(scores, dtype=np.float64)
+    if arr.shape[0] != 3 or not np.isfinite(arr).all():
+        return 1.0, 0.0
+
+    span = float(arr.max() - arr.min())
+    if span < 1e-8:
+        return 1.0, 0.0
+
+    if mode == "revolute":
+        order = np.argsort(arr)
+        best = float(arr[order[0]])
+        second = float(arr[order[1]])
+        diff = float(arr[axis_dim] - best)
+    elif mode == "prismatic":
+        order = np.argsort(-arr)
+        best = float(arr[order[0]])
+        second = float(arr[order[1]])
+        diff = float(best - arr[axis_dim])
+    else:
+        raise ValueError(f"mode must be prismatic or revolute, got {mode!r}")
+
+    separation = max(second - best, 0.0)
+    confidence = float(np.clip(separation / max(0.35 * span, 1e-8), 0.0, 1.0))
+    scale = max(0.35 * span, 1e-3)
+    prior = float(np.exp(-max(diff, 0.0) / scale))
+    return prior, confidence
 
 
 def _component_boundary_support(comp: _Component, center: np.ndarray, d0: int, d1: int) -> float:
@@ -798,6 +832,8 @@ def _score_revolute_specs(
     corridor: np.ndarray,
     axis_dim: int,
     res: int,
+    axis_prior: float = 1.0,
+    axis_prior_confidence: float = 0.0,
     top_n_centers: int = 160,
 ) -> List[_RevoluteSpec]:
     d0, d1 = _plane_dims(axis_dim)
@@ -867,6 +903,8 @@ def _score_revolute_specs(
             + 0.10 * hinge_support
             + 0.08 * base_support
         )
+        prior_w = 0.18 * float(np.clip(axis_prior_confidence, 0.0, 1.0))
+        score = (1.0 - prior_w) * score + prior_w * float(axis_prior)
         phi_angle = angle_arr - angle_arr[0]
         out.append(
             _RevoluteSpec(
@@ -1032,12 +1070,20 @@ def detect_joint_type_v3(
         res=res,
     )
 
+    pris_geom_np = pris_geom.detach().cpu().numpy().astype(np.float64)
+    rev_geom_np = rev_geom.detach().cpu().numpy().astype(np.float64)
+
     for spec in _score_prismatic_specs(clean_state_sets, res=res):
         axis = _axis_tensor(spec.axis_dim, spec.sign, device, dtype)
         phi_pris = torch.from_numpy(spec.phi_world).to(device=device, dtype=dtype)
         advance_score = min(max(spec.advance, 0.0) / max(abs(spec.advance), 8.0), 1.0)
+        axis_prior, axis_prior_conf = _axis_prior_from_geom_np(
+            pris_geom_np, spec.axis_dim, mode="prismatic",
+        )
+        prior_w = 0.12 * axis_prior_conf
+        score = (1.0 - prior_w) * float(spec.score) + prior_w * float(axis_prior)
         score_pris = CandidateScore(
-            score=float(spec.score),
+            score=float(score),
             consistency=float(spec.perp_iou),
             conflict=float(max(0.0, 1.0 - spec.compactness)),
             coverage=float(advance_score),
@@ -1046,6 +1092,8 @@ def detect_joint_type_v3(
             valid_states_used=n_valid,
             radius_stability=float(spec.bbox_stability),
             axis_stability=float(spec.bbox_stability),
+            axis_prior=float(axis_prior),
+            axis_prior_confidence=float(axis_prior_conf),
         )
         c_pris = CandidateResult(
             type_str="prismatic", axis=axis, origin=swept_centroid.clone(),
@@ -1055,6 +1103,9 @@ def detect_joint_type_v3(
         all_candidates.append(c_pris)
 
     for axis_dim in range(3):
+        rev_axis_prior, rev_axis_prior_conf = _axis_prior_from_geom_np(
+            rev_geom_np, axis_dim, mode="revolute",
+        )
         for spec in _score_revolute_specs(
             base=base_np,
             state_sets=clean_state_sets,
@@ -1062,6 +1113,8 @@ def detect_joint_type_v3(
             corridor=corridor_np,
             axis_dim=axis_dim,
             res=res,
+            axis_prior=rev_axis_prior,
+            axis_prior_confidence=rev_axis_prior_conf,
             top_n_centers=160,
         ):
             phi_np = spec.phi_angle.astype(np.float64)
@@ -1085,6 +1138,8 @@ def detect_joint_type_v3(
                 arc_balance=float(spec.arc_balance),
                 radius_stability=float(spec.radius_stability),
                 axis_stability=float(spec.axis_stability),
+                axis_prior=float(rev_axis_prior),
+                axis_prior_confidence=float(rev_axis_prior_conf),
             )
             c_rev = CandidateResult(
                 type_str="revolute", axis=axis, origin=origin,
@@ -1102,6 +1157,13 @@ def detect_joint_type_v3(
     s_pris = max(best_pris.score.score, eps)
     s_rev = max(best_rev.score.score, eps)
     type_logit = float(math.log(s_pris / s_rev))
+    prismatic_edge_evidence = (
+        best_pris.score.coverage
+        * best_pris.score.monotone_quality
+        * best_pris.score.axis_prior
+    )
+    if s_pris >= 0.94 * s_rev and prismatic_edge_evidence > 0.75:
+        type_logit += 0.18 * min((prismatic_edge_evidence - 0.75) / 0.25, 1.0)
 
     if type_logit > type_margin:
         type_str = "prismatic"

@@ -41,7 +41,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--out_dir", required=True,
                    help="Destination directory for Stage D artifacts.")
     p.add_argument("--wan_ckpt_dir", required=True,
-                   help="Local Wan2.2-I2V-A14B checkpoint directory.")
+                   help="Local Wan checkpoint directory. Use Wan2.2-Fun-A14B-InP "
+                        "for the active Stage D contract.")
     p.add_argument("--device", default="cuda",
                    help="Torch device string. Default cuda.")
     p.add_argument("--device_id", type=int, default=0,

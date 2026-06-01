@@ -14,15 +14,16 @@
 # Usage:
 #   cd /path/to/mine
 #   sbatch bootstrap.sh outputs/30857 "A brown wooden desk. The right drawer slides open, smoothly and completely pulling outward. "
-#   BOOTSTRAP_INPUT_MODE=six_images IMAGE_DIR=~/hf_models/PartNet/30857 sbatch bootstrap.sh outputs/30857 "..."
+#   IMAGE_DIR=~/hf_models/PartNet/30857 sbatch bootstrap.sh outputs/30857 "..."
+#   BOOTSTRAP_INPUT_MODE=stagea_video sbatch bootstrap.sh outputs/30857 "..."
 #   PURE_IMAGE=~/hf_models/PartNet/30857/00_pure.png sbatch bootstrap.sh outputs/30857 "..."
 #   WAN_BACKEND=fun_inp PURE_END_IMAGE=~/hf_models/PartNet/30857/05_pure.png sbatch bootstrap.sh outputs/30857 "..."
 #
+# Six-image input:
+#   IMAGE_DIR/{00..05}_seg.png by default
+#
 # Stage A video input:
 #   outputs/30857/stage_a/wan_video_target_3FHW_uint8.pt
-#
-# Six-image input:
-#   IMAGE_DIR/rendering_joint_00_state_{00..05}.png by default
 #
 # Output:
 #   outputs/30857/bootstrap/
@@ -49,10 +50,13 @@ WAN_CKPT="${WAN_CKPT:-${HOME}/hf_models/Wan2.2-I2V-A14B}"
 TRELLIS_PRETRAINED="${TRELLIS_PRETRAINED:-${HOME}/hf_models/TRELLIS-image-large}"
 DEVICE="${DEVICE:-cuda}"
 DEVICE_ID="${DEVICE_ID:-0}"
-BOOTSTRAP_INPUT_MODE="${BOOTSTRAP_INPUT_MODE:-stagea_video}"
+BOOTSTRAP_INPUT_MODE="${BOOTSTRAP_INPUT_MODE:-six_images}"
 STAGEA_VIDEO="${STAGEA_VIDEO:-}"
 IMAGE_DIR="${IMAGE_DIR:-}"
-IMAGE_PATTERN="${IMAGE_PATTERN:-rendering_joint_00_state_{i:02d}.png}"
+IMAGE_PATTERN="${IMAGE_PATTERN:-}"
+if [[ -z "${IMAGE_PATTERN}" ]]; then
+  IMAGE_PATTERN="{i:02d}_seg.png"
+fi
 PURE_IMAGE="${PURE_IMAGE:-}"
 PURE_END_IMAGE="${PURE_END_IMAGE:-}"
 WAN_BACKEND="${WAN_BACKEND:-i2v}"
@@ -64,7 +68,12 @@ if [[ "${BOOTSTRAP_INPUT_MODE}" == "stagea_video" ]]; then
   fi
 elif [[ "${BOOTSTRAP_INPUT_MODE}" == "six_images" ]]; then
   if [[ -z "${IMAGE_DIR}" ]]; then
-    echo "ERROR: IMAGE_DIR is required when BOOTSTRAP_INPUT_MODE=six_images" >&2
+    RUN_ID="$(basename "${OUTPUT_ROOT}")"
+    IMAGE_DIR="${HOME}/hf_models/PartNet/${RUN_ID}"
+  fi
+  if [[ ! -d "${IMAGE_DIR}" ]]; then
+    echo "ERROR: IMAGE_DIR not found for six-image bootstrap: ${IMAGE_DIR}" >&2
+    echo "Set IMAGE_DIR to the folder containing 00_seg.png ... 05_seg.png." >&2
     exit 2
   fi
   INPUT_ARGS+=(--image_dir "${IMAGE_DIR}" --image_pattern "${IMAGE_PATTERN}")

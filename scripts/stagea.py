@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ---- required ----
-    p.add_argument("--backend", default="i2v", choices=["i2v", "fun_inp"],
+    p.add_argument("--backend", default="fun_inp", choices=["i2v", "fun_inp"],
                    help="Stage A backend. i2v uses Wan2.2-I2V-A14B; fun_inp "
                         "uses Wan2.2-Fun-A14B-InP with start/end images.")
     p.add_argument("--image", required=True,

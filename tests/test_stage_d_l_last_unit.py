@@ -1,8 +1,4 @@
-"""Unit tests for Stage D final-frame anchoring.
-
-The LPIPS package is not required for these tests; a tiny zero module keeps the
-test focused on frame selection and aggregation.
-"""
+"""Unit tests for Stage D final-frame geometry anchoring."""
 
 import os
 import sys
@@ -28,6 +24,7 @@ if "lpips" not in sys.modules:
 from pipelines.stage_d.losses import (
     LossInputs,
     aggregate_loss,
+    loss_six_state_recon,
     loss_last_frame_anchor,
 )
 
@@ -40,19 +37,23 @@ class ZeroLPIPS(torch.nn.Module):
 def test_loss_last_frame_anchor_uses_final_frame_only():
     rgb = torch.zeros(5, 3, 4, 4)
     rgb[0] = 1.0
-    rgb[-1] = 0.25
-    target_last = torch.ones(3, 4, 4)
+    rgb[-1, :, 1:3, 1:3] = 1.0
+    target_last = torch.zeros(3, 4, 4)
+    target_last[:, 1:3, 1:3] = 1.0
 
     loss = loss_last_frame_anchor(rgb, target_last, ZeroLPIPS())
 
-    assert torch.isclose(loss, torch.tensor(0.75))
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1.0e-6)
 
 
 def test_aggregate_loss_adds_l_last_when_target_is_present():
-    rgb = torch.zeros(5, 3, 4, 4)
-    rgb[-1] = 0.5
+    rgb = torch.zeros(21, 3, 4, 4)
+    rgb[-1, :, 1:3, 1:3] = 1.0
     s0 = torch.zeros(3, 4, 4)
-    s5 = torch.ones(3, 4, 4)
+    s5 = torch.zeros(3, 4, 4)
+    s5[:, 0:2, 0:2] = 1.0
+    pure_states = torch.zeros(6, 3, 4, 4)
+    pure_states[-1] = 1.0
     dummy_vec = torch.zeros(1)
 
     inp = LossInputs(
@@ -63,7 +64,7 @@ def test_aggregate_loss_adds_l_last_when_target_is_present():
         origin=torch.zeros(3),
         Delta_z_s=torch.zeros(1),
         alpha_m=dummy_vec,
-        wan_video_target_T3HW_01=rgb.detach(),
+        pure_state_targets_K3HW_01=pure_states,
         s_0_pure_3HW_01=s0,
         s_5_pure_3HW_01=s5,
         z_wan_target=torch.zeros(1, 1, 1, 1),
@@ -89,5 +90,23 @@ def test_aggregate_loss_adds_l_last_when_target_is_present():
         sched_lambda_m_prior=0.0,
     )
 
-    assert torch.isclose(torch.tensor(log["L_last"]), torch.tensor(0.5))
-    assert torch.isclose(total, torch.tensor(1.0))
+    expected = loss_last_frame_anchor(rgb, s5, ZeroLPIPS())
+    assert torch.isclose(torch.tensor(log["L_last"]), expected.detach())
+    assert torch.isclose(total, 2.0 * expected.detach())
+
+
+def test_loss_six_state_recon_uses_selected_frames_only():
+    rgb = torch.zeros(21, 3, 2, 2)
+    rgb[1] = 1.0
+    rgb[4, :, 0, 0] = 1.0
+    pure_states = torch.zeros(6, 3, 2, 2)
+    pure_states[1, :, 0, 0] = 1.0
+
+    loss = loss_six_state_recon(
+        rgb,
+        pure_states,
+        ZeroLPIPS(),
+        silhouette_weight=0.0,
+    )
+
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1.0e-6)

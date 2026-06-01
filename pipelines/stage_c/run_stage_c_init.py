@@ -255,10 +255,12 @@ def run_stage_c_joint_init(
         M_motion_corridor_64=inputs.M_motion_corridor_64,
         O_base_canonical=inputs.O_base_canonical,
         P_base_canonical=inputs.P_base_canonical,
+        move_union_voxel=V_union,
         is_carpet_mask_flat=inputs.is_carpet_mask.to(device).flatten().bool(),
         corridor_threshold=float(cfg.anchor_corridor_threshold),
         base_threshold=float(cfg.anchor_base_threshold),
         dilate_radius=int(cfg.anchor_dilate_radius),
+        near_move_radius=int(cfg.anchor_near_move_radius),
         target_count=int(cfg.anchor_target_count),  # ignored in v3
         min_count=int(cfg.anchor_min_count),
         res=res,
@@ -352,6 +354,8 @@ def run_stage_c_joint_init(
             "coverage": float(primary_cand.score.coverage),
             "contact_compat": float(primary_cand.score.contact_compat),
             "monotone_quality": float(primary_cand.score.monotone_quality),
+            "axis_prior": float(primary_cand.score.axis_prior),
+            "axis_prior_confidence": float(primary_cand.score.axis_prior_confidence),
         },
     }
     if secondary_cand is not None:
@@ -362,6 +366,8 @@ def run_stage_c_joint_init(
             "coverage": float(secondary_cand.score.coverage),
             "contact_compat": float(secondary_cand.score.contact_compat),
             "monotone_quality": float(secondary_cand.score.monotone_quality),
+            "axis_prior": float(secondary_cand.score.axis_prior),
+            "axis_prior_confidence": float(secondary_cand.score.axis_prior_confidence),
         }
     # FreeArt3D-style geometric scores (diagnostic)
     if type_result.pris_geom_scores is not None:
@@ -471,7 +477,8 @@ def _save_v3_diagnostics(
             f"  {c.type_str:<10s} axis={axis_str}  "
             f"score={s.score:.3f}  consistency={s.consistency:.3f}  "
             f"conflict={s.conflict:.3f}  coverage={s.coverage:.3f}  "
-            f"contact={s.contact_compat:.3f}  monotone={s.monotone_quality:.3f}"
+            f"contact={s.contact_compat:.3f}  monotone={s.monotone_quality:.3f}  "
+            f"axis_prior={s.axis_prior:.3f}"
         )
     summary_lines.append("")
     summary_lines.append(f"--- FreeArt3D geom scores ---")

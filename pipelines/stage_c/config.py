@@ -22,7 +22,7 @@ class StageCConfig:
     soft_centroid_threshold: float = 0.1    # for P_move_evidence_per_state weighted centroid
 
     # ---- Joint type detection (joint_type_detect.py) ----------------------
-    type_decision_margin: float = 0.035     # abs log(best_pris / best_rev) threshold
+    type_decision_margin: float = 0.12      # abs log(best_pris / best_rev) threshold
                                             # below this, keep type uncertain but still emit both branches
     arc_min_states: int = 4                 # need >= 4 centroids to fit a circle reliably
     ransac_iters_line: int = 50             # RANSAC iterations for line fit
@@ -38,6 +38,7 @@ class StageCConfig:
     anchor_corridor_threshold: float = 0.1       # M_motion_corridor_64 > this
     anchor_base_threshold: float = 0.5           # O_base_canonical / P_base_canonical > this
     anchor_dilate_radius: int = 1                # voxel dilation after intersection
+    anchor_near_move_radius: int = 3             # local base surface must be near cleaned move
     anchor_target_count: int = 48                # FPS down-sample to this many
     anchor_min_count: int = 8                    # if fewer survive, expand corridor threshold
 

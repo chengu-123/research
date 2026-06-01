@@ -115,8 +115,10 @@ def run_type_vote(
         learnable, forward_single_pass, t_ss_grid, seed_grid,
     )
     mean_logit = float(sum(logits) / len(logits))
-    p = float(1.0 / (1.0 + pow(2.71828182845904523536, -mean_logit)))
-    # safer: use torch.sigmoid for numerical stability
+    # Numerically stable sigmoid. The naive 1/(1+exp(-x)) OVERFLOWS when a clean
+    # motion (e.g. the frozen-joint run) makes the type vote very confident ->
+    # huge |mean_logit|; that dead unsafe line (its result was overwritten just
+    # below) is removed.
     p_t = torch.sigmoid(torch.tensor(mean_logit, dtype=torch.float64))
     p = float(p_t.item())
     confidence = max(p, 1.0 - p)
@@ -193,7 +195,7 @@ def make_dual_clones(
     optimizer_factory : (learnable) -> Optimizer
         Used to instantiate the per-clone optimizer with the right param
         groups. Typically a closure ``lambda lr: torch.optim.AdamW(
-        lr.make_param_groups(), lr=cfg.lr_scalar, ...)``; see train.py.
+        lr.make_param_groups(), ...)``; see train.py.
     """
     # Deep copy weights + buffers but NOT references to frozen TRELLIS / Wan.
     learnable_rev = copy.deepcopy(learnable)

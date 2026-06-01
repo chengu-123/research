@@ -116,19 +116,56 @@ class StageDConfig:
     adapter_hidden_dim: int = 256        # zero-init MLP hidden dim
     adapter_blocks: Tuple[int, int, int] = (14, 16, 18)
     head_hidden_dim: int = 512
+    # Head output-projection init gain (xavier). 0.0 = zero-init: heads output 0,
+    # so d(head_out)/d(feat)=0 at init and the shared SS-DiT adapter starts starved.
+    # Keep this small and nonzero so the adapter receives task gradient through
+    # H_sup/H_part/H_joint from the first active head phase.
+    head_out_init_gain: float = 0.1
     # Feature dim at each voxel: 3 * 1024 (block hidden) + 3*2*F (Fourier PE) + 1 (occ logit)
     fourier_num_freqs: int = 6           # ★ S4 fix: feat_dim is derived from this
 
     # ---- Optimizer ----
     lr_adapter:  float = 1.0e-3
     lr_head:     float = 1.0e-3
-    lr_scalar:   float = 5.0e-4
+    lr_scalar:   float = 5.0e-4          # Delta_z_s only
+    lr_gate:     float = 1.0e-3          # alpha_g / alpha_m
+    lr_joint:    float = 1.0e-4          # psi_param / delta_phi
     weight_decay: float = 0.0
     grad_clip_norm: float = 1.0
+    # Freeze the revolute HINGE (psi axis[0:3] + origin[3:6]) at the Stage-C
+    # geometric init by zeroing its grad each step; SDS then refines only
+    # range (psi[7]) + gates. Diagnosis: the axis DIRECTION already converges to
+    # GT and range ~= 90, but the pivot drifts under high-variance video-SDS ->
+    # wrong door arc + axis jitter. Pinning the hinge geometrically (codex-rec)
+    # fixes both. type_logit[6] + range[7] + disp[8] stay free.
+    freeze_joint_hinge: bool = False
+    # Also pin the rotation RANGE (theta = psi[7]) at the Stage-C geometric
+    # estimate. With ONLY the hinge frozen, the free SDS + H_joint range residual
+    # blows theta up (90 -> 128 deg by iter 120, job 5822) -> the video-SDS is a
+    # poor estimator for EVERY kinematic DoF. Freeze range too; SDS refines only
+    # the gates (segmentation). The Stage-C closed->open angle is the geometric
+    # range (= GT 90 for 7201).
+    freeze_joint_range: bool = False
+    # Freeze ONLY the axis DIRECTION (psi[0:3]) at the Stage-C geometric init,
+    # leaving origin (psi[3:6]) + range (psi[7]) + qpos (delta_phi) + gates
+    # trainable. This is the FreeArt3D practice (opt_dir=False): the hinge axis
+    # direction comes from the reliable geometric init and is NOT optimized by
+    # the high-variance video-SDS, which otherwise drags a correct-but-low-
+    # confidence axis off toward diagonals (7201: Stage-C axis sub_confidence
+    # =0.13 but its value [1,0,0] == GT; free-joint run 5851 wandered the axis to
+    # [0.7-0.97, 0.2-0.58, *] and theta to 115deg). Unlike freeze_joint_hinge
+    # (which also pins origin), this leaves the pivot free. The forward detaches
+    # psi[0:3] AND drops the H_joint residual there via psi_for_warp[0:3].detach().
+    freeze_joint_axis_only: bool = False
 
     # ---- W-RFSDS Wan ----
-    wan_backend: str = "i2v"              # "i2v" or "fun_inp"
+    wan_backend: str = "fun_inp"          # "fun_inp" is the active Stage D contract
+    render_contract_only: bool = False    # diagnostics only; no Wan load or optimization
     fun_inp_config_path: Optional[str] = None
+    wan_expert_mode: str = "both"         # "both" or "low_only"; low_only is for smoke runs
+    wan_offload_dit: bool = False
+    wan_teacher_device_id: int = -1       # dual-GPU: put Wan experts+T5 on cuda:{id}; -1 = same GPU as student
+    wan_sds_resolution_hw: Optional[List[int]] = None
 
     # CFG schedule (CHORD A.1: 25 -> 12 linear decay over training).
     cfg_warmup_g0: float = 25.0
@@ -162,23 +199,86 @@ class StageDConfig:
     T_m_warmup: float = 1.5
     T_m_main_end: float = 0.6
     T_m_transition_end: float = 0.2
+    alpha_g_init_logit: float = 3.0
 
     # ---- Loss weights (phase-gated; see schedules.py) ----
-    lambda_first: float = 1.0           # frame 0 anchor to no-carpet s_0_pure
-    lambda_last: float = 1.0            # frame F-1 anchor to no-carpet s_5_pure
+    # Pixel anchors are RE-ENABLED. Targets are now per-state TRELLIS
+    # keyframe-model renders (M0 closed / M5 open) rendered from the same camera
+    # as StageD's recon -> same TRELLIS frame/scale/texture, so the
+    # silhouette+luminance-edge anchor measures pure articulation error (valid),
+    # unlike real-GT which injected a size mismatch.
+    lambda_first: float = 0.1           # frame 0 anchor to keyframe-render M0 (closed)
+    lambda_last: float = 0.1            # frame F-1 anchor to keyframe-render M5 (open)
     lambda_contact: float = 0.2         # axis-through-anchor band
     lambda_gate: float = 0.05           # rounds g, m to {0, 1}
     lambda_shell_main: float = 0.02     # shell sparsity (D-v3.14)
     lambda_z: float = 1.0e-3            # Delta_z_s L2 stability
     lambda_m_prior_warmup: float = 0.5  # BCE(alpha_m, M_attn_boot) in warmup_g0
+    lambda_m_prior_main: float = 0.0    # optional weak Stage-B move-prior anchor after warmup
     # lambda_sds, lambda_lat, lambda_rgb come from schedules.schedule_w_rfsds_weights
+    # Global multiplier on the scheduled W-RFSDS (SDS) weight. The single-view
+    # video-SDS PREFERS a static render (collapsing the move set to empty), because
+    # opening the door reveals interior the frozen canonical recon renders poorly.
+    # The endpoint anchors (L_first/L_last) must out-vote that pull; scaling the SDS
+    # down gives the reliable geometric anchors authority. 1.0 = unscaled.
+    lambda_sds_scale: float = 1.0
+    # Motion ownership from the first/last keyframe luminance difference. This
+    # supervises WHICH pixels must be rendered by the move branch, instead of
+    # only asking the final composite image to match the endpoints.
+    lambda_move_cover: float = 0.0
+    lambda_move_suppress: float = 0.0
+    # Anti-collapse move-mass floor is disabled. It keeps mass alive but does not
+    # identify the correct part, and previous runs showed it can preserve a wrong
+    # ownership solution.
+    lambda_move_floor: float = 0.0
+    move_floor_frac: float = 0.08
+    lambda_move_ceiling: float = 0.0
+    move_ceiling_frac: float = 0.20
+    # Visible-base anchor: six axis-aligned first-hit rays over the Stage-B
+    # base_move_preview split. A ray anchors only when its first hit is preview
+    # base; if move wins the first hit, that ray contributes no base anchor.
+    # These voxels are hard-clamped to m=0 in Stage D, leaving all non-anchor
+    # base/move ownership trainable.
+    base_anchor_enable: bool = False
+    base_anchor_logit: float = -20.0
+    base_anchor_preview_dir: Optional[str] = None
+    base_anchor_preview_base_thresh: float = 0.3
+    base_anchor_preview_move_thresh: float = 0.3
+    gate_hardening_start_frac: float = 0.45
+    gate_hardening_ramp_frac: float = 0.15
 
     # ---- Lambda ramps (sup / part / joint heads) ----
     lambda_sup_max:   float = 0.3
-    lambda_part_max:  float = 0.3
+    lambda_part_max:  float = 0.6
     lambda_joint_max: float = 0.5
+    # Head gate-logit residual bound: H_*_out = bound * tanh(pre). The move logit is
+    # b = alpha_m + lambda_part * H_part_out, so the head can move b by at most
+    # +-(bound * lambda_part). The bootstrap seeds alpha_m[rod] ~= +1.9 (mislabeled
+    # move); to let the head flip it to base (b < 0) the head must reach < -1.9, so
+    # bound * lambda_part_max must exceed ~1.9. With bound=4, lambda_part_max=0.6 the
+    # head authority is +-2.4 -> enough to overturn the wrong prior. (Was 2.0 x 0.3 =
+    # +-0.6, far too weak; the rod could never flip.)
+    head_logit_residual_bound: float = 4.0
+    # L2 on the pre-tanh head pre-activations. This keeps tanh from saturating
+    # into a frozen +/-bound residual, which otherwise kills gradients to both
+    # head weights and the upstream SS-DiT adapters.
+    lambda_head_leash: float = 1.0e-2
+    head_saturation_abs: float = 4.0
+    require_live_head_adapter_grads: bool = False
+    live_grad_check_start_frac: float = 0.12
+    live_grad_min_norm: float = 1.0e-12
+
+    # ---- Multi-view supervision (keyframe-render anchors) ----
+    mv_enable: bool = True
+    mv_canonical_ratio: float = 0.5      # P(use canonical camera) per iter; rest are random
+    mv_azi_min_deg: float = -37.5        # random-view azimuth lower bound (deg)
+    mv_azi_max_deg: float = 52.5         # random-view azimuth upper bound (deg)
+    mv_ele_min_deg: float = 30.0
+    mv_ele_max_deg: float = 60.0
+    mv_seed: int = 0                     # dedicated RNG seed for camera sampling
 
     # ---- Stage C.5 periodic silhouette check (S1) ----
+    iter0_camera_iou_threshold: float = 0.4
     silhouette_check_every: int = 0     # disabled unless a no-carpet video target exists
     silhouette_iou_threshold: float = 0.85
     silhouette_n_states: int = 4        # how many states to check (subsampled from K)
@@ -191,6 +291,14 @@ class StageDConfig:
     # If confidence < threshold: clone learnable into rev/pri branches, run each
     # for (f_main_g1b_end - f_main_g1a_end) * total_iters / 2 more iters, then
     # commit the lower-final-loss branch.
+    # Commit the joint TYPE from iter 0 (skip the blend render AND the iter-500
+    # vote) when Stage C is already confident. While committed_type is None the
+    # renderer blends revolute+prismatic by sigmoid(type_logit); 7201 psi_0 has
+    # type_logit=-0.229 (-> 44% prismatic) despite type_confidence=0.955, so
+    # iter 0-500 render a revolute/prismatic DOUBLE-WARP phantom. Set to the
+    # Stage-C joint_type ("revolute"/"prismatic") to render a single committed
+    # branch from the start. None = keep the vote-at-iter-500 behavior.
+    force_committed_type: Optional[str] = None
 
     # ---- D_GS forward dtype ----
     use_fp16_autocast: bool = True      # SS-DiT, D_GS forward under autocast

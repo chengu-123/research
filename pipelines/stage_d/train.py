@@ -55,20 +55,32 @@ from .joint_ops import (
     weighted_feature_pool,
 )
 from .learnable import StageDLearnable
-from .losses import LossInputs, LPIPSModule, aggregate_loss
+from .losses import (
+    LossInputs,
+    LPIPSModule,
+    aggregate_loss,
+    dynamic_mask,
+    loss_motion_ownership,
+)
 from .render import (
     DGSWithParent,
     LockedCamera,
     RenderInputs,
+    StageDCameraConfig,
+    build_locked_camera,
+    render_move_silhouettes,
     render_21_with_warp,
+    render_static_gaussians,
+    sample_camera_for_iter,
 )
 from .schedules import (
     phase_of,
+    sample_tau_chord_anneal,
     sample_t_ss,
-    sample_tau_inverse_cdf_logitnormal,
     schedule_cfg,
     schedule_gate_temperature,
     schedule_head_lambdas,
+    schedule_lambda_gate,
     schedule_lambda_m_prior,
     schedule_lambda_shell,
     schedule_snapshot,
@@ -91,13 +103,20 @@ from .type_vote import (
 )
 from .viz import (
     save_3d_state_html,
+    save_initial_render_contract_diagnostics,
     save_iter_snapshot,
     save_loss_curves_html,
+    save_motion_ownership_debug,
+    save_no_learning_gs_ablation,
     save_p1_final_summary,
     save_phi_curve,
     save_phi_curve_html,
 )
-from .w_rfsds import WanRFSDSContext
+from .w_rfsds import (
+    WanRFSDSContext,
+    _prepare_fun_inp_rfsds_condition,
+    rebuild_fun_inp_y_for_keyframes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -114,8 +133,8 @@ class BootstrapBundle:
     Lifetimes:
       - ``z_s0`` and ``trellis_cond_can`` stay resident (cheap; SS-DiT cond).
       - ``z_slat0`` and ``U_object`` stay resident (drive D_GS every iter).
-      - ``M_attn_at_U`` / ``shell_mask`` / ``anchors_world`` / ``s_0_pure`` /
-        ``wan_video_target_T3HW_01`` / ``z_wan_target`` / ``wan_cond`` /
+      - ``M_attn_at_U`` / ``shell_mask`` / ``anchors_world`` /
+        ``pure_state_targets_K3HW_01`` / ``z_wan_target`` / ``wan_cond`` /
         ``slat_mean`` / ``slat_std`` stay resident (every iter).
       - ``dit_hidden_cache`` is diagnostic-only and dropped after loading
         (it was useful to past Stage C v8.1; Stage D learns adapters and
@@ -145,12 +164,14 @@ class BootstrapBundle:
 
     # BMCSA M_attn at U_object (for alpha_m init + L_m_prior)
     M_attn_at_U: torch.Tensor                 # [N_obj] in [0, 1]
+    base_anchor_at_U: torch.Tensor            # [N_obj] bool visible base forced to m=0
 
     # Conditioning + targets
     trellis_cond_can: torch.Tensor            # [1, N_dino, 1024]
     wan_cond: Dict[str, Any]                  # context / context_null / seq_len / y
     z_wan_target: torch.Tensor                # [16, F_lat, H_lat, W_lat]
     wan_video_target_T3HW_01: torch.Tensor    # [F, 3, H, W] in [0, 1]
+    pure_state_targets_K3HW_01: torch.Tensor  # [K, 3, H, W] in [0, 1]
     s_0_pure_3HW_01: torch.Tensor             # [3, H, W] in [0, 1]
     s_5_pure_3HW_01: Optional[torch.Tensor]   # [3, H, W] in [0, 1]
     frame_num: int
@@ -187,6 +208,48 @@ def _build_sparse_in(
     return sp.SparseTensor(feats=z_slat, coords=U_object_with_batch)
 
 
+def _apply_base_anchor_to_move_logits(
+    b: torch.Tensor,
+    bootstrap: BootstrapBundle,
+    cfg: StageDConfig,
+) -> torch.Tensor:
+    if not bool(cfg.base_anchor_enable):
+        return b
+    anchor = bootstrap.base_anchor_at_U.to(device=b.device, dtype=torch.bool)
+    return torch.where(anchor, b.new_full(b.shape, float(cfg.base_anchor_logit)), b)
+
+
+# =============================================================================
+# Helper: measure decoded canonical object bbox (FreeArt3D camera framing)
+# =============================================================================
+
+def measure_canonical_object_bbox(
+    trellis: TrellisModules,
+    bootstrap: BootstrapBundle,
+    device: torch.device,
+) -> Tuple[torch.Tensor, float]:
+    """Measure the decoded canonical object's world-space bounding box.
+
+    FreeArt3D's run_rendering (mine/pipelines/render.py:265-275) frames the
+    camera by the object: camera_distance = 2.1 * max(bbox extent), aimed at
+    the bbox center. The TRELLIS SLAT decodes geometry into only a SUBSET of
+    the [-0.5, 0.5]^3 box (true max_extent < 1, centroid offset from origin),
+    so Stage D must measure the actual decoded Gaussians instead of assuming a
+    unit box centered at the origin. Returns the bbox ``center`` ([3] world
+    space) and ``max_extent`` (largest bbox side length, world units).
+    """
+    d_gs_w = DGSWithParent(d_gs_frozen=trellis.d_gs).to(device)
+    sparse_in = _build_sparse_in(bootstrap.z_slat0, bootstrap.U_object_with_batch)
+    with torch.no_grad():
+        gauss, _parent_idx = d_gs_w(sparse_in)
+        xyz = gauss.get_xyz                       # [N, 3] world space, in [-0.5, 0.5]
+        min_corner = xyz.amin(dim=0)
+        max_corner = xyz.amax(dim=0)
+    center = 0.5 * (min_corner + max_corner)
+    max_extent = float((max_corner - min_corner).amax().item())
+    return center, max_extent
+
+
 # =============================================================================
 # One regular-phase forward (warmup_g0 / main_g1a / main_g1b / transition)
 # =============================================================================
@@ -204,7 +267,9 @@ def _regular_forward(
     committed_type: Optional[Literal["revolute", "prismatic"]],
     forced_type_logit: Optional[float] = None,
 ) -> Tuple[torch.Tensor, JointParams, torch.Tensor, torch.Tensor,
-           torch.Tensor, torch.Tensor, torch.Tensor]:
+           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           Dict[str, torch.Tensor], RenderInputs, RenderInputs,
+           torch.Tensor, torch.Tensor]:
     """Run one full forward for a non-warmup-G- phase.
 
     Returns
@@ -215,6 +280,12 @@ def _regular_forward(
     g_obj    : Tensor [N_obj]      (post-STE forward; binary-ish)
     m_obj    : Tensor [N_obj]
     u_shifted: Tensor [K=6]        (for diagnostics)
+    head_preact_l2 : Tensor scalar (mean square of the pre-tanh head outputs;
+                     add ``cfg.lambda_head_leash * head_preact_l2`` to the loss so
+                     the head pre-activation cannot run away and saturate tanh,
+                     which would sever the gradient to the shared SS-DiT adapter)
+    head_stats : dict of detached scalar tensors for saturation diagnostics
+    render_inputs, phi_rev, phi_pri : tensors reused by move-only ownership render
     """
     # ---- 1) z_s_base = z_s0 + Delta_z_s ----
     z_s_base = bootstrap.z_s0 + learnable.Delta_z_s.unsqueeze(0)
@@ -250,10 +321,28 @@ def _regular_forward(
 
     # ---- 6) Per-voxel gate logits ----
     lambda_sup, lambda_part, lambda_joint = schedule_head_lambdas(f_global, cfg)
-    H_sup_out = learnable.H_sup(feat).squeeze(-1)
-    H_part_out = learnable.H_part(feat).squeeze(-1)
-    r = occ_at_U + learnable.alpha_g + lambda_sup * H_sup_out
+    # Pre-tanh head pre-activations, squashed into the gate residual by
+    # bound * tanh(.). head_preact_l2 keeps the pre-activation away from hard
+    # tanh saturation so gradients can still reach the heads and adapters.
+    sup_pre = learnable.H_sup(feat).squeeze(-1)
+    part_pre = learnable.H_part(feat).squeeze(-1)
+    H_sup_out = cfg.head_logit_residual_bound * torch.tanh(sup_pre)
+    H_part_out = cfg.head_logit_residual_bound * torch.tanh(part_pre)
+    head_preact_l2 = sup_pre.pow(2).mean() + part_pre.pow(2).mean()
+    head_abs = torch.cat(
+        [sup_pre.detach().abs().reshape(-1), part_pre.detach().abs().reshape(-1)],
+        dim=0,
+    )
+    head_stats = {
+        "head_preact_abs_mean": head_abs.mean(),
+        "head_preact_abs_max": head_abs.max(),
+        "head_tanh_saturation_frac": (
+            head_abs > float(cfg.head_saturation_abs)
+        ).float().mean(),
+    }
+    r = learnable.alpha_g + lambda_sup * H_sup_out
     b = learnable.alpha_m + lambda_part * H_part_out
+    b = _apply_base_anchor_to_move_logits(b, bootstrap, cfg)
 
     # ---- 7) BinaryConcrete STE gates ----
     T_g, T_m = schedule_gate_temperature(f_global, cfg)
@@ -271,6 +360,35 @@ def _regular_forward(
         f_ramp_end=cfg.f_warmup_g0_end + 0.05,
     )
     psi_combined = psi_for_warp + lambda_joint * delta_psi
+    if cfg.freeze_joint_axis_only:
+        # Pin ONLY the axis direction psi[0:3] at the Stage-C init: take it from
+        # psi_for_warp DETACHED (no SDS grad) and drop the H_joint residual on
+        # those dims, so neither the video-SDS nor the joint head can rotate the
+        # hinge. origin[3:6] + type[6] + range[7] + disp[8] stay trainable (the
+        # pivot/range still optimize). FreeArt3D opt_dir=False. See config.py.
+        psi_combined = torch.cat(
+            [psi_for_warp[0:3].detach(), psi_combined[3:]], dim=0
+        )
+    if cfg.freeze_joint_hinge:
+        # Pin the revolute HINGE (axis[0:3] + origin[3:6]) at the Stage-C
+        # geometric init: take [0:6] from psi_for_warp DETACHED (no grad) and
+        # drop the H_joint residual there, so neither SDS-on-psi nor the joint
+        # head can drift the pivot. range/type/disp [6:9] still refine. This is
+        # the airtight channel-level freeze (grad-masking psi_param alone misses
+        # the lambda_joint * H_joint residual). Covers the main loop AND the
+        # dual-clone since both call _regular_forward.
+        psi_combined = torch.cat(
+            [psi_for_warp[0:6].detach(), psi_combined[6:]], dim=0
+        )
+    if cfg.freeze_joint_range:
+        # Also pin the rotation RANGE theta (psi[7]) at the Stage-C geometric
+        # estimate: with only the hinge frozen, the free SDS + H_joint range
+        # residual blows theta up (90 -> 128 deg by iter 120). type[6] + disp[8]
+        # stay from psi_combined (type committed by the vote; disp unused for
+        # revolute). SDS then refines only the gates.
+        psi_combined = torch.cat(
+            [psi_combined[0:7], psi_for_warp[7:8].detach(), psi_combined[8:]], dim=0
+        )
     # If we are inside a dual-clone branch the type_logit is forced.
     if forced_type_logit is not None:
         psi_combined = psi_combined.clone()
@@ -302,6 +420,15 @@ def _regular_forward(
         g_per_gauss=g_per_gauss,
         m_per_gauss=m_per_gauss,
     )
+    ownership_render_inputs = RenderInputs(
+        xyz_canon=gauss_can.get_xyz,
+        opacity_canon=gauss_can.get_opacity,
+        rot_canon=gauss_can.get_rotation,
+        scale_canon=gauss_can.get_scaling,
+        sh_canon=gauss_can._features_dc,
+        g_per_gauss=g_per_gauss,
+        m_per_gauss=m_soft[bootstrap.gaussian_parent_idx],
+    )
 
     # ---- 11) Render 21 frames ----
     type_soft = (torch.sigmoid(joint.type_logit) if committed_type is None
@@ -311,7 +438,10 @@ def _regular_forward(
         type_soft=type_soft, committed_type=committed_type, sh_degree=0,
     )
 
-    return rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted
+    return (
+        rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted, head_preact_l2,
+        head_stats, render_inputs, ownership_render_inputs, phi_rev, phi_pri,
+    )
 
 
 # =============================================================================
@@ -342,8 +472,9 @@ def _warmup_minus_forward(
     flat = U[:, 0] * TRELLIS_OCC_RES * TRELLIS_OCC_RES + U[:, 1] * TRELLIS_OCC_RES + U[:, 2]
     occ_at_U = occ_logits.view(-1).index_select(0, flat)   # [N_obj]
 
-    r = occ_at_U + learnable.alpha_g
+    r = learnable.alpha_g
     b = learnable.alpha_m
+    b = _apply_base_anchor_to_move_logits(b, bootstrap, cfg)
 
     T_g, T_m = schedule_gate_temperature(0.0, cfg)
     g_obj = binary_concrete_ste(r, T_g)
@@ -417,6 +548,193 @@ def build_optimizer(learnable: StageDLearnable, cfg: StageDConfig
     )
 
 
+def _optimizer_grad_diagnostics(
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    for group_idx, group in enumerate(optimizer.param_groups):
+        name = str(group.get("name", f"group{group_idx}"))
+        total_sq = 0.0
+        max_abs = 0.0
+        params_with_grad = 0
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            grad = param.grad.detach()
+            if grad.numel() == 0:
+                continue
+            params_with_grad += 1
+            grad_norm = torch.linalg.vector_norm(grad.float()).item()
+            total_sq += grad_norm * grad_norm
+            max_abs = max(max_abs, float(grad.abs().max().item()))
+        stats[f"grad_norm_{name}"] = total_sq ** 0.5
+        stats[f"grad_max_abs_{name}"] = max_abs
+        stats[f"grad_params_{name}"] = float(params_with_grad)
+    return stats
+
+
+# =============================================================================
+# Multi-view keyframe context + per-iter camera / target selection
+# =============================================================================
+
+@dataclass
+class MultiViewKeyframeContext:
+    """Everything the per-iter multi-view camera/anchor sampler needs.
+
+    Built once in ``train_stage_d_p1`` when multi-view is active and shared by
+    both the main loop and the dual-clone loop so they sample identical cameras
+    and re-condition Wan-Fun-InP the same way (sharp edge #1: the dual-clone path
+    must replicate the MV logic or main_g1b silently reverts to single-view +
+    real-GT).
+    """
+    m0: Any                                # state-0 (closed) TRELLIS Gaussian
+    m5: Any                                # state-5 (open)   TRELLIS Gaussian
+    object_center: Tuple[float, float, float]
+    object_scale: float
+    image_h: int
+    image_w: int
+    canonical_camera_cfg: StageDCameraConfig
+    canonical_locked_camera: LockedCamera
+    ref_first_canon: torch.Tensor          # [3, H, W] detached canonical M0 render
+    ref_last_canon: torch.Tensor           # [3, H, W] detached canonical M5 render
+    wan_cond_canonical: Dict[str, Any]     # prepared fun_inp cond for the canonical view
+    cam_rng: torch.Generator               # dedicated CPU rng (cfg.mv_seed)
+
+
+def _mv_camera_and_targets(
+    mv: MultiViewKeyframeContext,
+    cfg: StageDConfig,
+    wan_ctx: WanRFSDSContext,
+    device: torch.device,
+    force_canonical: bool,
+) -> Tuple[LockedCamera, torch.Tensor, torch.Tensor, Dict[str, Any], bool]:
+    """Pick this iter's camera + keyframe anchor targets + Wan condition.
+
+    Returns ``(locked_camera, ref_first, ref_last, wan_cond_iter, is_canonical)``.
+
+    * canonical draw (or ``force_canonical`` in warmup): reuse the pre-built
+      canonical camera, refs and Wan condition (no re-render, no cond rebuild).
+    * random draw: build a locked camera for the sampled view, render M0/M5 from
+      it (``.detach()`` -- the anchor target side of ``_pure_geometry_loss`` is NOT
+      detached internally, so a non-detached ref would leak grad into the frozen
+      keyframe Gaussians), and rebuild ONLY the Fun-InP ``y_guidance`` for the
+      new reference frames (reuses cached in_context + seq_len).
+    """
+    cam_cfg, is_canon = sample_camera_for_iter(
+        mv.cam_rng, cfg, mv.object_center, mv.object_scale,
+        mv.image_h, mv.image_w, mv.canonical_camera_cfg,
+    )
+    if force_canonical:
+        is_canon = True
+    if is_canon:
+        return (
+            mv.canonical_locked_camera,
+            mv.ref_first_canon,
+            mv.ref_last_canon,
+            mv.wan_cond_canonical,
+            True,
+        )
+    locked_cam = build_locked_camera(cam_cfg, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        ref_first = render_static_gaussians(
+            mv.m0.get_xyz, mv.m0.get_opacity, mv.m0.get_rotation,
+            mv.m0.get_scaling, mv.m0._features_dc, locked_cam,
+        ).detach()
+        ref_last = render_static_gaussians(
+            mv.m5.get_xyz, mv.m5.get_opacity, mv.m5.get_rotation,
+            mv.m5.get_scaling, mv.m5._features_dc, locked_cam,
+        ).detach()
+    wan_cond_iter = rebuild_fun_inp_y_for_keyframes(
+        mv.wan_cond_canonical, ref_first, ref_last, wan_ctx,
+    )
+    return locked_cam, ref_first, ref_last, wan_cond_iter, False
+
+
+def _build_wan_cond_canonical(
+    bootstrap: BootstrapBundle,
+    ref_first_canon: torch.Tensor,
+    ref_last_canon: torch.Tensor,
+    wan_ctx: WanRFSDSContext,
+) -> Dict[str, Any]:
+    """Prepare the canonical Fun-InP condition once (first/last = canonical refs).
+
+    Shallow-copies ``bootstrap.wan_cond``, swaps the first/last conditioning
+    frames to the canonical keyframe renders, drops any stale ``_prepared_backend``
+    marker, then runs the (one-time, T5-to-CPU) prepare. Subsequent random-view
+    iters reuse this via ``rebuild_fun_inp_y_for_keyframes`` (in_context + seq_len
+    are camera-independent).
+    """
+    wc = dict(bootstrap.wan_cond)
+    fv = wc["fun_video"].clone()
+    fv[:, :, 0] = ref_first_canon.to(device=fv.device, dtype=fv.dtype)
+    fv[:, :, -1] = ref_last_canon.to(device=fv.device, dtype=fv.dtype)
+    wc["fun_video"] = fv
+    wc.pop("_prepared_backend", None)
+    return _prepare_fun_inp_rfsds_condition(wc, wan_ctx)
+
+
+def _add_motion_ownership_loss(
+    *,
+    total_loss: torch.Tensor,
+    log: Dict[str, float],
+    cfg: StageDConfig,
+    render_inputs: RenderInputs,
+    joint: JointParams,
+    phi_rev: torch.Tensor,
+    phi_pri: torch.Tensor,
+    camera: LockedCamera,
+    ref_first_3HW: torch.Tensor,
+    ref_last_3HW: torch.Tensor,
+    committed_type: Optional[Literal["revolute", "prismatic"]],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if cfg.lambda_move_cover <= 0.0 and cfg.lambda_move_suppress <= 0.0:
+        log["L_move_cover"] = 0.0
+        log["L_move_suppress"] = 0.0
+        return total_loss, None, None, None
+    if committed_type is None:
+        raise RuntimeError(
+            "motion ownership requires a committed joint type; set "
+            "cfg.force_committed_type or enable it only after type commit"
+        )
+
+    move_sil = render_move_silhouettes(
+        render_inputs,
+        joint,
+        phi_rev,
+        phi_pri,
+        camera,
+        frame_indices=(0, F_FRAMES - 1),
+        committed_type=committed_type,
+        sh_degree=0,
+    )
+    L_cover, L_suppress = loss_motion_ownership(
+        move_sil,
+        ref_first_3HW,
+        ref_last_3HW,
+        dilate_px=4,
+        thresh=0.04,
+    )
+    total_loss = (
+        total_loss
+        + float(cfg.lambda_move_cover) * L_cover
+        + float(cfg.lambda_move_suppress) * L_suppress
+    )
+    log["L_move_cover"] = float(L_cover.detach().item())
+    log["L_move_suppress"] = float(L_suppress.detach().item())
+    log["L_total"] = float(total_loss.detach().item())
+
+    with torch.no_grad():
+        ref_first = ref_first_3HW.to(device=move_sil.device, dtype=move_sil.dtype)
+        ref_last = ref_last_3HW.to(device=move_sil.device, dtype=move_sil.dtype)
+        dyn = dynamic_mask(ref_first, ref_last, dilate_px=4, thresh=0.04)
+        fg = (
+            ref_first.abs().sum(dim=0, keepdim=True)
+            + ref_last.abs().sum(dim=0, keepdim=True)
+        ).clamp(0.0, 1.0)
+        static = fg * (1.0 - dyn)
+    return total_loss, move_sil.detach(), dyn.detach(), static.detach()
+
+
 # =============================================================================
 # Main training driver
 # =============================================================================
@@ -430,6 +748,13 @@ def train_stage_d_p1(
     cfg: StageDConfig,
     out_dir: str,
     device: torch.device,
+    keyframe_models: Optional[Dict[int, Any]] = None,
+    object_center: Optional[Tuple[float, float, float]] = None,
+    object_scale: Optional[float] = None,
+    canonical_camera_cfg: Optional[StageDCameraConfig] = None,
+    ref_first_canon: Optional[torch.Tensor] = None,
+    ref_last_canon: Optional[torch.Tensor] = None,
+    image_hw: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Run the full Stage D P1 schedule. Returns a summary dict.
 
@@ -441,6 +766,15 @@ def train_stage_d_p1(
         if committed: main_g1b runs single-branch
         else        : dual-clone, run two clones in alternation
       iter 0.65 .. 0.75 * total               transition      (slow W-RFSDS down)
+
+    Multi-view keyframe anchors (when ``cfg.mv_enable`` and ``keyframe_models``
+    is provided): each iter samples a camera (``cfg.mv_canonical_ratio`` chance
+    of the canonical view, else a random azimuth/elevation), renders the M0/M5
+    keyframe Gaussians from it as the first/last pixel-anchor targets, and
+    re-conditions Wan-Fun-InP on those reference frames. Warmup phases force the
+    canonical view (no SDS there; avoids jitter on the Delta_z_s anchor). When
+    the keyframe pieces are absent (single-view fallback) the loop keeps the
+    canonical camera and the bootstrap real-GT s_0/s_5/wan_cond targets.
     """
     os.makedirs(out_dir, exist_ok=True)
     logs_path = os.path.join(out_dir, "logs.jsonl")
@@ -466,15 +800,92 @@ def train_stage_d_p1(
     optimizer = build_optimizer(learnable, cfg)
 
     type_vote_iter = int(round(cfg.f_main_g1a_end * cfg.total_iters))
-    committed_type: Optional[Literal["revolute", "prismatic"]] = None
+    if cfg.force_committed_type is not None and cfg.force_committed_type not in (
+        "revolute", "prismatic"
+    ):
+        raise ValueError(
+            "cfg.force_committed_type must be None/'revolute'/'prismatic'; "
+            f"got {cfg.force_committed_type!r}"
+        )
+    # When force_committed_type is set, the type is committed from iter 0: the
+    # render uses a single branch (no revolute/prismatic blend phantom) and the
+    # `it == type_vote_iter and committed_type is None` guard skips the vote.
+    committed_type: Optional[Literal["revolute", "prismatic"]] = cfg.force_committed_type
     dual_clone: Optional[DualCloneState] = None
     silhouette_state_indices = default_check_state_indices(cfg.silhouette_n_states)
 
-    # Resolution-format target so we don't permute every iter.
+    # Dense Wan target is used only by W-RFSDS/latent supervision. Pixel
+    # reconstruction supervision is six-state pure target only.
     wan_target_T3HW = bootstrap.wan_video_target_T3HW_01     # [F, 3, H, W] in [0, 1]
+    pure_targets_K3HW = bootstrap.pure_state_targets_K3HW_01
     lambda_last_active = cfg.lambda_last if str(cfg.wan_backend) == "fun_inp" else 0.0
 
-    summary: Dict[str, Any] = {"committed_type": None, "n_iters_run": 0}
+    base_anchor_count = int(bootstrap.base_anchor_at_U.detach().sum().item())
+    base_anchor_frac = float(base_anchor_count) / float(max(1, bootstrap.n_obj))
+    summary: Dict[str, Any] = {
+        "committed_type": None,
+        "n_iters_run": 0,
+        "base_anchor_count": base_anchor_count,
+        "base_anchor_frac": base_anchor_frac,
+    }
+
+    # ------------------------------------------------------------------ #
+    # Multi-view keyframe context (built once; shared with dual-clone).   #
+    # Active only when cfg.mv_enable, keyframe_models are provided, and    #
+    # the Fun-InP Wan teacher is loaded (the keyframe condition rebuild    #
+    # is Fun-InP specific). Otherwise the loop falls back to single-view   #
+    # with the bootstrap real-GT anchors / condition.                     #
+    # ------------------------------------------------------------------ #
+    mv_ctx: Optional[MultiViewKeyframeContext] = None
+    mv_active = (
+        bool(getattr(cfg, "mv_enable", False))
+        and keyframe_models is not None
+        and wan_ctx is not None
+        and str(cfg.wan_backend) == "fun_inp"
+    )
+    if mv_active:
+        if (object_center is None or object_scale is None
+                or canonical_camera_cfg is None
+                or ref_first_canon is None or ref_last_canon is None
+                or image_hw is None):
+            raise ValueError(
+                "mv_enable=True requires object_center/object_scale/"
+                "canonical_camera_cfg/ref_first_canon/ref_last_canon/image_hw"
+            )
+        if 0 not in keyframe_models or 5 not in keyframe_models:
+            raise ValueError(
+                f"keyframe_models must contain states 0 and 5; got "
+                f"{sorted(keyframe_models.keys())}"
+            )
+        wan_cond_canonical = _build_wan_cond_canonical(
+            bootstrap, ref_first_canon, ref_last_canon, wan_ctx,
+        )
+        cam_rng = torch.Generator(device="cpu").manual_seed(int(cfg.mv_seed))
+        mv_ctx = MultiViewKeyframeContext(
+            m0=keyframe_models[0],
+            m5=keyframe_models[5],
+            object_center=tuple(float(c) for c in object_center),
+            object_scale=float(object_scale),
+            image_h=int(image_hw[0]),
+            image_w=int(image_hw[1]),
+            canonical_camera_cfg=canonical_camera_cfg,
+            canonical_locked_camera=camera,
+            ref_first_canon=ref_first_canon.detach(),
+            ref_last_canon=ref_last_canon.detach(),
+            wan_cond_canonical=wan_cond_canonical,
+            cam_rng=cam_rng,
+        )
+        logger.info(
+            "[stage_d] multi-view keyframe anchors ENABLED "
+            "(canonical_ratio=%.2f azi=[%.1f,%.1f] ele=[%.1f,%.1f] seed=%d)",
+            cfg.mv_canonical_ratio, cfg.mv_azi_min_deg, cfg.mv_azi_max_deg,
+            cfg.mv_ele_min_deg, cfg.mv_ele_max_deg, int(cfg.mv_seed),
+        )
+        summary["mv_enabled"] = True
+        summary["mv_canon_iters"] = 0
+        summary["mv_random_iters"] = 0
+    else:
+        summary["mv_enabled"] = False
 
     # ============================================================ #
     # Iter-0 camera sanity check (fail-loud on camera mismatch).    #
@@ -482,6 +893,7 @@ def train_stage_d_p1(
     # and compare its silhouette to Wan-canonical s_0. Mismatch ->  #
     # clear CameraMismatchError pointing at StageDCameraConfig.     #
     # ============================================================ #
+    os.makedirs(os.path.join(out_dir, "viz"), exist_ok=True)
     with torch.no_grad():
         rgb_T3HW_init, _joint_init, _r_init, _b_init, _g_init, _m_init = (
             _warmup_minus_forward(
@@ -489,17 +901,146 @@ def train_stage_d_p1(
                 d_gs_w=d_gs_w, bootstrap=bootstrap, camera=camera, cfg=cfg,
             )
         )
+        sparse_in_init = _build_sparse_in(bootstrap.z_slat0, bootstrap.U_object_with_batch)
+        gauss_init, parent_idx_init = d_gs_w(sparse_in_init)
+        canonical_rgb = render_static_gaussians(
+            gauss_init.get_xyz,
+            gauss_init.get_opacity,
+            gauss_init.get_rotation,
+            gauss_init.get_scaling,
+            gauss_init._features_dc,
+            camera,
+        )
+        support_rgb = render_static_gaussians(
+            gauss_init.get_xyz,
+            gauss_init.get_opacity,
+            gauss_init.get_rotation,
+            gauss_init.get_scaling,
+            gauss_init._features_dc,
+            camera,
+            opacity_scale=torch.sigmoid(learnable.alpha_g.detach())[parent_idx_init],
+        )
+        support_scale = torch.sigmoid(learnable.alpha_g.detach())[parent_idx_init]
+        move_scale = torch.sigmoid(learnable.alpha_m.detach())[parent_idx_init]
+        base_only_rgb = render_static_gaussians(
+            gauss_init.get_xyz,
+            gauss_init.get_opacity,
+            gauss_init.get_rotation,
+            gauss_init.get_scaling,
+            gauss_init._features_dc,
+            camera,
+            opacity_scale=support_scale * (1.0 - move_scale),
+        )
+        move_only_rgb = render_static_gaussians(
+            gauss_init.get_xyz,
+            gauss_init.get_opacity,
+            gauss_init.get_rotation,
+            gauss_init.get_scaling,
+            gauss_init._features_dc,
+            camera,
+            opacity_scale=support_scale * move_scale,
+        )
+        summary["no_learning_gs_ablation"] = save_no_learning_gs_ablation(
+            out_root=out_dir,
+            canonical_3HW_01=canonical_rgb,
+            support_3HW_01=support_rgb,
+            base_only_3HW_01=base_only_rgb,
+            move_only_3HW_01=move_only_rgb,
+            s0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
+        )
+        contract_metrics = save_initial_render_contract_diagnostics(
+            out_root=out_dir,
+            canonical_3HW_01=canonical_rgb,
+            support_3HW_01=support_rgb,
+            initial_warp_frame0_3HW_01=rgb_T3HW_init[0],
+            s0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
+            sc_pure_3HW_01=bootstrap.pure_state_targets_K3HW_01[CANONICAL_STATE_IDX],
+            canonical_state_idx=CANONICAL_STATE_IDX,
+        )
+        summary["initial_render_contract"] = contract_metrics
         iter0_iou = iter_0_camera_check(
             rendered_frame_0_3HW=rgb_T3HW_init[0],
             s_0_pure_3HW=bootstrap.s_0_pure_3HW_01,
-            iou_threshold=0.5,
+            iou_threshold=float(cfg.iter0_camera_iou_threshold),
             save_diag_to=os.path.join(out_dir, "viz", "iter_0_camera_diag.png"),
         )
         summary["iter_0_camera_iou"] = iter0_iou
         # Free init render before the real loop begins (cheap; ~34MB on 832x464x21).
         del rgb_T3HW_init
 
-    for it in range(cfg.total_iters):
+    if bool(cfg.render_contract_only):
+        summary["render_contract_only"] = True
+        logs_file.close()
+        return summary
+
+    p1_stop_iter = int(round(cfg.f_transition_end * cfg.total_iters))
+    if p1_stop_iter <= 0:
+        raise ValueError(
+            f"f_transition_end * total_iters must be positive, got "
+            f"{cfg.f_transition_end} * {cfg.total_iters}"
+        )
+
+    # ---- Iter-0 snapshot: pristine pre-optimization baseline for comparison ----
+    # The main loop's viz is guarded against phase warmup_g_minus, so it==0 never
+    # produced an iter_000000/. Mirror the loop's it==0 path EXACTLY:
+    # warmup_g_minus uses _warmup_minus_forward (NOT _regular_forward, which
+    # raises there since sample_t_ss returns None). At f_global=0 the head
+    # lambdas are 0, so this is the identical initial state the run starts from.
+    # Save/restore RNG around it so the snapshot does not perturb the training
+    # RNG stream (keeps the run comparable to a no-snapshot baseline).
+    _cpu_rng_state = torch.get_rng_state()
+    _cuda_rng_state = torch.cuda.get_rng_state_all()
+    with torch.no_grad():
+        rgb0_T3HW, joint0, r0, b0, _g0_obj, _m0_obj = _warmup_minus_forward(
+            learnable=learnable,
+            ss_vae_decoder=trellis.ss_vae_decoder,
+            d_gs_w=d_gs_w,
+            bootstrap=bootstrap,
+            camera=camera,
+            cfg=cfg,
+        )
+        u0_shifted = bootstrap.phi_0.to(device)
+        g0_soft = torch.sigmoid(r0).detach()
+        m0_soft = torch.sigmoid(b0).detach()
+        phi0_rev = (u0_shifted * joint0.theta_max).detach()
+        phi0_pri = (u0_shifted * joint0.disp_max).detach()
+        save_iter_snapshot(
+            out_dir, 0,
+            rgb_T3HW_01=rgb0_T3HW.detach(),
+            pure_state_targets_K3HW_01=pure_targets_K3HW,
+            metrics={"f_global": 0.0, "note": "iter0_pristine_pre_optimization"},
+            U_object=bootstrap.U_object.cpu().numpy(),
+            g_per_voxel=g0_soft,
+            m_per_voxel=m0_soft,
+        )
+        save_phi_curve(
+            out_dir, 0,
+            u_shifted=u0_shifted.detach(),
+            phi_rev=phi0_rev,
+            phi_pri=phi0_pri,
+        )
+        type0_str = ("prismatic" if joint0.type_logit.item() > 0.0
+                     else "revolute")
+        save_3d_state_html(
+            out_dir, 0,
+            U_object_np=bootstrap.U_object.cpu().numpy(),
+            g_per_voxel_np=g0_soft.cpu().numpy(),
+            m_per_voxel_np=m0_soft.cpu().numpy(),
+            joint_axis_world_np=joint0.axis.detach().cpu().numpy(),
+            joint_origin_world_np=joint0.origin.detach().cpu().numpy(),
+            joint_type=type0_str,
+        )
+        save_phi_curve_html(
+            out_dir, 0,
+            u_shifted_np=u0_shifted.detach().cpu().numpy(),
+            phi_rev_np=phi0_rev.cpu().numpy(),
+            phi_pri_np=phi0_pri.cpu().numpy(),
+            type_soft=float(torch.sigmoid(joint0.type_logit).item()),
+        )
+    torch.set_rng_state(_cpu_rng_state)
+    torch.cuda.set_rng_state_all(_cuda_rng_state)
+
+    for it in range(p1_stop_iter):
         consumed_until_marker = summary.get("_dual_clone_consumed_until")
         if consumed_until_marker is not None and it < int(consumed_until_marker):
             continue
@@ -507,21 +1048,53 @@ def train_stage_d_p1(
         f_global = it / max(1, cfg.total_iters - 1)
         phase = phase_of(f_global, cfg)
 
+        # ---- Multi-view: pick this iter's camera + keyframe anchor targets ----
+        # Warmup phases (warmup_g_minus / warmup_g0) force the canonical view:
+        # no SDS runs there, and jittering the camera would perturb the
+        # Delta_z_s anchor. Random views only kick in once the SDS path is live.
+        is_warmup_phase = phase in ("warmup_g_minus", "warmup_g0")
+        if mv_ctx is not None:
+            (cam_iter, ref_first_iter, ref_last_iter,
+             wan_cond_iter, is_canon) = _mv_camera_and_targets(
+                mv_ctx, cfg, wan_ctx, device, force_canonical=is_warmup_phase,
+            )
+            if is_canon:
+                summary["mv_canon_iters"] += 1
+            else:
+                summary["mv_random_iters"] += 1
+        else:
+            cam_iter = camera
+            ref_first_iter = bootstrap.s_0_pure_3HW_01
+            ref_last_iter = bootstrap.s_5_pure_3HW_01
+            wan_cond_iter = bootstrap.wan_cond
+            is_canon = True
+
         # ---- Forward ----
         if phase == "warmup_g_minus":
             rgb_T3HW, joint, r, b, g_obj, m_obj = _warmup_minus_forward(
                 learnable=learnable, ss_vae_decoder=trellis.ss_vae_decoder,
-                d_gs_w=d_gs_w, bootstrap=bootstrap, camera=camera, cfg=cfg,
+                d_gs_w=d_gs_w, bootstrap=bootstrap, camera=cam_iter, cfg=cfg,
             )
             u_shifted = bootstrap.phi_0.to(device)
+            # Warmup G- runs no heads / no SS-DiT, so there is no head pre-activation
+            # to leash (the adapter is intentionally inactive here).
+            head_preact_l2 = None
+            head_stats = None
+            render_inputs = None
+            ownership_render_inputs = None
+            phi_rev = None
+            phi_pri = None
         else:
-            rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted = _regular_forward(
+            (
+                rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted, head_preact_l2,
+                head_stats, render_inputs, ownership_render_inputs, phi_rev, phi_pri,
+            ) = _regular_forward(
                 learnable=learnable,
                 ss_dit_w=ss_dit_w,
                 ss_vae_decoder=trellis.ss_vae_decoder,
                 d_gs_w=d_gs_w,
                 bootstrap=bootstrap,
-                camera=camera,
+                camera=cam_iter,
                 f_global=f_global,
                 cfg=cfg,
                 committed_type=committed_type,
@@ -529,7 +1102,9 @@ def train_stage_d_p1(
 
         # ---- Loss schedule sample ----
         if phase != "warmup_g_minus":
-            tau = sample_tau_inverse_cdf_logitnormal(
+            tau = sample_tau_chord_anneal(
+                iter_idx=it,
+                total_iters=p1_stop_iter,
                 mean=cfg.tau_logit_normal_mean_p1,
                 std=cfg.tau_logit_normal_std_p1,
                 device=device,
@@ -547,14 +1122,14 @@ def train_stage_d_p1(
             axis=joint.axis, origin=joint.origin,
             Delta_z_s=learnable.Delta_z_s,
             alpha_m=learnable.alpha_m,
-            wan_video_target_T3HW_01=wan_target_T3HW,
-            s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
-            s_5_pure_3HW_01=bootstrap.s_5_pure_3HW_01,
+            pure_state_targets_K3HW_01=pure_targets_K3HW,
+            s_0_pure_3HW_01=ref_first_iter,
+            s_5_pure_3HW_01=ref_last_iter,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,
             m_attn_at_U=bootstrap.M_attn_at_U,
-            wan_cond=bootstrap.wan_cond,
+            wan_cond=wan_cond_iter,
             tau=tau,
             cfg_scale=cfg_scale,
         )
@@ -562,41 +1137,114 @@ def train_stage_d_p1(
         sched_lambdas = schedule_w_rfsds_weights(f_global, cfg)
         sched_lam_shell = schedule_lambda_shell(f_global, cfg)
         sched_lam_m_prior = schedule_lambda_m_prior(f_global, cfg)
+        sched_lam_gate = schedule_lambda_gate(f_global, cfg)
 
         total_loss, log = aggregate_loss(
             loss_inputs, wan_ctx, lpips_module,
             cfg_lambdas_first=cfg.lambda_first,
             cfg_lambdas_last=lambda_last_active,
             cfg_lambdas_contact=cfg.lambda_contact,
-            cfg_lambdas_gate=cfg.lambda_gate,
+            cfg_lambdas_gate=sched_lam_gate,
             cfg_lambdas_z=cfg.lambda_z,
             sched_lambdas_w_rfsds=sched_lambdas,
             sched_lambda_shell=sched_lam_shell,
             sched_lambda_m_prior=sched_lam_m_prior,
+            cfg_lambda_move_floor=cfg.lambda_move_floor,
+            move_floor_frac=cfg.move_floor_frac,
+            cfg_lambda_move_ceiling=cfg.lambda_move_ceiling,
+            move_ceiling_frac=cfg.move_ceiling_frac,
         )
+
+        ownership_move_sil = None
+        ownership_dyn = None
+        ownership_static = None
+        if phase != "warmup_g_minus":
+            if ownership_render_inputs is None or phi_rev is None or phi_pri is None:
+                raise RuntimeError("regular phase missing render inputs for ownership loss")
+            (
+                total_loss,
+                ownership_move_sil,
+                ownership_dyn,
+                ownership_static,
+            ) = _add_motion_ownership_loss(
+                total_loss=total_loss,
+                log=log,
+                cfg=cfg,
+                render_inputs=ownership_render_inputs,
+                joint=joint,
+                phi_rev=phi_rev,
+                phi_pri=phi_pri,
+                camera=cam_iter,
+                ref_first_3HW=ref_first_iter,
+                ref_last_3HW=ref_last_iter,
+                committed_type=committed_type,
+            )
+        else:
+            log["L_move_cover"] = 0.0
+            log["L_move_suppress"] = 0.0
+
+        # ---- Head pre-activation leash. ----
+        if head_preact_l2 is not None and cfg.lambda_head_leash > 0.0:
+            total_loss = total_loss + cfg.lambda_head_leash * head_preact_l2
+            log["L_head_leash"] = float(head_preact_l2.detach().item())
+        if head_stats is not None:
+            for key, value in head_stats.items():
+                log[key] = float(value.detach().item())
 
         # ---- Backward ----
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        grad_log = _optimizer_grad_diagnostics(optimizer)
+        if (
+            cfg.require_live_head_adapter_grads
+            and f_global >= float(cfg.live_grad_check_start_frac)
+            and (
+                grad_log.get("grad_norm_head", 0.0) <= float(cfg.live_grad_min_norm)
+                or grad_log.get("grad_norm_adapter", 0.0) <= float(cfg.live_grad_min_norm)
+            )
+        ):
+            raise RuntimeError(
+                "dead head/adapter gradient path: "
+                f"grad_norm_head={grad_log.get('grad_norm_head', 0.0):.3e}, "
+                f"grad_norm_adapter={grad_log.get('grad_norm_adapter', 0.0):.3e}, "
+                f"f_global={f_global:.3f}"
+            )
         if cfg.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
+            clip_total_norm = torch.nn.utils.clip_grad_norm_(
                 [p for grp in optimizer.param_groups for p in grp["params"]],
                 cfg.grad_clip_norm,
             )
+            grad_log["grad_clip_total_norm"] = float(clip_total_norm.detach().item())
         optimizer.step()
+        log.update(grad_log)
+        log["base_anchor_count"] = float(base_anchor_count)
+        log["base_anchor_frac"] = base_anchor_frac
+        if base_anchor_count > 0:
+            anchor_mask = bootstrap.base_anchor_at_U.to(device=b.device, dtype=torch.bool)
+            log["base_anchor_move_prob"] = float(
+                torch.sigmoid(b[anchor_mask]).detach().mean().item()
+            )
+        else:
+            log["base_anchor_move_prob"] = 0.0
 
         # ---- Periodic: log ----
         if it % cfg.log_every == 0:
             snap = schedule_snapshot(f_global, cfg)
             line = {
                 "it": it, "f_global": f_global, "tau": float(tau),
+                "mv_is_canon": bool(is_canon), "mv_active": bool(mv_ctx is not None),
+                "axis": joint.axis.detach().cpu().tolist(),
+                "origin": joint.origin.detach().cpu().tolist(),
+                "theta_max_deg": float(joint.theta_max.detach().cpu()) * 57.29578,
                 **snap, **log,
             }
             logs_file.write(json.dumps(line) + "\n")
             logs_file.flush()
             logger.info(
-                "[stage_d it=%d phase=%s tau=%.3f cfg=%.1f L_total=%.4f]",
-                it, phase, tau, cfg_scale, log["L_total"],
+                "[stage_d it=%d phase=%s is_canon=%s tau=%.3f cfg=%.1f L_total=%.4f "
+                "L_first=%.4f L_last=%.4f]",
+                it, phase, is_canon, tau, cfg_scale, log["L_total"],
+                log.get("L_first", 0.0), log.get("L_last", 0.0),
             )
 
         # ---- Periodic: viz ----
@@ -611,12 +1259,27 @@ def train_stage_d_p1(
                 save_iter_snapshot(
                     out_dir, it,
                     rgb_T3HW_01=rgb_T3HW.detach(),
-                    wan_target_T3HW_01=wan_target_T3HW,
+                    pure_state_targets_K3HW_01=pure_targets_K3HW,
                     metrics={"f_global": f_global, **log},
                     U_object=bootstrap.U_object.cpu().numpy(),
                     g_per_voxel=g_soft,
                     m_per_voxel=m_soft_viz,
+                    base_anchor_per_voxel=bootstrap.base_anchor_at_U,
                 )
+                if (
+                    ownership_move_sil is not None
+                    and ownership_dyn is not None
+                    and ownership_static is not None
+                ):
+                    save_motion_ownership_debug(
+                        out_dir,
+                        it,
+                        move_sil_K1HW=ownership_move_sil,
+                        dynamic_mask_1HW=ownership_dyn,
+                        static_mask_1HW=ownership_static,
+                        ref_first_3HW=ref_first_iter,
+                        ref_last_3HW=ref_last_iter,
+                    )
                 # 2) phi npz (raw)
                 save_phi_curve(
                     out_dir, it,
@@ -651,8 +1314,13 @@ def train_stage_d_p1(
                 )
 
         # ---- Periodic: silhouette check (raises on failure) ----
+        # ★ Sharp edge #4: this compares the render to the 6 REAL pure states,
+        # which were captured from the canonical camera. On a random-view iter
+        # the render is from a different camera, so the comparison would
+        # false-raise. Only run it on canonical iters.
         if (cfg.silhouette_check_every > 0
                 and phase != "warmup_g_minus"
+                and is_canon
                 and it > 0 and it % cfg.silhouette_check_every == 0):
             with torch.no_grad():
                 periodic_silhouette_check(
@@ -662,7 +1330,7 @@ def train_stage_d_p1(
                     cfg_n_states=cfg.silhouette_n_states,
                     sample_state_indices=silhouette_state_indices,
                     rendered_T3HW_01=rgb_T3HW.detach(),
-                    wan_video_target_T3HW_01=wan_target_T3HW,
+                    pure_state_targets_K3HW_01=pure_targets_K3HW,
                 )
 
         # ---- Type vote at G1a end ----
@@ -693,7 +1361,11 @@ def train_stage_d_p1(
                     fourier_num_freqs=cfg.fourier_num_freqs,
                 )
                 # Match _regular_forward's b = alpha_m + lambda_part * H_part(feat).
-                b_logit = learnable.alpha_m + l_part_v * learnable.H_part(feat).squeeze(-1)
+                H_part_vote = cfg.head_logit_residual_bound * torch.tanh(
+                    learnable.H_part(feat).squeeze(-1)
+                )
+                b_logit = learnable.alpha_m + l_part_v * H_part_vote
+                b_logit = _apply_base_anchor_to_move_logits(b_logit, bootstrap, cfg)
                 m_soft = torch.sigmoid(b_logit)
                 F_pool = weighted_feature_pool(feat, m_soft, eps=cfg.sgs_eps)
                 delta_psi = learnable.H_joint(F_pool)
@@ -749,7 +1421,9 @@ def train_stage_d_p1(
                     device=device,
                     out_dir=out_dir,
                     summary=summary,
+                    mv_ctx=mv_ctx,
                 )
+                summary["committed_type"] = committed_type
                 # Replace main learnable + optimizer with the winning clone.
                 learnable = (dual_clone.learnable_rev if committed_type == "revolute"
                              else dual_clone.learnable_pri)
@@ -789,6 +1463,7 @@ def train_stage_d_p1(
         summary["n_iters_run"] = it + 1
 
     # ---- Final P1 artifacts ----
+    summary["committed_type"] = committed_type
     final_path = os.path.join(out_dir, "learnable_p1_final.pt")
     torch.save(
         {"learnable_state": learnable.state_dict(),
@@ -800,7 +1475,7 @@ def train_stage_d_p1(
 
     # ---- Final P1 visualization (PNG + 3D HTML deliverables) ----
     with torch.no_grad():
-        final_rgb, final_joint, final_r, final_b, _, _, _ = _regular_forward(
+        final_rgb, final_joint, final_r, final_b, _, _, _, _, _, _, _, _, _ = _regular_forward(
             learnable=learnable, ss_dit_w=ss_dit_w,
             ss_vae_decoder=trellis.ss_vae_decoder, d_gs_w=d_gs_w,
             bootstrap=bootstrap, camera=camera,
@@ -809,7 +1484,7 @@ def train_stage_d_p1(
         save_p1_final_summary(
             out_root=out_dir,
             final_rgb_T3HW_01=final_rgb.detach(),
-            wan_target_T3HW_01=wan_target_T3HW,
+            pure_state_targets_K3HW_01=pure_targets_K3HW,
             U_object_np=bootstrap.U_object.cpu().numpy(),
             g_per_voxel_np=torch.sigmoid(final_r).detach().cpu().numpy(),
             m_per_voxel_np=torch.sigmoid(final_b).detach().cpu().numpy(),
@@ -852,6 +1527,7 @@ def _run_dual_clone_to_completion(
     device: torch.device,
     out_dir: str,
     summary: Dict[str, Any],
+    mv_ctx: Optional["MultiViewKeyframeContext"] = None,
 ) -> Literal["revolute", "prismatic"]:
     """Alternate-update both clones across ``[start_iter, end_iter)``.
 
@@ -859,6 +1535,13 @@ def _run_dual_clone_to_completion(
     compare apples-to-apples on the final L_sds + L_rgb_rec. The total
     wall-clock budget is the same as the regular G1b would have used
     (each clone runs at half rate, end at the same point).
+
+    ★ Sharp edge #1: this is a SECOND render+loss path (main_g1b, ~15% of
+    iters when the type vote is undecided). It MUST replicate the main loop's
+    multi-view camera-sample + M0/M5 render + condition rebuild + LossInputs
+    swap, or main_g1b silently reverts to single-view + real-GT targets. The
+    dual-clone runs only in main_g1b (never warmup), so the camera is never
+    force-canonical here.
     """
     ss_dit_w_rev = ss_dit_w_factory(dual_clone.learnable_rev)
     ss_dit_w_pri = ss_dit_w_factory(dual_clone.learnable_pri)
@@ -880,20 +1563,41 @@ def _run_dual_clone_to_completion(
             forced_logit = dual_clone.forced_type_logit_rev
             committed_type = "revolute"
 
-        rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted = _regular_forward(
+        # ---- Multi-view: same per-iter camera/target selection as main loop ----
+        if mv_ctx is not None:
+            (cam_iter, ref_first_iter, ref_last_iter,
+             wan_cond_iter, is_canon) = _mv_camera_and_targets(
+                mv_ctx, cfg, wan_ctx, device, force_canonical=False,
+            )
+            if is_canon:
+                summary["mv_canon_iters"] = summary.get("mv_canon_iters", 0) + 1
+            else:
+                summary["mv_random_iters"] = summary.get("mv_random_iters", 0) + 1
+        else:
+            cam_iter = camera
+            ref_first_iter = bootstrap.s_0_pure_3HW_01
+            ref_last_iter = bootstrap.s_5_pure_3HW_01
+            wan_cond_iter = bootstrap.wan_cond
+
+        (
+            rgb_T3HW, joint, r, b, g_obj, m_obj, u_shifted, head_preact_l2,
+            head_stats, render_inputs, ownership_render_inputs, phi_rev, phi_pri,
+        ) = _regular_forward(
             learnable=learnable_cur,
             ss_dit_w=ss_dit_w_cur,
             ss_vae_decoder=trellis.ss_vae_decoder,
             d_gs_w=d_gs_w,
             bootstrap=bootstrap,
-            camera=camera,
+            camera=cam_iter,
             f_global=f_global,
             cfg=cfg,
             committed_type=committed_type,
             forced_type_logit=forced_logit,
         )
 
-        tau = sample_tau_inverse_cdf_logitnormal(
+        tau = sample_tau_chord_anneal(
+            iter_idx=it,
+            total_iters=int(round(cfg.f_transition_end * cfg.total_iters)),
             mean=cfg.tau_logit_normal_mean_p1,
             std=cfg.tau_logit_normal_std_p1,
             device=device,
@@ -902,20 +1606,21 @@ def _run_dual_clone_to_completion(
         sched_lambdas = schedule_w_rfsds_weights(f_global, cfg)
         sched_lam_shell = schedule_lambda_shell(f_global, cfg)
         sched_lam_m_prior = schedule_lambda_m_prior(f_global, cfg)
+        sched_lam_gate = schedule_lambda_gate(f_global, cfg)
 
         loss_inputs = LossInputs(
             rgb_T3HW=rgb_T3HW, r=r, b=b,
             axis=joint.axis, origin=joint.origin,
             Delta_z_s=learnable_cur.Delta_z_s,
             alpha_m=learnable_cur.alpha_m,
-            wan_video_target_T3HW_01=bootstrap.wan_video_target_T3HW_01,
-            s_0_pure_3HW_01=bootstrap.s_0_pure_3HW_01,
-            s_5_pure_3HW_01=bootstrap.s_5_pure_3HW_01,
+            pure_state_targets_K3HW_01=bootstrap.pure_state_targets_K3HW_01,
+            s_0_pure_3HW_01=ref_first_iter,
+            s_5_pure_3HW_01=ref_last_iter,
             z_wan_target=bootstrap.z_wan_target,
             anchors_world=bootstrap.anchors_world,
             shell_mask=bootstrap.slat_shell_mask,
             m_attn_at_U=bootstrap.M_attn_at_U,
-            wan_cond=bootstrap.wan_cond,
+            wan_cond=wan_cond_iter,
             tau=tau, cfg_scale=cfg_scale,
         )
         total_loss, log = aggregate_loss(
@@ -923,12 +1628,33 @@ def _run_dual_clone_to_completion(
             cfg_lambdas_first=cfg.lambda_first,
             cfg_lambdas_last=(cfg.lambda_last if str(cfg.wan_backend) == "fun_inp" else 0.0),
             cfg_lambdas_contact=cfg.lambda_contact,
-            cfg_lambdas_gate=cfg.lambda_gate,
+            cfg_lambdas_gate=sched_lam_gate,
             cfg_lambdas_z=cfg.lambda_z,
             sched_lambdas_w_rfsds=sched_lambdas,
             sched_lambda_shell=sched_lam_shell,
             sched_lambda_m_prior=sched_lam_m_prior,
+            cfg_lambda_move_floor=cfg.lambda_move_floor,
+            move_floor_frac=cfg.move_floor_frac,
+            cfg_lambda_move_ceiling=cfg.lambda_move_ceiling,
+            move_ceiling_frac=cfg.move_ceiling_frac,
         )
+        total_loss, _move_sil, _dyn, _static = _add_motion_ownership_loss(
+            total_loss=total_loss,
+            log=log,
+            cfg=cfg,
+            render_inputs=ownership_render_inputs,
+            joint=joint,
+            phi_rev=phi_rev,
+            phi_pri=phi_pri,
+            camera=cam_iter,
+            ref_first_3HW=ref_first_iter,
+            ref_last_3HW=ref_last_iter,
+            committed_type=committed_type,
+        )
+
+        # Head pre-activation leash (same as the main loop; keeps the adapter alive).
+        if head_preact_l2 is not None and cfg.lambda_head_leash > 0.0:
+            total_loss = total_loss + cfg.lambda_head_leash * head_preact_l2
 
         opt_cur.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -942,9 +1668,7 @@ def _run_dual_clone_to_completion(
         opt_cur.step()
 
         # Remember final L_sds + lambda_rgb * L_rgb for each clone's last iter.
-        # In the default G1b schedule lambda_rgb is zero, so this compares the
-        # Wan score that actually selects the branch instead of an unweighted
-        # auxiliary pixel term.
+        # L_rgb is six-state pure reconstruction, not the dense Wan video.
         score_value = float(log["L_sds"]) + float(sched_lambdas[2]) * float(log["L_rgb"])
         if committed_type == "revolute":
             dual_clone.final_loss_rev = score_value

@@ -22,7 +22,7 @@ committed type_hard; ``type_soft`` does not appear, no soft blend.
 The frozen TRELLIS D_GS produces ``Gaussian`` objects with ``.get_xyz``,
 ``.get_opacity`` (post-sigmoid + bias), ``.get_rotation``, ``.get_scaling``,
 ``._features_dc``. We do NOT mutate the Gaussian object; we call the
-underlying ``diff_gauss.GaussianRasterizer`` directly with our warped
+underlying ``diff_gaussian_rasterization.GaussianRasterizer`` directly with our warped
 arrays as kwargs. This avoids any in-place edit on the frozen D_GS output
 while keeping ``rendered_image`` differentiable w.r.t. all the warped
 quantities (means3D, opacities, rotations).
@@ -37,8 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# diff_gauss is provided by TRELLIS's setup.sh (pip install diff-gauss)
-from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
+# Use TRELLIS/3DGS rasterization rather than FreeArt3D's diff_gauss package.
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 from .config import (
     H_PIXEL,
@@ -101,6 +101,8 @@ class StageDCameraConfig:
         cls,
         image_h: int = H_PIXEL,
         image_w: int = W_PIXEL,
+        object_scale: float = 1.0,
+        object_center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> "StageDCameraConfig":
         """FreeArt3D's hardcoded rendering camera, expressed in TRELLIS world.
 
@@ -110,9 +112,14 @@ class StageDCameraConfig:
             azi = pi/8 = 22.5 deg           (training render azimuth)
             height = sin(pi/4) * distance   (elevation: 45 deg from horizontal)
             camera_distance = 2.1 * object_scale
-        with object centered at origin and ``object_scale = max_extent``. In
-        TRELLIS world, the asset lives in ``[-0.5, 0.5]^3`` so
-        ``object_scale = 1`` and ``camera_distance = 2.1``.
+        with the camera aimed at the object bbox center and
+        ``object_scale = max(bbox extent)``. The TRELLIS-decoded asset occupies
+        only a SUBSET of ``[-0.5, 0.5]^3`` (true max_extent < 1, centroid offset
+        from origin), so the ``object_scale=1`` / ``object_center=origin``
+        defaults render it too small and off-center. Callers that have the
+        decoded canonical Gaussians should pass the measured bbox center and
+        max_extent (see ``train.measure_canonical_object_bbox``) so the render
+        matches the FreeArt3D-framed target.
 
         **TRELLIS canonical world up is +Z**, verified from:
             ``trellis/utils/render_utils.py:33``:
@@ -127,17 +134,74 @@ class StageDCameraConfig:
         produces a square output. Keep fov_x = fov_y = 45 deg and pass the
         Stage A actual H/W into this factory.
         """
-        d = 2.1                                 # distance, normalized object_scale=1
+        d = 2.1 * float(object_scale)           # distance scales with object extent
         azi = math.pi / 8.0                     # 22.5 deg azimuth
+        cx, cy, cz = (
+            float(object_center[0]),
+            float(object_center[1]),
+            float(object_center[2]),
+        )
         # FreeArt3D's render.py: height = sin(45 deg) * distance,
-        # x = sin(azi) * d, y = -cos(azi) * d. +Z up world (Blender = TRELLIS).
-        x = math.sin(azi) * d                   # +0.804
-        y = -math.cos(azi) * d                  # -1.940 (in front of object along -Y)
-        z = math.sin(math.pi / 4.0) * d         # +1.485 (height above object)
+        # x = sin(azi) * d, y = -cos(azi) * d, relative to the object center.
+        # +Z up world (Blender = TRELLIS).
+        x = cx + math.sin(azi) * d
+        y = cy - math.cos(azi) * d
+        z = cz + math.sin(math.pi / 4.0) * d
 
         return cls(
             pos=(x, y, z),
-            look_at=(0.0, 0.0, 0.0),
+            look_at=(cx, cy, cz),
+            up=(0.0, 0.0, 1.0),                 # ★ hardcoded +Z (TRELLIS canonical)
+            fov_x_deg=45.0,
+            fov_y_deg=45.0,
+            image_h=int(image_h), image_w=int(image_w),
+            near=0.1, far=10.0,
+            bg_color=(0.0, 0.0, 0.0),
+        )
+
+    @classmethod
+    def freeart3d_sampled(
+        cls,
+        azi_deg: float,
+        ele_deg: float,
+        image_h: int,
+        image_w: int,
+        object_scale: float,
+        object_center: Tuple[float, float, float],
+    ) -> "StageDCameraConfig":
+        """Multi-view variant of ``freeart3d_canonical`` with explicit angles.
+
+        Reproduces the EXACT same (non-spherical) position convention as
+        ``freeart3d_canonical`` but with caller-chosen azimuth / elevation
+        instead of the hardcoded 22.5 / 45 deg::
+
+            d = 2.1 * object_scale
+            x = cx + sin(azi) * d
+            y = cy - cos(azi) * d
+            z = cz + sin(ele) * d        # NOTE: x/y use the full d (no cos(ele))
+
+        With ``azi_deg=22.5`` and ``ele_deg=45`` this returns a config EQUAL to
+        ``freeart3d_canonical(image_h, image_w, object_scale, object_center)``
+        (same pos, up, fov, near/far, bg, image size). near/far/bg constants are
+        copied verbatim from ``freeart3d_canonical``.
+        """
+        d = 2.1 * float(object_scale)           # distance scales with object extent
+        ar = math.radians(float(azi_deg))
+        el = math.radians(float(ele_deg))
+        cx, cy, cz = (
+            float(object_center[0]),
+            float(object_center[1]),
+            float(object_center[2]),
+        )
+        # Same convention as freeart3d_canonical: x/y use the FULL d, the
+        # elevation enters only z via sin(el) (there is NO cos(el) on x/y).
+        x = cx + math.sin(ar) * d
+        y = cy - math.cos(ar) * d
+        z = cz + math.sin(el) * d
+
+        return cls(
+            pos=(x, y, z),
+            look_at=(cx, cy, cz),
             up=(0.0, 0.0, 1.0),                 # ★ hardcoded +Z (TRELLIS canonical)
             fov_x_deg=45.0,
             fov_y_deg=45.0,
@@ -147,23 +211,76 @@ class StageDCameraConfig:
         )
 
 
+def sample_camera_for_iter(
+    rng: "torch.Generator",
+    cfg,
+    object_center: Tuple[float, float, float],
+    object_scale: float,
+    image_h: int,
+    image_w: int,
+    canonical_cfg: StageDCameraConfig,
+) -> Tuple[StageDCameraConfig, bool]:
+    """Pick the camera for one StageD iter: canonical or a random view.
+
+    With probability ``cfg.mv_canonical_ratio`` returns the pre-built
+    ``canonical_cfg`` (and ``is_canonical=True``); otherwise samples a fresh
+    azimuth / elevation and returns ``freeart3d_sampled(...)`` with
+    ``is_canonical=False``.
+
+    Sampling ranges (degrees)::
+
+        azi in [mv_azi_min_deg, mv_azi_max_deg]
+        ele in [mv_ele_min_deg, mv_ele_max_deg]
+
+    Parameters
+    ----------
+    rng : torch.Generator (cpu)
+        Dedicated CPU generator so camera sampling is deterministic and
+        decoupled from the model/training RNG.
+    cfg : StageDConfig
+        Reads ``mv_canonical_ratio``, ``mv_azi_min_deg``, ``mv_azi_max_deg``,
+        ``mv_ele_min_deg``, ``mv_ele_max_deg``.
+    canonical_cfg : StageDCameraConfig
+        The pre-built canonical camera, returned as-is on canonical draws.
+
+    Returns
+    -------
+    (camera_cfg, is_canonical) : Tuple[StageDCameraConfig, bool]
+    """
+    u = torch.rand(1, generator=rng).item()
+    if u < float(cfg.mv_canonical_ratio):
+        return canonical_cfg, True
+    azi = float(cfg.mv_azi_min_deg) + torch.rand(1, generator=rng).item() * (
+        float(cfg.mv_azi_max_deg) - float(cfg.mv_azi_min_deg)
+    )
+    ele = float(cfg.mv_ele_min_deg) + torch.rand(1, generator=rng).item() * (
+        float(cfg.mv_ele_max_deg) - float(cfg.mv_ele_min_deg)
+    )
+    sampled_cfg = StageDCameraConfig.freeart3d_sampled(
+        azi, ele, image_h, image_w, object_scale, object_center,
+    )
+    return sampled_cfg, False
+
+
 def _build_extrinsics(camera_cfg: StageDCameraConfig,
                       device: torch.device,
                       dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """4x4 world-to-camera transform from (pos, look_at, up).
 
-    Right-handed OpenGL-style convention: camera looks down -Z in its own
-    frame, X right, Y up. Returned matrix transforms world points to
-    camera-local coordinates as ``p_cam = R_wc @ p_world + t_wc``.
+    Matches ``utils3d.torch.extrinsics_look_at`` used by TRELLIS:
+    camera-space +Z points from the camera to the target. This is the
+    convention expected by TRELLIS' ``intrinsics_to_projection`` and
+    ``diff_gaussian_rasterization`` (projection ``w`` must be positive for visible points).
+    Returned matrix transforms world points to camera-local coordinates as
+    ``p_cam = R_wc @ p_world + t_wc``.
     """
     pos = torch.tensor(camera_cfg.pos, device=device, dtype=dtype)
     target = torch.tensor(camera_cfg.look_at, device=device, dtype=dtype)
     up = torch.tensor(camera_cfg.up, device=device, dtype=dtype)
 
-    # OpenGL convention: -Z forward. So forward = pos - target (not target - pos).
-    forward = pos - target
+    forward = target - pos
     forward = forward / forward.norm().clamp_min(1.0e-6)
-    right = torch.linalg.cross(up, forward)
+    right = torch.linalg.cross(forward, up)
     right = right / right.norm().clamp_min(1.0e-6)
     up_corrected = torch.linalg.cross(forward, right)
 
@@ -187,7 +304,7 @@ def _build_proj_matrix(camera_cfg: StageDCameraConfig,
     When ``fov_y_deg`` is set explicitly, uses it directly — this is needed
     when the image grid does NOT have square pixels.
 
-    Maps z in [near, far] to [0, 1] (diff_gauss / TRELLIS convention; see
+    Maps z in [near, far] to [0, 1] (TRELLIS rasterization convention; see
     trellis/renderers/gaussian_render.py:30-47).
     """
     fovx = math.radians(camera_cfg.fov_x_deg)
@@ -206,7 +323,7 @@ def _build_proj_matrix(camera_cfg: StageDCameraConfig,
     far = float(camera_cfg.far)
 
     P = torch.zeros(4, 4, device=device, dtype=dtype)
-    # diff_gauss uses a non-standard layout where intrinsics is normalized
+    # TRELLIS rasterization uses a non-standard layout where intrinsics is normalized
     # (fx, fy in [0, 1] of image dim). Here we go via FoV -> direct matrix.
     P[0, 0] = 1.0 / tan_fov_x
     P[1, 1] = 1.0 / tan_fov_y
@@ -369,7 +486,7 @@ def _rasterize_one_frame(
     ``render_21_with_warp`` call) instead of constructed per-frame. Per
     iter, this avoids 42 redundant constructions of identical objects.
 
-    ★ C3 caveat: diff_gauss API return tuple length varies across versions
+    C3 caveat: rasterizer return tuple length varies across versions
     (3-tuple ``(rendered, radii, depth)`` in some, 4-tuple ``(rendered,
     depth, alpha, radii)`` in others). We unpack the rendered image as the
     first element (universal) and discard the rest with ``*_``.
@@ -401,10 +518,39 @@ def _rasterize_one_frame(
         rotations=rotations,
         cov3D_precomp=None,
     )
-    # diff_gauss returns a tuple; the first element is always the rendered
+    # The rasterizer returns a tuple; the first element is always the rendered
     # image. We accept any length to be version-tolerant (C3 caveat).
     rendered = out[0] if isinstance(out, tuple) else out
     return rendered                          # [3, H, W]
+
+
+def render_static_gaussians(
+    xyz: torch.Tensor,
+    opacity: torch.Tensor,
+    rotation: torch.Tensor,
+    scale: torch.Tensor,
+    sh: torch.Tensor,
+    camera: LockedCamera,
+    opacity_scale: Optional[torch.Tensor] = None,
+    sh_degree: int = 0,
+) -> torch.Tensor:
+    """Render the canonical Gaussian set without gate split or joint warp."""
+    if opacity_scale is not None:
+        if opacity_scale.ndim != 1 or opacity_scale.shape[0] != opacity.shape[0]:
+            raise ValueError(
+                f"opacity_scale must be [{opacity.shape[0]}], got {tuple(opacity_scale.shape)}"
+            )
+        opacity = opacity * opacity_scale.to(device=opacity.device, dtype=opacity.dtype).unsqueeze(-1)
+    raster_settings = _build_raster_settings(camera, sh_degree=sh_degree)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    return _rasterize_one_frame(
+        xyz,
+        opacity,
+        rotation,
+        scale,
+        sh,
+        rasterizer,
+    ).clamp(0.0, 1.0)
 
 
 # =============================================================================
@@ -431,6 +577,7 @@ def _warp_one_state(
     R: torch.Tensor,
     t: torch.Tensor,
     R_quat_or_none: Optional[torch.Tensor],
+    move_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build per-frame (means, opacities, rotations, scales, sh) for one state.
 
@@ -451,6 +598,8 @@ def _warp_one_state(
     opacity_base = (
         op_canon_1d * inputs.g_per_gauss * (1.0 - inputs.m_per_gauss)
     ).unsqueeze(-1)                                        # [N_gauss, 1]
+    if move_only:
+        opacity_base = torch.zeros_like(opacity_base)
     rot_base = inputs.rot_canon
 
     # Move
@@ -520,6 +669,18 @@ def render_21_with_warp(
     raster_settings = _build_raster_settings(camera, sh_degree=sh_degree)
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+    # Gradient-checkpoint each rasterize. In the uncommitted phase this loop
+    # issues 42 grad-retaining rasterize calls (rev + pri x 21 frames); the
+    # rasterizer's saved geom/binning/img buffers for all of them together
+    # exhaust the GPU once both A14B experts (~56 GB) are resident. Checkpoint
+    # keeps only one frame's buffers live and recomputes the rest in backward.
+    # The rasterize is far cheaper than the dual-expert Wan DiT, so the
+    # recompute cost is modest. Closes over the shared rasterizer.
+    from torch.utils.checkpoint import checkpoint
+
+    def _ckpt_rasterize(means, op, rot, sc, sh):
+        return _rasterize_one_frame(means, op, rot, sc, sh, rasterizer)
+
     rgb_frames: List[torch.Tensor] = []
 
     for t_idx in range(F):
@@ -532,8 +693,9 @@ def render_21_with_warp(
             means_r, op_r, rot_r, sc_r, sh_r = _warp_one_state(
                 inputs, R_rev, t_rev, R_quat_rev,
             )
-            rgb_rev = _rasterize_one_frame(
-                means_r, op_r, rot_r, sc_r, sh_r, rasterizer,
+            rgb_rev = checkpoint(
+                _ckpt_rasterize, means_r, op_r, rot_r, sc_r, sh_r,
+                use_reentrant=False,
             )                                              # [3, H, W]
         else:
             rgb_rev = None
@@ -545,8 +707,9 @@ def render_21_with_warp(
             means_p, op_p, rot_p, sc_p, sh_p = _warp_one_state(
                 inputs, R_pri, t_pri, R_quat_or_none=None,
             )
-            rgb_pri = _rasterize_one_frame(
-                means_p, op_p, rot_p, sc_p, sh_p, rasterizer,
+            rgb_pri = checkpoint(
+                _ckpt_rasterize, means_p, op_p, rot_p, sc_p, sh_p,
+                use_reentrant=False,
             )                                              # [3, H, W]
         else:
             rgb_pri = None
@@ -570,7 +733,7 @@ def render_21_with_warp(
 
     rgb_T3HW = torch.stack(rgb_frames, dim=0)             # [F, 3, H, W]
     # ★ S1 fix: clamp raw rasterizer output to [0, 1] before downstream loss.
-    # diff_gauss's per-pixel color = sum(T_i * alpha_i * c_i) where c_i comes
+    # Rasterized per-pixel color = sum(T_i * alpha_i * c_i) where c_i comes
     # from SH-decoded RGB; not guaranteed to stay in [0, 1]. LPIPS and Wan
     # VAE both assume in-range input; out-of-range values produce undefined
     # behavior in VGG and out-of-distribution input to the VAE.
@@ -578,7 +741,73 @@ def render_21_with_warp(
     return rgb_T3HW
 
 
+def render_move_silhouettes(
+    inputs: RenderInputs,
+    joint: JointParams,
+    phi_render_rev: torch.Tensor,
+    phi_render_pri: torch.Tensor,
+    camera: LockedCamera,
+    frame_indices: Tuple[int, ...],
+    committed_type: str,
+    sh_degree: int = 0,
+) -> torch.Tensor:
+    """Render move-branch silhouettes for selected endpoint frames.
+
+    Returns [K, 1, H, W]. Base rows remain in the rasterizer call with zero
+    opacity so tensor layout and graph structure match the normal renderer.
+    """
+    if committed_type not in ("revolute", "prismatic"):
+        raise ValueError(
+            "render_move_silhouettes requires committed_type "
+            f"'revolute' or 'prismatic', got {committed_type!r}"
+        )
+    F = int(phi_render_rev.shape[0])
+    if phi_render_pri.shape[0] != F:
+        raise ValueError(
+            "phi_render_rev / phi_render_pri must have same length"
+        )
+    if len(frame_indices) == 0:
+        raise ValueError("frame_indices must be non-empty")
+
+    raster_settings = _build_raster_settings(camera, sh_degree=sh_degree)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    from torch.utils.checkpoint import checkpoint
+
+    def _ckpt_rasterize(means, op, rot, sc, sh):
+        return _rasterize_one_frame(means, op, rot, sc, sh, rasterizer)
+
+    silhouettes: List[torch.Tensor] = []
+    for frame_idx_raw in frame_indices:
+        frame_idx = int(frame_idx_raw)
+        if frame_idx < 0 or frame_idx >= F:
+            raise ValueError(f"frame index {frame_idx} out of range [0, {F})")
+        if committed_type == "revolute":
+            T = SE3_revolute(joint.axis, joint.origin, phi_render_rev[frame_idx])
+            R = T[:3, :3]
+            t = T[:3, 3]
+            R_quat = quaternion_from_axis_angle(joint.axis, phi_render_rev[frame_idx])
+            means, op, rot, sc, sh = _warp_one_state(
+                inputs, R, t, R_quat, move_only=True,
+            )
+        else:
+            T = SE3_prismatic(joint.axis, phi_render_pri[frame_idx])
+            R = T[:3, :3]
+            t = T[:3, 3]
+            means, op, rot, sc, sh = _warp_one_state(
+                inputs, R, t, R_quat_or_none=None, move_only=True,
+            )
+        rgb = checkpoint(
+            _ckpt_rasterize, means, op, rot, sc, sh,
+            use_reentrant=False,
+        ).clamp(0.0, 1.0)
+        silhouettes.append(rgb.abs().sum(dim=0, keepdim=True).clamp(0.0, 1.0))
+    return torch.stack(silhouettes, dim=0)
+
+
 __all__ = [
-    "StageDCameraConfig", "LockedCamera", "build_locked_camera",
+    "StageDCameraConfig", "sample_camera_for_iter",
+    "LockedCamera", "build_locked_camera",
     "DGSWithParent", "RenderInputs", "render_21_with_warp",
+    "render_static_gaussians", "render_move_silhouettes",
 ]

@@ -33,6 +33,7 @@ Memory:
 from __future__ import annotations
 
 import math
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ from .config import (
     WAN_LATENT_CH,
     WAN_NUM_TRAIN_TIMESTEPS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -81,7 +84,7 @@ class WanRFSDSContext:
     """
     wan_vae: Any                 # Wan2_1_VAE; .encode([Tensor [3, T, H, W] in [-1,1]])
     low_noise_model: Any         # WanModel; tau < 0.9 expert
-    high_noise_model: Any        # WanModel; tau >= 0.9 expert
+    high_noise_model: Optional[Any]  # WanModel; tau >= 0.9 expert
     boundary_in_t_units: float   # = WAN_BOUNDARY_NORMALIZED * (num_train_timesteps)
     num_train_timesteps: int
     sample_shift: float          # ★ C2 fix: Wan scheduler shift parameter (default 5.0)
@@ -92,9 +95,11 @@ class WanRFSDSContext:
     w_latent: int
     device: torch.device
     dtype: torch.dtype
+    offload_dit: bool = False
     backend: str = "i2v"
     fun_pipeline: Any = None
     fun_boundary_normalized: Optional[float] = None
+    teacher_device: Optional[torch.device] = None  # dual-GPU: experts/T5 device; None => same as `device`
 
 
 def load_wan_for_rfsds(
@@ -106,12 +111,15 @@ def load_wan_for_rfsds(
     sample_shift: float = 5.0,
     frame_num: int = 21,
     resolution_hw: Tuple[int, int] = (464, 832),
+    expert_mode: str = "both",
+    offload_dit: bool = False,
 ) -> WanRFSDSContext:
     """Load the three Wan2.2 components we need for W-RFSDS.
 
     Uses the same ``wan.image2video.WanI2V`` class that Stage A uses, but
-    keeps everything resident on GPU (no offload) and freezes all
-    parameters. The T5 text encoder is NOT loaded here because the
+    freezes all parameters. DiT experts may be kept on CPU between W-RFSDS
+    calls because they are frozen teachers and do not participate in backward.
+    The T5 text encoder is NOT loaded here because the
     ``wan_cond_cached`` dict from Bootstrap already contains the encoded
     text embeddings (context / context_null) as tensors.
 
@@ -135,28 +143,55 @@ def load_wan_for_rfsds(
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     _ensure_wan_on_sys_path(repo_root)
 
+    if expert_mode not in ("both", "low_only"):
+        raise ValueError(
+            f"expert_mode must be 'both' or 'low_only', got {expert_mode!r}"
+        )
+
     from wan.configs.wan_i2v_A14B import i2v_A14B as wan_cfg
-    from wan.image2video import WanI2V
+    from wan.modules.model import WanModel
+    from wan.modules.vae2_1 import Wan2_1_VAE
+    load_kwargs: Dict[str, Any] = {"low_cpu_mem_usage": True}
+    if convert_model_dtype:
+        load_kwargs["torch_dtype"] = wan_cfg.param_dtype
 
-    # Construct WanI2V; we'll only retain vae / low_noise_model / high_noise_model.
-    i2v = WanI2V(
-        config=wan_cfg,
-        checkpoint_dir=wan_ckpt_dir,
-        device_id=device_id,
-        rank=0,
-        t5_fsdp=False,
-        dit_fsdp=False,
-        use_sp=False,
-        convert_model_dtype=convert_model_dtype,
-        init_on_cpu=False,
+    logger.info("[stage_d][wan] loading VAE")
+    vae = Wan2_1_VAE(
+        vae_pth=os.path.join(wan_ckpt_dir, wan_cfg.vae_checkpoint),
+        device=device,
     )
+    logger.info("[stage_d][wan] loading low-noise DiT from %s",
+                wan_cfg.low_noise_checkpoint)
+    low_noise = WanModel.from_pretrained(
+        wan_ckpt_dir, subfolder=wan_cfg.low_noise_checkpoint, **load_kwargs,
+    )
+    logger.info("[stage_d][wan] low-noise DiT loaded")
+    high_noise = None
+    if expert_mode == "both":
+        logger.info("[stage_d][wan] loading high-noise DiT from %s",
+                    wan_cfg.high_noise_checkpoint)
+        high_noise = WanModel.from_pretrained(
+            wan_ckpt_dir, subfolder=wan_cfg.high_noise_checkpoint, **load_kwargs,
+        )
+        logger.info("[stage_d][wan] high-noise DiT loaded")
 
-    vae = i2v.vae
-    low_noise = i2v.low_noise_model
-    high_noise = i2v.high_noise_model
+    for model in [m for m in (low_noise, high_noise) if m is not None]:
+        model.eval().requires_grad_(False)
+        if convert_model_dtype and next(model.parameters()).dtype != wan_cfg.param_dtype:
+            logger.info("[stage_d][wan] converting DiT to %s", wan_cfg.param_dtype)
+            model.to(wan_cfg.param_dtype)
+        if offload_dit:
+            logger.info("[stage_d][wan] keeping DiT on CPU between W-RFSDS calls")
+            model.to("cpu")
+        else:
+            logger.info("[stage_d][wan] moving DiT to %s", device)
+            model.to(device)
+    dit_resident = "cpu" if offload_dit else str(device)
+    logger.info("[stage_d][wan] DiT expert mode=%s resident on %s",
+                expert_mode, dit_resident)
 
     # Freeze everything.
-    for m in (low_noise, high_noise):
+    for m in [m for m in (low_noise, high_noise) if m is not None]:
         for p in m.parameters():
             p.requires_grad_(False)
         m.eval()
@@ -167,10 +202,6 @@ def load_wan_for_rfsds(
         for p in vae.model.parameters():
             p.requires_grad_(False)
         vae.model.eval()
-
-    # Drop T5 text encoder reference (we use cached context tensors).
-    if hasattr(i2v, "text_encoder"):
-        del i2v.text_encoder
 
     # ``boundary * num_train_timesteps`` gives the cutoff in [0, 1000) scale
     # (matches wan/image2video.py:341).
@@ -223,6 +254,7 @@ def load_wan_for_rfsds(
         w_latent=int(w_latent),
         device=device,
         dtype=param_dtype,
+        offload_dit=bool(offload_dit),
     )
 
 
@@ -271,6 +303,8 @@ def load_wan_fun_inp_for_rfsds(
     sample_shift: float = 5.0,
     frame_num: int = 21,
     resolution_hw: Tuple[int, int] = (464, 832),
+    expert_mode: str = "both",
+    teacher_device: Optional[torch.device] = None,
     weight_dtype: torch.dtype = torch.bfloat16,
 ) -> WanRFSDSContext:
     """Load VideoX-Fun Wan2.2-Fun-A14B-InP for W-RFSDS.
@@ -284,6 +318,11 @@ def load_wan_fun_inp_for_rfsds(
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     _ = repo_root
     _ = device_id
+
+    if expert_mode not in ("both", "low_only"):
+        raise ValueError(
+            f"expert_mode must be 'both' or 'low_only', got {expert_mode!r}"
+        )
 
     model_dir = os.path.abspath(os.fspath(model_dir))
     if not os.path.isdir(model_dir):
@@ -315,7 +354,8 @@ def load_wan_fun_inp_for_rfsds(
         low_cpu_mem_usage=True,
         torch_dtype=weight_dtype,
     )
-    if transformer_kwargs.get("transformer_combination_type", "single") == "moe":
+    is_moe = transformer_kwargs.get("transformer_combination_type", "single") == "moe"
+    if is_moe and expert_mode == "both":
         transformer_2 = Wan2_2Transformer3DModel.from_pretrained(
             os.path.join(model_dir, high_subpath),
             transformer_additional_kwargs=transformer_kwargs,
@@ -323,6 +363,13 @@ def load_wan_fun_inp_for_rfsds(
             torch_dtype=weight_dtype,
         )
     else:
+        # expert_mode='low_only' (or non-MoE config): skip the high-noise
+        # expert entirely. It only serves tau >= boundary (~top 12.5% of the
+        # noise range); the low-noise expert covers the rest, including the SDS
+        # refinement band. Freeing its ~28 GB is what lets the grad-enabled Wan
+        # VAE encode of the 21-frame video fit -- both A14B experts (~56 GB)
+        # plus that encode (~18 GB) exceed one 80 GB GPU. _select_fun_inp_
+        # transformer falls back to the low-noise model when high is None.
         transformer_2 = None
 
     vae_kwargs = OmegaConf.to_container(config["vae_kwargs"])
@@ -363,7 +410,18 @@ def load_wan_fun_inp_for_rfsds(
         text_encoder=text_encoder,
         scheduler=scheduler,
     )
-    pipe.to(device=device)
+    # Device placement. Single GPU (default): everything on `device`. Dual-GPU
+    # teacher-student split: the frozen Wan experts + T5 (the SDS teacher) go on
+    # `teacher_device`, the differentiable Wan VAE stays on `device` with the
+    # render/TRELLIS student. Each iter only a ~23 MB latent crosses GPUs (the
+    # experts run no_grad and the SDS residual is detached), so both A14B
+    # experts stay resident without the 21-frame grad VAE encode OOMing.
+    tdev = teacher_device if teacher_device is not None else device
+    pipe.vae.to(device)
+    pipe.transformer.to(tdev)
+    if pipe.transformer_2 is not None:
+        pipe.transformer_2.to(tdev)
+    pipe.text_encoder.to(tdev)
 
     for module in (pipe.transformer, pipe.transformer_2, pipe.text_encoder, pipe.vae):
         if module is None:
@@ -406,6 +464,7 @@ def load_wan_fun_inp_for_rfsds(
         backend="fun_inp",
         fun_pipeline=pipe,
         fun_boundary_normalized=boundary,
+        teacher_device=tdev,
     )
 
 
@@ -438,6 +497,44 @@ def _to_wan_vae_input(video_3FHW_float01: torch.Tensor) -> torch.Tensor:
     return video_3FHW_float01 * 2.0 - 1.0
 
 
+def _resize_rgb_for_wan_sds(
+    rgb_3FHW_float01: torch.Tensor,
+    resolution_hw: Tuple[int, int],
+) -> torch.Tensor:
+    H = int(resolution_hw[0])
+    W = int(resolution_hw[1])
+    if rgb_3FHW_float01.shape[-2:] == (H, W):
+        return rgb_3FHW_float01
+    rgb_F3HW = rgb_3FHW_float01.permute(1, 0, 2, 3)
+    resized = F.interpolate(
+        rgb_F3HW, size=(H, W), mode="bilinear", align_corners=False,
+    )
+    return resized.permute(1, 0, 2, 3)
+
+
+def _resize_i2v_y_for_wan_sds(
+    y: torch.Tensor,
+    ctx: WanRFSDSContext,
+) -> torch.Tensor:
+    target = (int(ctx.f_latent), int(ctx.h_latent), int(ctx.w_latent))
+    if tuple(y.shape[-3:]) == target:
+        return y
+    if y.shape[0] != 20:
+        raise ValueError(f"Wan I2V y must have 20 channels, got {tuple(y.shape)}")
+    mask = F.interpolate(
+        y[:4].unsqueeze(0).float(), size=target, mode="nearest",
+    ).squeeze(0).to(dtype=y.dtype)
+    latent = F.interpolate(
+        y[4:].unsqueeze(0).float(), size=target, mode="trilinear",
+        align_corners=False,
+    ).squeeze(0).to(dtype=y.dtype)
+    return torch.cat([mask, latent], dim=0)
+
+
+def _i2v_seq_len_for_ctx(ctx: WanRFSDSContext) -> int:
+    return int(ctx.f_latent) * int(ctx.h_latent) * int(ctx.w_latent) // 4
+
+
 def wan_vae_encode_grad(
     rgb_3FHW_float01: torch.Tensor,
     ctx: WanRFSDSContext,
@@ -465,20 +562,27 @@ def wan_vae_encode_grad(
     if ctx.backend == "fun_inp":
         return _fun_inp_vae_encode_grad(rgb_3FHW_float01, ctx)
 
-    expected_rgb = (3, int(ctx.frame_num), int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1]))
-    if rgb_3FHW_float01.shape != expected_rgb:
+    expected_prefix = (3, int(ctx.frame_num))
+    if rgb_3FHW_float01.shape[:2] != expected_prefix:
         raise ValueError(
-            f"rgb_3FHW must be {expected_rgb}, "
+            f"rgb_3FHW must start with {expected_prefix}, "
             f"got {tuple(rgb_3FHW_float01.shape)}"
         )
-    rgb_neg11 = _to_wan_vae_input(rgb_3FHW_float01).to(ctx.device)
-    # Wan2_1_VAE.encode expects a Python list and returns a list.
-    z_list = ctx.wan_vae.encode([rgb_neg11])
-    if len(z_list) != 1:
-        raise RuntimeError(
-            f"Wan VAE encode returned {len(z_list)} entries; expected 1"
-        )
-    z = z_list[0]
+    rgb_sds = _resize_rgb_for_wan_sds(rgb_3FHW_float01, ctx.resolution_hw)
+    rgb_neg11 = _to_wan_vae_input(rgb_sds).to(ctx.device)
+
+    def _encode_one(video_3FHW: torch.Tensor) -> torch.Tensor:
+        with torch.cuda.amp.autocast(dtype=ctx.wan_vae.dtype):
+            return (
+                ctx.wan_vae.model.encode(
+                    video_3FHW.unsqueeze(0), ctx.wan_vae.scale,
+                )
+                .float()
+                .squeeze(0)
+            )
+
+    from torch.utils.checkpoint import checkpoint
+    z = checkpoint(_encode_one, rgb_neg11, use_reentrant=False)
     # Sanity-check the latent shape.
     expected = (
         WAN_LATENT_CH,
@@ -507,7 +611,11 @@ def _fun_inp_vae_encode_grad(
     video = _to_wan_vae_input(rgb_3FHW_float01).unsqueeze(0).to(
         device=ctx.device, dtype=ctx.fun_pipeline.vae.dtype
     )
-    z = ctx.fun_pipeline.vae.encode(video)[0].mode()
+    def _encode(v: torch.Tensor) -> torch.Tensor:
+        return ctx.fun_pipeline.vae.encode(v)[0].mode()
+
+    from torch.utils.checkpoint import checkpoint
+    z = checkpoint(_encode, video, use_reentrant=False)
     expected = (
         1,
         WAN_LATENT_CH,
@@ -522,36 +630,19 @@ def _fun_inp_vae_encode_grad(
     return z
 
 
-def _prepare_fun_inp_rfsds_condition(
-    wan_cond: Dict[str, Any],
+def _build_fun_inp_y_guidance(
+    video: torch.Tensor,
+    mask_video: torch.Tensor,
     ctx: WanRFSDSContext,
-) -> Dict[str, Any]:
-    if wan_cond.get("_prepared_backend") == "fun_inp":
-        return wan_cond
-    if wan_cond.get("backend") != "fun_inp":
-        raise ValueError("Fun-InP W-RFSDS requires wan_cond['backend'] == 'fun_inp'")
+) -> Tuple[torch.Tensor, int]:
+    """Build the Fun-InP y_guidance (mask+masked-video latents) and seq_len for the given
+    keyframe video. video [1,3,F,H,W], mask_video [1,1,F,H,W]. Returns (y on ctx.teacher_device
+    or ctx.device, seq_len). No prompt encode, no T5 move. Camera-dependent part of the cond."""
     pipe = ctx.fun_pipeline
     H, W = int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1])
     F_count = int(ctx.frame_num)
-    video = wan_cond["fun_video"].to(device=ctx.device, dtype=torch.float32)
-    mask_video = wan_cond["fun_mask"].to(device=ctx.device, dtype=torch.float32)
-    if tuple(video.shape) != (1, 3, F_count, H, W):
-        raise ValueError(f"fun_video shape mismatch: got {tuple(video.shape)}")
-    if tuple(mask_video.shape) != (1, 1, F_count, H, W):
-        raise ValueError(f"fun_mask shape mismatch: got {tuple(mask_video.shape)}")
-
-    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
-        wan_cond["pos_prompt"],
-        wan_cond["neg_prompt"],
-        True,
-        num_videos_per_prompt=1,
-        max_sequence_length=512,
-        device=ctx.device,
-    )
-    if isinstance(prompt_embeds, torch.Tensor):
-        in_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-    else:
-        in_prompt_embeds = negative_prompt_embeds + prompt_embeds
+    video = video.to(device=ctx.device, dtype=torch.float32)
+    mask_video = mask_video.to(device=ctx.device, dtype=torch.float32)
 
     flat_video = video.permute(0, 2, 1, 3, 4).reshape(F_count, 3, H, W)
     init_video = pipe.image_processor.preprocess(flat_video, height=H, width=W)
@@ -593,15 +684,89 @@ def _prepare_fun_inp_rfsds_condition(
         [torch.cat([mask_latents, mask_latents], dim=0),
          torch.cat([masked_video_latents, masked_video_latents], dim=0)],
         dim=1,
-    ).to(device=ctx.device, dtype=ctx.dtype)
+    ).to(device=ctx.teacher_device or ctx.device, dtype=ctx.dtype)
 
     patch_size = tuple(int(v) for v in pipe.transformer.config.patch_size)
     seq_len = int(math.ceil((ctx.h_latent * ctx.w_latent) / (patch_size[1] * patch_size[2]) * ctx.f_latent))
+    return y, int(seq_len)
+
+
+def rebuild_fun_inp_y_for_keyframes(
+    base_wan_cond: Dict[str, Any],
+    ref_first_3HW: torch.Tensor,
+    ref_last_3HW: torch.Tensor,
+    ctx: WanRFSDSContext,
+) -> Dict[str, Any]:
+    """Return a SHALLOW COPY of an already-prepared canonical wan_cond with a FRESH y_guidance
+    for new first/last keyframe images, reusing the cached in_context + seq_len
+    (camera-independent). Used by the multi-view path to re-condition Wan-Fun-InP on
+    per-camera reference frames without re-encoding the prompt or moving T5."""
+    if base_wan_cond.get("_prepared_backend") != "fun_inp":
+        raise ValueError(
+            "rebuild_fun_inp_y_for_keyframes requires an already-prepared "
+            "base_wan_cond with _prepared_backend == 'fun_inp'"
+        )
+    base_video = base_wan_cond["fun_video"]
+    video = base_video.clone()
+    ref_first = ref_first_3HW.detach().to(device=base_video.device, dtype=base_video.dtype)
+    ref_last = ref_last_3HW.detach().to(device=base_video.device, dtype=base_video.dtype)
+    video[:, :, 0] = ref_first
+    video[:, :, -1] = ref_last
+    mask_video = base_wan_cond["fun_mask"]
+
+    y, _seq = _build_fun_inp_y_guidance(video, mask_video, ctx)
+
+    out = dict(base_wan_cond)
+    out["y_guidance"] = y
+    return out
+
+
+def _prepare_fun_inp_rfsds_condition(
+    wan_cond: Dict[str, Any],
+    ctx: WanRFSDSContext,
+) -> Dict[str, Any]:
+    if wan_cond.get("_prepared_backend") == "fun_inp":
+        return wan_cond
+    if wan_cond.get("backend") != "fun_inp":
+        raise ValueError("Fun-InP W-RFSDS requires wan_cond['backend'] == 'fun_inp'")
+    pipe = ctx.fun_pipeline
+    H, W = int(ctx.resolution_hw[0]), int(ctx.resolution_hw[1])
+    F_count = int(ctx.frame_num)
+    video = wan_cond["fun_video"].to(device=ctx.device, dtype=torch.float32)
+    mask_video = wan_cond["fun_mask"].to(device=ctx.device, dtype=torch.float32)
+    if tuple(video.shape) != (1, 3, F_count, H, W):
+        raise ValueError(f"fun_video shape mismatch: got {tuple(video.shape)}")
+    if tuple(mask_video.shape) != (1, 1, F_count, H, W):
+        raise ValueError(f"fun_mask shape mismatch: got {tuple(mask_video.shape)}")
+
+    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+        wan_cond["pos_prompt"],
+        wan_cond["neg_prompt"],
+        True,
+        num_videos_per_prompt=1,
+        max_sequence_length=512,
+        device=ctx.teacher_device or ctx.device,
+    )
+    if isinstance(prompt_embeds, torch.Tensor):
+        in_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+    else:
+        in_prompt_embeds = negative_prompt_embeds + prompt_embeds
+
+    y, seq_len = _build_fun_inp_y_guidance(video, mask_video, ctx)
 
     wan_cond["in_context"] = in_prompt_embeds
     wan_cond["y_guidance"] = y
     wan_cond["seq_len"] = int(seq_len)
     wan_cond["_prepared_backend"] = "fun_inp"
+
+    # T5 is only needed for this one-time prompt encode (embeds cached in
+    # wan_cond["in_context"] and reused every iter), so move it off the GPU to
+    # free ~11 GB. Single-GPU: that headroom goes to the grad VAE encode.
+    # Dual-GPU: it frees the teacher GPU, which holds both ~27 GB experts and is
+    # tighter than it looks once the DiT forward activations are added. The
+    # prompt is fixed, so this is a one-time move with no recurring transfer.
+    pipe.text_encoder.to("cpu")
+    torch.cuda.empty_cache()
     return wan_cond
 
 
@@ -653,6 +818,8 @@ def _select_expert(
     """
     t_in_train_units = float(tau) * (float(ctx.num_train_timesteps) - 1.0)
     if t_in_train_units >= ctx.boundary_in_t_units:
+        if ctx.high_noise_model is None:
+            return ctx.low_noise_model
         return ctx.high_noise_model
     return ctx.low_noise_model
 
@@ -712,7 +879,15 @@ def w_rfsds_loss(
         )
 
     # ---- 1) Encode rendered video to VAE latent (grad-enabled) ----
-    z_theta = wan_vae_encode_grad(rgb_3FHW_float01, ctx)
+    # For the default SDS path, compute the frozen-VAE VJP against a detached
+    # RGB leaf, then replay that pixel gradient through the renderer with a
+    # surrogate loss. This is first-order equivalent to backpropagating the
+    # SDS surrogate through VAE and renderer together, but avoids keeping the
+    # Wan VAE graph alive until the main optimizer backward.
+    rgb_for_vae = rgb_3FHW_float01 if return_z_theta else (
+        rgb_3FHW_float01.detach().requires_grad_(True)
+    )
+    z_theta = wan_vae_encode_grad(rgb_for_vae, ctx)
     # z_theta: [1, 16, F_lat, H_lat, W_lat]
 
     # ---- 2) Forward sample z_sigma = (1-sigma)*z + sigma*eps  (★ C2) ----
@@ -733,36 +908,73 @@ def w_rfsds_loss(
     # Match wan/image2video.py:341,388-391 which compares timestep against
     # boundary = boundary_normalized * num_train_timesteps.
     wan_model = _select_expert(tau, ctx)
+    if next(wan_model.parameters()).device != ctx.device:
+        logger.info("[stage_d][wan] moving selected DiT to %s", ctx.device)
+        wan_model.to(ctx.device)
+        if ctx.device.type == "cuda":
+            torch.cuda.empty_cache()
     t_wan = torch.tensor(
         [float(tau) * (float(ctx.num_train_timesteps) - 1.0)],
         device=ctx.device, dtype=torch.float32,
     )
 
     # ---- 4) Two DiT forwards (cond + uncond), both under no_grad ----
-    x_input = [z_sigma.squeeze(0)]                     # List of [16, 6, 58, 104]
-    with torch.no_grad():
+    x_input = [z_sigma.squeeze(0).to(ctx.dtype)]       # List of [16, F_lat, H_lat, W_lat]
+    y_input = [
+        _resize_i2v_y_for_wan_sds(y, ctx).to(device=ctx.device, dtype=ctx.dtype)
+        if isinstance(y, torch.Tensor) else y
+        for y in wan_cond["y"]
+    ]
+    context = [
+        c.to(device=ctx.device, dtype=ctx.dtype)
+        if isinstance(c, torch.Tensor) else c
+        for c in wan_cond["context"]
+    ]
+    context_null = [
+        c.to(device=ctx.device, dtype=ctx.dtype)
+        if isinstance(c, torch.Tensor) else c
+        for c in wan_cond["context_null"]
+    ]
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=ctx.dtype):
+        seq_len = _i2v_seq_len_for_ctx(ctx)
         v_pred_cond = wan_model(
             x_input, t=t_wan,
-            context=wan_cond["context"],
-            seq_len=int(wan_cond["seq_len"]),
-            y=wan_cond["y"],
+            context=context,
+            seq_len=seq_len,
+            y=y_input,
         )[0].to(z_theta.dtype).unsqueeze(0)            # [1, 16, F_lat, H_lat, W_lat]
 
         v_pred_uncond = wan_model(
             x_input, t=t_wan,
-            context=wan_cond["context_null"],
-            seq_len=int(wan_cond["seq_len"]),
-            y=wan_cond["y"],
+            context=context_null,
+            seq_len=seq_len,
+            y=y_input,
         )[0].to(z_theta.dtype).unsqueeze(0)
 
         v_pred = v_pred_uncond + float(cfg_scale) * (v_pred_cond - v_pred_uncond)
         # CHORD Eq.3 residual; detached, treated as fixed target direction.
         residual = (v_pred - eps + z_theta.detach()).detach()
 
+    if ctx.offload_dit:
+        logger.info("[stage_d][wan] moving selected DiT to CPU before VAE backward")
+        wan_model.to("cpu")
+        if ctx.device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # ---- 5) Form surrogate loss whose gradient w.r.t. theta equals SDS ----
-    loss = (residual * z_theta).sum() / float(z_theta.numel())
+    loss_z = (residual * z_theta).sum() / float(z_theta.numel())
     if return_z_theta:
-        return loss, z_theta
+        return loss_z, z_theta
+    del x_input, y_input, context, context_null, z_sigma, eps
+    del v_pred_cond, v_pred_uncond, v_pred
+    if ctx.device.type == "cuda":
+        torch.cuda.empty_cache()
+    loss_value = loss_z.detach()
+    grad_rgb = torch.autograd.grad(
+        loss_z, rgb_for_vae, retain_graph=False, create_graph=False,
+    )[0]
+    surrogate = (grad_rgb.detach() * rgb_3FHW_float01).sum()
+    loss = surrogate + (loss_value - surrogate.detach())
     return loss
 
 
@@ -804,16 +1016,26 @@ def _w_rfsds_loss_fun_inp(
     if hasattr(ctx.fun_pipeline.scheduler, "scale_model_input"):
         latent_model_input = ctx.fun_pipeline.scheduler.scale_model_input(latent_model_input, t_wan)
 
-    timestep = t_wan.expand(latent_model_input.shape[0])
     transformer = _select_fun_inp_transformer(float(tau), ctx)
-    with torch.no_grad():
+    # Dual-GPU: the experts live on ctx.teacher_device. Move the (tiny, already
+    # detached) latent + timestep there for the no_grad teacher forward, then
+    # bring the score back to ctx.device. Single-GPU: teacher_device == device,
+    # so every .to() is a no-op. in_context / y_guidance were cached on the
+    # teacher device by _prepare_fun_inp_rfsds_condition.
+    tdev = ctx.teacher_device or ctx.device
+    timestep = t_wan.expand(latent_model_input.shape[0]).to(tdev)
+    # The Wan DiT is bf16 and its time_embedding feeds the fp32 timestep
+    # sinusoid into a bf16 Linear; the model is designed to run under autocast
+    # (matching the in-house path's ``with torch.no_grad(), autocast(...)``).
+    # Without it: "mat1 and mat2 must have the same dtype, Float vs BFloat16".
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=ctx.dtype):
         noise_pred = transformer(
-            x=latent_model_input.to(ctx.dtype),
+            x=latent_model_input.to(device=tdev, dtype=ctx.dtype),
             context=wan_cond["in_context"],
             t=timestep,
             seq_len=int(wan_cond["seq_len"]),
             y=wan_cond["y_guidance"],
-        )
+        ).to(ctx.device)
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         v_pred = noise_pred_uncond + float(cfg_scale) * (noise_pred_text - noise_pred_uncond)
         residual = (v_pred.to(z_theta.dtype) - eps + z_theta.detach()).detach()

@@ -222,8 +222,9 @@ def sample_hidden_at_U(
         Concatenation of: per-block grid-sampled hidden (3*1024) +
         Fourier PE of U_object coords (3*2*F=36) + occ logit at voxel (1).
     occ_at_U : Tensor [N_obj]
-        Convenience copy of the occupancy logit at each U voxel; used by
-        ``r = occ_at_U + alpha_g + lambda_sup * H_sup(feat).squeeze``.
+        Convenience copy of the raw occupancy logit at each U voxel. It is
+        appended to ``feat`` as evidence, but not used as a calibrated support
+        gate logit.
     """
     if not all(b in captured for b in capture_blocks):
         missing = [b for b in capture_blocks if b not in captured]

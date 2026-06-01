@@ -55,8 +55,7 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
     """
     # lazy import
     if 'GaussianRasterizer' not in globals():
-        # from diff_gaussian_rasterization import GaussianRasterizer, GaussianRasterizationSettings
-        from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
+        from diff_gaussian_rasterization import GaussianRasterizer, GaussianRasterizationSettings
         
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0

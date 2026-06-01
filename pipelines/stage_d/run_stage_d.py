@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -30,15 +30,27 @@ import torch
 from .config import (
     CANONICAL_STATE_IDX,
     F_FRAMES,
+    K_STATES,
+    STATE_INDICES,
     StageDConfig,
     TRELLIS_OCC_RES,
     WAN_LATENT_CH,
     WAN_VAE_STRIDE,
 )
 from .feature_sample import voxel_to_world
+from .keyframe_models import build_per_state_keyframe_models
 from .losses import LPIPSModule
-from .render import StageDCameraConfig, build_locked_camera
-from .train import BootstrapBundle, TrellisModules, train_stage_d_p1
+from .render import (
+    StageDCameraConfig,
+    build_locked_camera,
+    render_static_gaussians,
+)
+from .train import (
+    BootstrapBundle,
+    TrellisModules,
+    measure_canonical_object_bbox,
+    train_stage_d_p1,
+)
 from .w_rfsds import load_wan_for_rfsds, load_wan_fun_inp_for_rfsds
 
 
@@ -46,6 +58,34 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TRELLIS_PRETRAINED = os.path.abspath(
     os.path.expanduser(os.environ.get("TRELLIS_PRETRAINED", "~/hf_models/TRELLIS-image-large"))
 )
+
+# Multi-view keyframe states: 0 = closed (M0, frame 0), 5 = open (M5, frame F-1).
+# Matches the six-state contract STATE_INDICES (0, 4, 8, 12, 16, 20) -> state-0 is
+# the first pure target and state-5 is the last.
+STATE_INDICES_KEYFRAME: Tuple[int, int] = (0, 5)
+
+
+def _resolve_wan_sds_resolution_hw(
+    source_hw: tuple[int, int],
+    cfg: StageDConfig,
+) -> tuple[int, int]:
+    if cfg.wan_sds_resolution_hw is None:
+        return int(source_hw[0]), int(source_hw[1])
+    if len(cfg.wan_sds_resolution_hw) != 2:
+        raise ValueError(
+            "StageDConfig.wan_sds_resolution_hw must be [H, W]"
+        )
+    H = int(cfg.wan_sds_resolution_hw[0])
+    W = int(cfg.wan_sds_resolution_hw[1])
+    if H <= 0 or W <= 0:
+        raise ValueError(
+            f"wan_sds_resolution_hw must be positive, got ({H}, {W})"
+        )
+    if H % 16 != 0 or W % 16 != 0:
+        raise ValueError(
+            f"wan_sds_resolution_hw=({H}, {W}) must be divisible by 16"
+        )
+    return H, W
 
 
 # =============================================================================
@@ -72,13 +112,89 @@ def _load_json(path: str) -> Any:
         return json.load(f)
 
 
+def _require_grid64(name: str, x: np.ndarray) -> np.ndarray:
+    R = TRELLIS_OCC_RES
+    if tuple(x.shape) != (R, R, R):
+        raise ValueError(f"{name} must have shape {(R, R, R)}, got {tuple(x.shape)}")
+    return x
+
+
+def _build_visible_base_anchor_at_U(
+    U_object_np: np.ndarray,
+    p_base_preview_64: np.ndarray,
+    p_move_preview_64: np.ndarray,
+    cfg: StageDConfig,
+) -> np.ndarray:
+    R = TRELLIS_OCC_RES
+    if U_object_np.ndim != 2 or U_object_np.shape[1] != 3:
+        raise ValueError(f"U_object must be [N,3], got {tuple(U_object_np.shape)}")
+
+    U = U_object_np.astype(np.int64, copy=False)
+    if ((U < 0) | (U >= R)).any():
+        raise ValueError("U_object contains coordinates outside the TRELLIS grid")
+    if not bool(cfg.base_anchor_enable):
+        return np.zeros((U.shape[0],), dtype=np.bool_)
+
+    base_score = np.clip(
+        _require_grid64("p_base_preview", p_base_preview_64).astype(np.float32, copy=False),
+        0.0,
+        1.0,
+    )
+    move_score = np.clip(
+        _require_grid64("p_move_preview", p_move_preview_64).astype(np.float32, copy=False),
+        0.0,
+        1.0,
+    )
+
+    train_support = np.zeros((R, R, R), dtype=np.bool_)
+    train_support[U[:, 0], U[:, 1], U[:, 2]] = True
+
+    base_candidate = (
+        (base_score > float(cfg.base_anchor_preview_base_thresh))
+        & (base_score >= move_score)
+    )
+    move_candidate = (
+        (move_score > float(cfg.base_anchor_preview_move_thresh))
+        & (move_score > base_score)
+    )
+    hit = base_candidate | move_candidate
+    anchor = np.zeros((R, R, R), dtype=np.bool_)
+
+    for axis in range(3):
+        for forward in (True, False):
+            # The user convention is +axis projection scans low->high index:
+            # e.g. x=5 move occludes x=6 base from +X.
+            order = range(R) if forward else range(R - 1, -1, -1)
+            for a in range(R):
+                for b in range(R):
+                    for i in order:
+                        if axis == 0:
+                            coord = (i, a, b)
+                        elif axis == 1:
+                            coord = (a, i, b)
+                        else:
+                            coord = (a, b, i)
+                        if not hit[coord]:
+                            continue
+                        if base_candidate[coord]:
+                            anchor[coord] = True
+                        elif move_candidate[coord]:
+                            pass
+                        break
+
+    anchor &= train_support
+    return anchor[U[:, 0], U[:, 1], U[:, 2]]
+
+
 def _as_tensor(x: Any, device: torch.device,
                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-    """Coerce numpy / list / tensor to a torch tensor on the target device."""
+    """Coerce numeric / numpy / list / tensor to a torch tensor on target device."""
     if isinstance(x, torch.Tensor):
         t = x
     elif isinstance(x, np.ndarray):
         t = torch.from_numpy(x)
+    elif isinstance(x, (int, float)):
+        t = torch.tensor(x)
     elif isinstance(x, (list, tuple)):
         t = torch.tensor(x)
     else:
@@ -89,15 +205,28 @@ def _as_tensor(x: Any, device: torch.device,
     return t
 
 
+def _normalize_image_tensor_01(t: torch.Tensor, name: str) -> torch.Tensor:
+    if t.dtype == torch.uint8:
+        t = t.float() / 255.0
+    else:
+        t = t.float()
+    if t.min().item() < 0.0 or t.max().item() > 1.0:
+        raise ValueError(f"{name} must be in [0, 1] or uint8 [0, 255]")
+    return t.contiguous()
+
+
 def load_bootstrap_bundle(
     bootstrap_dir: str,
     device: torch.device,
     n_gauss_per_voxel: int = 32,
+    cfg: Optional[StageDConfig] = None,
 ) -> BootstrapBundle:
     """Read every Bootstrap artifact from ``bootstrap_dir`` into a bundle.
 
     File naming follows ``record/pipeline.md`` section 6.1.
     """
+    if cfg is None:
+        cfg = StageDConfig()
     if not os.path.isdir(bootstrap_dir):
         raise FileNotFoundError(f"bootstrap_dir not found: {bootstrap_dir!r}")
 
@@ -117,12 +246,27 @@ def load_bootstrap_bundle(
     U_object_np = _load_npy(os.path.join(bootstrap_dir, "U_object.npy"))
     U_object = torch.from_numpy(U_object_np.astype(np.int64)).to(device)   # [N_obj, 3]
     n_obj = int(U_object.shape[0])
+    if tuple(z_slat0.shape[:1]) != (n_obj,):
+        raise RuntimeError(
+            f"z_slat0/U_object row mismatch: z_slat0 has {tuple(z_slat0.shape)}, "
+            f"U_object has {tuple(U_object.shape)}"
+        )
 
-    # U_object_with_batch: [N_obj, 4] int32 with leading zero (single-batch)
-    batch_col = torch.zeros(n_obj, 1, dtype=torch.int32, device=device)
-    U_object_with_batch = torch.cat([
-        batch_col, U_object.to(torch.int32),
-    ], dim=-1)
+    z_slat_coords_np = _load_npy(os.path.join(bootstrap_dir, "z_slat_coords.npy"))
+    z_slat_coords = torch.from_numpy(z_slat_coords_np.astype(np.int32)).to(device)
+    if tuple(z_slat_coords.shape) != (n_obj, 4):
+        raise RuntimeError(
+            f"z_slat_coords shape mismatch: expected {(n_obj, 4)}, "
+            f"got {tuple(z_slat_coords.shape)}"
+        )
+    if not torch.equal(z_slat_coords[:, 0], torch.zeros(n_obj, dtype=torch.int32, device=device)):
+        raise RuntimeError("z_slat_coords must use batch index 0 for every row.")
+    if not torch.equal(z_slat_coords[:, 1:].to(torch.int64), U_object):
+        raise RuntimeError(
+            "z_slat_coords[:, 1:] must match U_object.npy row-for-row. "
+            "Rerun Bootstrap with the SLAT coordinate contract enabled."
+        )
+    U_object_with_batch = z_slat_coords
 
     # gaussian_parent_idx: if Bootstrap saved it, use it; else compute trivially.
     gpi_path = os.path.join(bootstrap_dir, "gaussian_parent_idx.npy")
@@ -140,8 +284,13 @@ def load_bootstrap_bundle(
     psi_0_path_pt = os.path.join(bootstrap_dir, "psi_0.pt")
     if os.path.isfile(psi_0_path_json):
         psi_0_raw = _load_json(psi_0_path_json)
+        if "psi" not in psi_0_raw:
+            raise KeyError(
+                "psi_0.json must contain the Stage C joint payload field 'psi'"
+            )
+        psi_payload = psi_0_raw["psi"]
         psi_0 = {
-            k: _as_tensor(v, device, torch.float32) for k, v in psi_0_raw.items()
+            k: _as_tensor(v, device, torch.float32) for k, v in psi_payload.items()
         }
     elif os.path.isfile(psi_0_path_pt):
         psi_0_raw = _load_pt(psi_0_path_pt)
@@ -161,17 +310,46 @@ def load_bootstrap_bundle(
     anchors_object = torch.from_numpy(anchors_object_np.astype(np.int64)).to(device)
     anchors_world = voxel_to_world(anchors_object, res=TRELLIS_OCC_RES)
 
-    # --- BMCSA M_attn at U_object ---
-    M_attn_64 = torch.from_numpy(
-        _load_npy(os.path.join(bootstrap_dir, "M_attn_boot_64.npy"))
-    ).to(device).float()                                  # [64, 64, 64]
-    # Index M_attn_64 at U_object's voxel coords using the flat index convention
+    # --- Move prior at U_object ---
+    # Stage D's alpha_m is a move logit. Stage B already exports direct move
+    # evidence per state; max over states gives the canonical part prior.
+    # The downstream legacy variable is base-like, so store 1 - move_prior.
+    P_move_np = _load_npy(os.path.join(bootstrap_dir, "P_move_evidence_per_state.npy"))
+    P_move = torch.from_numpy(P_move_np).to(device).float() # [K, 64, 64, 64]
+    if P_move.ndim != 4:
+        raise ValueError(f"P_move_evidence_per_state must be [K,64,64,64], got {tuple(P_move.shape)}")
+    M_attn_64 = 1.0 - P_move.clamp(0.0, 1.0).max(dim=0).values
+    # Index the base-like prior at U_object's voxel coords using the flat index convention
     # i = d * 64*64 + h * 64 + w.
     R = TRELLIS_OCC_RES
     flat_idx = (
         U_object[:, 0] * R * R + U_object[:, 1] * R + U_object[:, 2]
     )
     M_attn_at_U = M_attn_64.view(-1)[flat_idx]            # [N_obj]
+    if bool(cfg.base_anchor_enable):
+        preview_dir = cfg.base_anchor_preview_dir
+        if preview_dir is None:
+            preview_dir = bootstrap_dir
+        preview_dir = os.path.abspath(preview_dir)
+        p_base_preview_np = _load_npy(os.path.join(preview_dir, "p_base_preview.npy"))
+        p_move_preview_np = _load_npy(os.path.join(preview_dir, "p_move_preview.npy"))
+        logger.info("[stage_d] visible-base anchors use preview dir: %s", preview_dir)
+    else:
+        p_base_preview_np = np.zeros((R, R, R), dtype=np.float32)
+        p_move_preview_np = np.zeros((R, R, R), dtype=np.float32)
+    base_anchor_at_U_np = _build_visible_base_anchor_at_U(
+        U_object_np=U_object_np,
+        p_base_preview_64=p_base_preview_np,
+        p_move_preview_64=p_move_preview_np,
+        cfg=cfg,
+    )
+    base_anchor_at_U = torch.from_numpy(base_anchor_at_U_np.astype(np.bool_)).to(device)
+    logger.info(
+        "[stage_d] visible-base anchors at U_object: %d / %d (%.4f)",
+        int(base_anchor_at_U_np.sum()),
+        int(n_obj),
+        float(base_anchor_at_U_np.mean()) if base_anchor_at_U_np.size else 0.0,
+    )
 
     # --- Conditioning ---
     trellis_cond_can = _load_pt(
@@ -229,27 +407,30 @@ def load_bootstrap_bundle(
             f"got {tuple(z_wan_target.shape)}"
         )
 
-    s0_pure_path = os.path.join(bootstrap_dir, "s_0_pure.pt")
-    s_0_pure = _load_pt(s0_pure_path).to(device)
-    if s_0_pure.dtype == torch.uint8:
-        s_0_pure = s_0_pure.float() / 255.0
+    pure_states_path = os.path.join(bootstrap_dir, "pure_state_targets_K3HW.pt")
+    pure_states = _normalize_image_tensor_01(
+        _load_pt(pure_states_path).to(device),
+        "pure_state_targets_K3HW.pt",
+    )
+    expected_pure_shape = (K_STATES, 3, H_loaded, W_loaded)
+    if tuple(pure_states.shape) != expected_pure_shape:
+        raise RuntimeError(
+            f"pure_state_targets_K3HW.pt shape mismatch: expected "
+            f"{expected_pure_shape}; got {tuple(pure_states.shape)}"
+        )
+    if tuple(STATE_INDICES) != (0, 4, 8, 12, 16, 20):
+        raise RuntimeError(
+            f"Stage D six-state target contract assumes STATE_INDICES "
+            f"(0, 4, 8, 12, 16, 20); got {tuple(STATE_INDICES)}"
+        )
+
+    s_0_pure = pure_states[0].contiguous()
     if s_0_pure.shape != (3, H_loaded, W_loaded):
         raise RuntimeError(
             f"s_0_pure shape mismatch: expected "
             f"(3, {H_loaded}, {W_loaded}); got {tuple(s_0_pure.shape)}"
         )
-    s5_pure_path = os.path.join(bootstrap_dir, "s_5_pure.pt")
-    if os.path.isfile(s5_pure_path):
-        s_5_pure = _load_pt(s5_pure_path).to(device)
-        if s_5_pure.dtype == torch.uint8:
-            s_5_pure = s_5_pure.float() / 255.0
-        if s_5_pure.shape != (3, H_loaded, W_loaded):
-            raise RuntimeError(
-                f"s_5_pure shape mismatch: expected "
-                f"(3, {H_loaded}, {W_loaded}); got {tuple(s_5_pure.shape)}"
-            )
-    else:
-        s_5_pure = None
+    s_5_pure = pure_states[-1].contiguous()
 
     return BootstrapBundle(
         z_s0=z_s0,
@@ -263,9 +444,11 @@ def load_bootstrap_bundle(
         psi_0=psi_0, phi_0=phi_0,
         anchors_object=anchors_object, anchors_world=anchors_world,
         M_attn_at_U=M_attn_at_U,
+        base_anchor_at_U=base_anchor_at_U,
         trellis_cond_can=trellis_cond_can,
         wan_cond=wan_cond_on_dev, z_wan_target=z_wan_target,
         wan_video_target_T3HW_01=wan_video_target_T3HW_01,
+        pure_state_targets_K3HW_01=pure_states,
         s_0_pure_3HW_01=s_0_pure,
         s_5_pure_3HW_01=s_5_pure,
         frame_num=int(F_FRAMES),
@@ -278,19 +461,23 @@ def load_bootstrap_bundle(
 # TRELLIS module loader
 # =============================================================================
 
-def load_trellis_modules(pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
-                          device: torch.device = torch.device("cuda")) -> TrellisModules:
-    """Load the four frozen TRELLIS modules Stage D needs.
+def build_trellis_pipe(pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
+                       device: torch.device = torch.device("cuda")):
+    """Build the full TRELLIS image-to-3D pipeline (single weight load).
 
-    Reuses ``pipelines.recon.build_trellis_pipeline`` so we get the same
-    SS-VAE encoder side-load that Stage B needed (harmless if absent in
-    Stage D, but consistent with other stages).
+    Multi-view Stage D needs the FULL pipeline (``sample_slat`` +
+    ``models['slat_flow_model']``) to build the per-state keyframe Gaussians,
+    not just the four frozen modules ``TrellisModules`` exposes. Both are
+    derived from one pipe so TRELLIS weights load exactly once.
     """
     sys.path.append("TRELLIS")
     from pipelines.recon import build_trellis_pipeline
 
-    pipe = build_trellis_pipeline(device=str(device), pretrained=pretrained)
+    return build_trellis_pipeline(device=str(device), pretrained=pretrained)
 
+
+def trellis_modules_from_pipe(pipe) -> TrellisModules:
+    """Extract + freeze the four frozen modules Stage D needs from a pipe."""
     ss_dit = pipe.models["sparse_structure_flow_model"]
     ss_vae_decoder = pipe.models["sparse_structure_decoder"]
     d_gs = pipe.models["slat_decoder_gs"]
@@ -307,6 +494,18 @@ def load_trellis_modules(pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
         d_gs=d_gs,
         slat_sampler=slat_sampler,
     )
+
+
+def load_trellis_modules(pretrained: str = _DEFAULT_TRELLIS_PRETRAINED,
+                          device: torch.device = torch.device("cuda")) -> TrellisModules:
+    """Load the four frozen TRELLIS modules Stage D needs.
+
+    Reuses ``pipelines.recon.build_trellis_pipeline`` so we get the same
+    SS-VAE encoder side-load that Stage B needed (harmless if absent in
+    Stage D, but consistent with other stages).
+    """
+    pipe = build_trellis_pipe(pretrained=pretrained, device=device)
+    return trellis_modules_from_pipe(pipe)
 
 
 # =============================================================================
@@ -351,19 +550,51 @@ def run_stage_d_main(
         # repo_root should now be the dir containing pipelines/ and Wan2.2/
 
     logger.info("[stage_d] loading Bootstrap bundle from %s", bootstrap_dir)
-    bootstrap = load_bootstrap_bundle(bootstrap_dir, dev)
+    bootstrap = load_bootstrap_bundle(bootstrap_dir, dev, cfg=cfg)
 
-    logger.info("[stage_d] loading TRELLIS modules")
-    trellis = load_trellis_modules(pretrained=trellis_pretrained, device=dev)
+    # Multi-view keyframe anchors need the FULL TRELLIS pipeline (sample_slat +
+    # slat_flow_model) to build the per-state M0/M5 Gaussians. Build the pipe
+    # once and derive TrellisModules from it so the TRELLIS weights load exactly
+    # once; the single-view fallback only needs the four frozen modules.
+    mv_enable = bool(getattr(cfg, "mv_enable", False))
+    trellis_pipe = None
+    if mv_enable:
+        logger.info("[stage_d] loading full TRELLIS pipeline (multi-view keyframes)")
+        trellis_pipe = build_trellis_pipe(pretrained=trellis_pretrained, device=dev)
+        trellis = trellis_modules_from_pipe(trellis_pipe)
+    else:
+        logger.info("[stage_d] loading TRELLIS modules")
+        trellis = load_trellis_modules(pretrained=trellis_pretrained, device=dev)
+
+    wan_sds_resolution_hw = _resolve_wan_sds_resolution_hw(
+        bootstrap.resolution_hw, cfg
+    )
+    if wan_sds_resolution_hw != tuple(bootstrap.resolution_hw):
+        logger.info(
+            "[stage_d] W-RFSDS prior resolution %s from render resolution %s",
+            wan_sds_resolution_hw, bootstrap.resolution_hw,
+        )
 
     wan_backend = str(cfg.wan_backend)
-    if wan_backend == "i2v":
+    if bool(cfg.render_contract_only):
+        if wan_backend != "none":
+            raise ValueError(
+                "StageDConfig.render_contract_only=True requires "
+                "StageDConfig.wan_backend='none'"
+            )
+        logger.info(
+            "[stage_d] render-contract-only diagnostics: skipping Wan load"
+        )
+        wan_ctx = None
+    elif wan_backend == "i2v":
         logger.info("[stage_d] loading Wan2.2 I2V for W-RFSDS from %s", wan_ckpt_dir)
         wan_ctx = load_wan_for_rfsds(
             wan_ckpt_dir=wan_ckpt_dir, repo_root=repo_root, device=dev,
             convert_model_dtype=True, device_id=device_id,
             frame_num=bootstrap.frame_num,
-            resolution_hw=bootstrap.resolution_hw,
+            resolution_hw=wan_sds_resolution_hw,
+            expert_mode=str(cfg.wan_expert_mode),
+            offload_dit=bool(cfg.wan_offload_dit),
         )
     elif wan_backend == "fun_inp":
         if bootstrap.s_5_pure_3HW_01 is None:
@@ -384,25 +615,92 @@ def run_stage_d_main(
             device_id=device_id,
             frame_num=bootstrap.frame_num,
             resolution_hw=bootstrap.resolution_hw,
+            expert_mode=str(cfg.wan_expert_mode),
+            teacher_device=(
+                torch.device(f"cuda:{int(cfg.wan_teacher_device_id)}")
+                if int(cfg.wan_teacher_device_id) >= 0 else None
+            ),
         )
     else:
-        raise ValueError(f"StageDConfig.wan_backend must be 'i2v' or 'fun_inp'; got {wan_backend!r}")
+        raise ValueError(
+            "StageDConfig.wan_backend must be 'i2v', 'fun_inp', or 'none' "
+            f"for render_contract_only diagnostics; got {wan_backend!r}"
+        )
 
     logger.info("[stage_d] building camera + LPIPS")
+    # ★ Always measure the decoded canonical object's bbox (center + max_extent)
+    # so the multi-view camera sampler always has a framing reference, even when
+    # the caller passes an explicit ``camera``. The TRELLIS asset fills only a
+    # subset of [-0.5, 0.5]^3, so assuming object_scale=1 / center=origin renders
+    # it too small and off-center and biases the W-RFSDS gradient toward 3D
+    # distortion. (Was previously computed only inside ``if camera is None``.)
+    object_center, object_scale = measure_canonical_object_bbox(
+        trellis, bootstrap, dev
+    )
+    image_h = int(bootstrap.resolution_hw[0])
+    image_w = int(bootstrap.resolution_hw[1])
     if camera is None:
         # ★ Default to FreeArt3D's hardcoded render camera (matches s_0).
         # +Z up is the verified TRELLIS canonical world convention; not a
         # tunable. Iter-0 silhouette IoU check inside train.py validates.
+        # Frame the camera by the decoded object's bbox (distance =
+        # 2.1 * max_extent, aimed at the bbox center), reproducing FreeArt3D's
+        # run_rendering.
         camera = StageDCameraConfig.freeart3d_canonical(
-            image_h=int(bootstrap.resolution_hw[0]),
-            image_w=int(bootstrap.resolution_hw[1]),
+            image_h=image_h,
+            image_w=image_w,
+            object_scale=object_scale,
+            object_center=tuple(float(c) for c in object_center.tolist()),
         )
         logger.info(
-            "[stage_d] using freeart3d_canonical camera (TRELLIS +Z up); "
-            "iter-0 sanity check will validate against s_0_pure."
+            "[stage_d] freeart3d_canonical camera: object max_extent=%.4f "
+            "center=%s (TRELLIS +Z up); iter-0 check validates vs s_0_pure.",
+            object_scale,
+            [round(float(c), 4) for c in object_center.tolist()],
         )
+    canonical_camera_cfg = camera
     locked_camera = build_locked_camera(camera, device=dev, dtype=torch.float32)
     lpips_module = LPIPSModule(net_type=lpips_net).to(dev)
+
+    # ---- Multi-view keyframe models (M0 closed / M5 open) + canonical refs ----
+    keyframe_models: Optional[Dict[int, Any]] = None
+    ref_first_canon: Optional[torch.Tensor] = None
+    ref_last_canon: Optional[torch.Tensor] = None
+    object_center_xyz = tuple(float(c) for c in object_center.tolist())
+    if mv_enable:
+        if trellis_pipe is None:
+            raise RuntimeError(
+                "mv_enable=True requires the full TRELLIS pipeline; trellis_pipe is None"
+            )
+        z_final = _load_pt(os.path.join(bootstrap_dir, "z_final.pt")).to(dev)
+        pure_states_K3HW = bootstrap.pure_state_targets_K3HW_01
+        logger.info(
+            "[stage_d] building per-state keyframe models (states %s, seed %d)",
+            tuple(STATE_INDICES_KEYFRAME), int(cfg.mv_seed),
+        )
+        keyframe_models = build_per_state_keyframe_models(
+            trellis_pipe,
+            z_final,
+            pure_states_K3HW,
+            state_indices=STATE_INDICES_KEYFRAME,
+            seed=int(cfg.mv_seed),
+            device=dev,
+        )
+        m0 = keyframe_models[STATE_INDICES_KEYFRAME[0]]
+        m5 = keyframe_models[STATE_INDICES_KEYFRAME[1]]
+        with torch.no_grad():
+            ref_first_canon = render_static_gaussians(
+                m0.get_xyz, m0.get_opacity, m0.get_rotation,
+                m0.get_scaling, m0._features_dc, locked_camera,
+            ).detach()
+            ref_last_canon = render_static_gaussians(
+                m5.get_xyz, m5.get_opacity, m5.get_rotation,
+                m5.get_scaling, m5._features_dc, locked_camera,
+            ).detach()
+        logger.info(
+            "[stage_d] keyframe refs rendered: ref_first %s ref_last %s",
+            tuple(ref_first_canon.shape), tuple(ref_last_canon.shape),
+        )
 
     logger.info("[stage_d] entering train_stage_d_p1 (total_iters=%d)",
                 cfg.total_iters)
@@ -415,6 +713,13 @@ def run_stage_d_main(
         cfg=cfg,
         out_dir=out_dir,
         device=dev,
+        keyframe_models=keyframe_models,
+        object_center=object_center_xyz,
+        object_scale=float(object_scale),
+        canonical_camera_cfg=canonical_camera_cfg,
+        ref_first_canon=ref_first_canon,
+        ref_last_canon=ref_last_canon,
+        image_hw=(image_h, image_w),
     )
     # Persist summary as JSON for downstream inspection.
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:

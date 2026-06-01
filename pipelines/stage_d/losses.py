@@ -4,19 +4,21 @@ method.md section 9.1 enumerates the full loss list:
 
     L_total = lambda_sds   * L_sds        (W-RFSDS through Wan2.2)
             + lambda_lat   * L_lat_rec    (auxiliary, off by default; C2)
-            + lambda_rgb   * L_rgb_rec    (L1 + LPIPS vs Wan video target)
+            + lambda_rgb   * L_pure_geom  (silhouette + luminance edges vs six pure states)
             + lambda_first * L_first      (frame 0 vs no-carpet s_0_pure)
             + lambda_last  * L_last       (frame F-1 vs no-carpet s_5_pure)
             + lambda_contact * L_contact  (axis-through-anchor-band prior)
             + lambda_gate  * L_gate       (encourages g, m -> {0, 1})
             + lambda_shell * L_shell      (sparsity on uncertain shell voxels)
             + lambda_m_prior * L_m_prior  (BCE alpha_m vs (1 - M_attn))
+            + lambda_move_cover * L_move_cover
+            + lambda_move_suppress * L_move_suppress
             + lambda_z     * L_z          (Delta_z_s L2 stability)
 
 This module:
   - implements each individual component
-  - provides ``LPIPSModule`` (a thin holder so we don't keep a global lpips
-    instance, but only construct it once per Stage D run)
+  - provides ``LPIPSModule`` for callers that still construct the historical
+    Stage D interface
   - exposes ``aggregate_loss`` which composes all components according to
     the current phase / schedule.
 
@@ -26,13 +28,14 @@ rescale from our ``[0, 1]`` render output inline.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import lpips
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import STATE_INDICES
 from .w_rfsds import WanRFSDSContext, latent_recon_loss, w_rfsds_loss
 
 
@@ -86,42 +89,207 @@ class LPIPSModule(nn.Module):
 # Individual loss components
 # =============================================================================
 
-def loss_rgb_recon(
-    rgb_T3HW: torch.Tensor,
-    wan_target_T3HW: torch.Tensor,
+def _soft_silhouette(batch_N3HW: torch.Tensor) -> torch.Tensor:
+    return batch_N3HW.abs().sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+
+
+def _luminance_edges(batch_N3HW: torch.Tensor) -> torch.Tensor:
+    weights = batch_N3HW.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    luma = (batch_N3HW * weights).sum(dim=1, keepdim=True)
+    kernel_x = batch_N3HW.new_tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+    ).view(1, 1, 3, 3) / 8.0
+    kernel_y = batch_N3HW.new_tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
+    ).view(1, 1, 3, 3) / 8.0
+    grad_x = F.conv2d(luma, kernel_x, padding=1)
+    grad_y = F.conv2d(luma, kernel_y, padding=1)
+    return torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1.0e-6)
+
+
+def _luminance_1HW(frame_3HW: torch.Tensor) -> torch.Tensor:
+    if frame_3HW.ndim != 3 or frame_3HW.shape[0] != 3:
+        raise ValueError(f"expected [3, H, W], got {tuple(frame_3HW.shape)}")
+    weights = frame_3HW.new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
+    return (frame_3HW * weights).sum(dim=0, keepdim=True)
+
+
+def dynamic_mask(
+    ref_first_3HW: torch.Tensor,
+    ref_last_3HW: torch.Tensor,
+    dilate_px: int = 4,
+    thresh: float = 0.04,
+) -> torch.Tensor:
+    """Binary [1, H, W] mask of pixels whose FOREGROUND (silhouette) changes across
+    endpoints -- the moving part's swept region.
+
+    SILHOUETTE diff, NOT luminance diff: M0/M5 are two INDEPENDENT TRELLIS keyframe
+    recons (``build_per_state_keyframe_models``, per-state occupancy + conditioning)
+    that shade the SHARED static cabinet differently. A luminance diff therefore lit
+    up the static base even where geometry is identical -- VERIFIED: 65% of the old
+    luminance D was appearance contamination on the shared foreground, so L_cover
+    demanded covering the static cabinet -> move over-inflation + non-convergence
+    (baseanchor_v1). The foreground/occupancy diff fires only where geometry appears
+    or disappears = where the part actually moves. ``thresh`` is the foreground
+    cutoff on ``sum_c |rgb|`` (black background -> 0).
+    """
+    if ref_first_3HW.shape != ref_last_3HW.shape:
+        raise ValueError(
+            f"endpoint ref shape mismatch: first={tuple(ref_first_3HW.shape)} "
+            f"last={tuple(ref_last_3HW.shape)}"
+        )
+    first = ref_first_3HW.detach()
+    last = ref_last_3HW.detach().to(device=first.device, dtype=first.dtype)
+    fg_first = (first.abs().sum(dim=0, keepdim=True) > float(thresh)).to(dtype=first.dtype)
+    fg_last = (last.abs().sum(dim=0, keepdim=True) > float(thresh)).to(dtype=first.dtype)
+    mask = (fg_first - fg_last).abs()
+    if int(dilate_px) > 0:
+        radius = int(dilate_px)
+        kernel = 2 * radius + 1
+        mask = F.max_pool2d(
+            mask.unsqueeze(0),
+            kernel_size=kernel,
+            stride=1,
+            padding=radius,
+        ).squeeze(0)
+    return mask.clamp(0.0, 1.0)
+
+
+def loss_motion_ownership(
+    move_sil_K1HW: torch.Tensor,
+    ref_first_3HW: torch.Tensor,
+    ref_last_3HW: torch.Tensor,
+    dilate_px: int = 4,
+    thresh: float = 0.04,
+    eps: float = 1.0e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Move branch must cover dynamic pixels and avoid static foreground pixels."""
+    if move_sil_K1HW.ndim == 3:
+        move_sil = move_sil_K1HW.unsqueeze(1)
+    else:
+        move_sil = move_sil_K1HW
+    if move_sil.ndim != 4 or move_sil.shape[1] != 1:
+        raise ValueError(f"move_sil must be [K, 1, H, W], got {tuple(move_sil.shape)}")
+
+    ref_first = ref_first_3HW.to(device=move_sil.device, dtype=move_sil.dtype)
+    ref_last = ref_last_3HW.to(device=move_sil.device, dtype=move_sil.dtype)
+    D = dynamic_mask(ref_first, ref_last, dilate_px=dilate_px, thresh=thresh)
+    if tuple(D.shape[-2:]) != tuple(move_sil.shape[-2:]):
+        raise ValueError(
+            f"mask/render size mismatch: D={tuple(D.shape)} move={tuple(move_sil.shape)}"
+        )
+    fg_first = _soft_silhouette(ref_first.unsqueeze(0)).squeeze(0)
+    fg_last = _soft_silhouette(ref_last.unsqueeze(0)).squeeze(0)
+    fg = (fg_first + fg_last).clamp(0.0, 1.0)
+    move_cov = move_sil.clamp(0.0, 1.0).amax(dim=0)
+    static = fg * (1.0 - D)
+    eps_t = move_sil.new_tensor(float(eps))
+    L_cover = (F.relu(D - move_cov) * D).sum() / (D.sum() + eps_t)
+    L_suppress = (move_cov * static).sum() / (static.sum() + eps_t)
+    return L_cover, L_suppress
+
+
+def _pure_geometry_loss(
+    pred_N3HW: torch.Tensor,
+    target_N3HW: torch.Tensor,
+    edge_weight: float,
+) -> torch.Tensor:
+    pred_sil = _soft_silhouette(pred_N3HW)
+    target_sil = _soft_silhouette(target_N3HW)
+    sil = F.l1_loss(pred_sil, target_sil)
+    pred_edges = _luminance_edges(pred_N3HW) * target_sil
+    target_edges = _luminance_edges(target_N3HW) * target_sil
+    edge = F.l1_loss(pred_edges, target_edges)
+    return sil + float(edge_weight) * edge
+
+
+def _pure_photometric_loss(
+    pred_N3HW: torch.Tensor,
+    target_N3HW: torch.Tensor,
     lpips_module: LPIPSModule,
+    edge_weight: float,
+) -> torch.Tensor:
+    """Appearance (L1 + LPIPS) + geometric (silhouette + edge) endpoint anchor.
+
+    The endpoint targets s_0_pure / s_5_pure are TRELLIS keyframe renders (M0
+    closed / M5 open) in the SAME render + texture space as the StageD output
+    (verified: silver-metal + JENN-AIR display, identical to the recon), so a
+    direct FOREGROUND-MASKED RGB L1 is valid and far richer than silhouette-only.
+    Stage D does not optimize texture, but it DOES optimize the gates + joint that
+    move the textured Gaussians, so matching the rendered appearance of the
+    closed/open endpoints directly supervises the articulation (range, canonical
+    pose, move/base split). Composition (geometry-led, perceptual-tethered):
+        silhouette(1.0) + edge_weight*edge + masked_L1(1.0) + 0.1*LPIPS
+    silhouette + masked_L1 are co-primary geometric/appearance drivers; LPIPS is a
+    weak, alignment-robust perceptual tether (NOT the driver, since StageD does not
+    optimize texture); the background is excluded from L1 so it cannot dilute the
+    foreground signal.
+    """
+    pred_c = pred_N3HW.clamp(0.0, 1.0)
+    target_c = target_N3HW.clamp(0.0, 1.0)
+    pred_sil = _soft_silhouette(pred_N3HW)
+    target_sil = _soft_silhouette(target_N3HW)
+    sil = F.l1_loss(pred_sil, target_sil)
+    pred_edges = _luminance_edges(pred_N3HW) * target_sil
+    target_edges = _luminance_edges(target_N3HW) * target_sil
+    edge = F.l1_loss(pred_edges, target_edges)
+    # foreground-masked RGB L1 (mask = target support; background excluded)
+    fg = target_sil                                                   # [N, 1, H, W]
+    masked_l1 = ((pred_c - target_c).abs() * fg).sum() / (fg.sum() * 3.0 + 1.0e-6)
+    lpips_val = lpips_module(pred_c, target_c)
+    return sil + float(edge_weight) * edge + masked_l1 + 0.1 * lpips_val
+
+
+def loss_six_state_recon(
+    rgb_T3HW: torch.Tensor,
+    pure_state_targets_K3HW: torch.Tensor,
+    lpips_module: LPIPSModule,
+    silhouette_weight: float = 1.0,
     lpips_chunk: int = 7,
 ) -> torch.Tensor:
-    """L1 + LPIPS reconstruction loss against the Wan video target.
+    """Geometry loss against the six pure observed states.
+
+    Stage D does not update Gaussian texture. Direct RGB L1/LPIPS against
+    PartNet gray targets would push texture mismatch through geometry, gates,
+    and motion. This loss uses foreground silhouette and luminance edges only.
 
     Parameters
     ----------
     rgb_T3HW : Tensor [F, 3, H, W] in [0, 1]
-    wan_target_T3HW : Tensor [F, 3, H, W] in [0, 1]
+    pure_state_targets_K3HW : Tensor [K=6, 3, H, W] in [0, 1]
     lpips_chunk : int
-        Sub-batch size used to chunk LPIPS to avoid the VGG backbone going
-        OOM on a 21-frame batch. 7 means 3 sub-batches of 7 each.
+        Historical interface parameter. Geometry-only supervision does not
+        call LPIPS because Stage D does not optimize texture.
 
     Returns
     -------
     loss : Tensor scalar
     """
-    if rgb_T3HW.shape != wan_target_T3HW.shape:
+    if rgb_T3HW.ndim != 4 or rgb_T3HW.shape[1] != 3:
+        raise ValueError(f"rgb_T3HW must be [F, 3, H, W]; got {tuple(rgb_T3HW.shape)}")
+    if pure_state_targets_K3HW.ndim != 4 or pure_state_targets_K3HW.shape[1] != 3:
         raise ValueError(
-            f"rgb / target shape mismatch: rgb={tuple(rgb_T3HW.shape)}, "
-            f"target={tuple(wan_target_T3HW.shape)}"
+            f"pure_state_targets_K3HW must be [K, 3, H, W]; "
+            f"got {tuple(pure_state_targets_K3HW.shape)}"
         )
-    l1 = F.l1_loss(rgb_T3HW, wan_target_T3HW)
-
-    F_total = rgb_T3HW.shape[0]
-    lpips_terms: List[torch.Tensor] = []
-    for start in range(0, F_total, lpips_chunk):
-        stop = min(start + lpips_chunk, F_total)
-        lpips_terms.append(
-            lpips_module(rgb_T3HW[start:stop], wan_target_T3HW[start:stop])
+    state_indices = torch.tensor(STATE_INDICES, device=rgb_T3HW.device, dtype=torch.long)
+    if int(pure_state_targets_K3HW.shape[0]) != int(state_indices.numel()):
+        raise ValueError(
+            f"pure_state_targets_K3HW must have K={int(state_indices.numel())}; "
+            f"got {int(pure_state_targets_K3HW.shape[0])}"
         )
-    lp = torch.stack(lpips_terms).mean()
-    return l1 + lp
+    selected = rgb_T3HW.index_select(0, state_indices)
+    target = pure_state_targets_K3HW.to(device=selected.device, dtype=selected.dtype)
+    if selected.shape != target.shape:
+        raise ValueError(
+            f"six-state rgb / target shape mismatch: rgb={tuple(selected.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+    return _pure_geometry_loss(
+        selected,
+        target,
+        edge_weight=0.25 * float(silhouette_weight),
+    )
 
 
 def loss_first_frame_anchor(
@@ -156,9 +324,7 @@ def loss_first_frame_anchor(
     frame_0 = rgb_T3HW[0:1]                                          # [1, 3, H, W]
     target = s_0_pure_3HW.unsqueeze(0).to(frame_0.dtype)            # [1, 3, H, W]
     target = target.to(frame_0.device)
-    l1 = F.l1_loss(frame_0, target)
-    lp = lpips_module(frame_0, target)
-    return l1 + lp
+    return _pure_photometric_loss(frame_0, target, lpips_module, edge_weight=0.25)
 
 
 def loss_last_frame_anchor(
@@ -180,9 +346,7 @@ def loss_last_frame_anchor(
     frame_last = rgb_T3HW[-1:].contiguous()
     target = s_5_pure_3HW.unsqueeze(0).to(frame_last.dtype)
     target = target.to(frame_last.device)
-    l1 = F.l1_loss(frame_last, target)
-    lp = lpips_module(frame_last, target)
-    return l1 + lp
+    return _pure_photometric_loss(frame_last, target, lpips_module, edge_weight=0.25)
 
 
 def loss_contact_anchor(
@@ -266,28 +430,28 @@ def loss_shell_sparsity(
 
 
 def loss_m_prior(
-    alpha_m: torch.Tensor,
+    move_logits: torch.Tensor,
     m_attn_at_U: torch.Tensor,
     clamp_lo: float = 0.05,
     clamp_hi: float = 0.95,
 ) -> torch.Tensor:
-    """BCE-with-logits driving ``alpha_m -> logit(1 - M_attn_clamped)``.
+    """BCE-with-logits driving effective move logits from a base-like prior.
 
-    BMCSA M_attn is high on base voxels (cross-state feature agreement)
-    and low on move voxels. We want ``alpha_m`` (the *move* logit) to be
-    high on move voxels and low on base, so the target is ``1 - M_attn``.
+    The input is high on base voxels and low on move voxels. We want
+    the effective move logit ``b`` to be high on move voxels and low on base,
+    so the target is ``1 - base_like_prior``.
 
-    This term is only active in warmup_g0; in main_g1 onward the SDS
-    gradient drives alpha_m, and the prior is decayed to 0 (see
-    ``schedules.schedule_lambda_m_prior``).
+    In main stages this must supervise ``b = alpha_m + lambda_part * H_part``,
+    not just ``alpha_m``. Otherwise the part head can override the prior while
+    the prior loss remains unchanged.
     """
-    if alpha_m.shape != m_attn_at_U.shape:
+    if move_logits.shape != m_attn_at_U.shape:
         raise ValueError(
-            f"alpha_m / m_attn shape mismatch: alpha_m={tuple(alpha_m.shape)}, "
+            f"move_logits / m_attn shape mismatch: logits={tuple(move_logits.shape)}, "
             f"m_attn={tuple(m_attn_at_U.shape)}"
         )
     target = (1.0 - m_attn_at_U).clamp(clamp_lo, clamp_hi)
-    return F.binary_cross_entropy_with_logits(alpha_m, target)
+    return F.binary_cross_entropy_with_logits(move_logits, target)
 
 
 def loss_delta_z_stability(Delta_z_s: torch.Tensor) -> torch.Tensor:
@@ -326,7 +490,7 @@ class LossInputs:
     alpha_m: torch.Tensor                 # [N_obj]
 
     # Static Bootstrap-derived inputs
-    wan_video_target_T3HW_01: torch.Tensor  # [F, 3, H, W] in [0, 1]
+    pure_state_targets_K3HW_01: torch.Tensor # [K, 3, H, W] in [0, 1]
     s_0_pure_3HW_01: torch.Tensor           # [3, H, W] in [0, 1]
     s_5_pure_3HW_01: Optional[torch.Tensor] # [3, H, W] in [0, 1]
     z_wan_target: torch.Tensor              # [16, F_lat, H_lat, W_lat]
@@ -338,6 +502,28 @@ class LossInputs:
     wan_cond: Dict[str, Any]               # cached
     tau: float                              # this iter's sampled tau
     cfg_scale: float                        # this iter's CFG
+
+
+def loss_move_floor(b: torch.Tensor, floor: float) -> torch.Tensor:
+    """Anti-collapse hinge on the MEAN soft move fraction ``mean(sigmoid(b))``.
+
+    The single-view video-SDS prefers a static render, so the move set drifts to
+    base and the HARD binary_concrete gate commits there; the collapse is a
+    *coordinated* local minimum (all voxels base) that no single-voxel gradient
+    escapes, since flipping one tiny voxel does not change the render. This term
+    pushes ALL b up together (a coordinated gradient on the smooth sigmoid, which
+    does NOT vanish at the committed corner like the gate's STE) whenever the soft
+    move fraction falls below ``floor``, lifting the move set back out of the
+    collapse. One-sided: inactive once the move mass is healthy (> floor).
+    """
+    move_frac = torch.sigmoid(b).mean()
+    return torch.relu(b.new_tensor(float(floor)) - move_frac)
+
+
+def loss_move_ceiling(b: torch.Tensor, ceiling: float) -> torch.Tensor:
+    """Anti-whole-object hinge on the mean soft move fraction."""
+    move_frac = torch.sigmoid(b).mean()
+    return torch.relu(move_frac - b.new_tensor(float(ceiling)))
 
 
 def aggregate_loss(
@@ -353,6 +539,10 @@ def aggregate_loss(
     sched_lambda_shell: float,
     sched_lambda_m_prior: float,
     seed_for_eps: Optional[int] = None,
+    cfg_lambda_move_floor: float = 0.0,
+    move_floor_frac: float = 0.0,
+    cfg_lambda_move_ceiling: float = 0.0,
+    move_ceiling_frac: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compose all loss components and return (total_loss, log_dict).
 
@@ -406,18 +596,25 @@ def aggregate_loss(
     else:
         log["L_lat"] = 0.0
 
-    # ---- L_rgb_rec (pixel L1 + LPIPS) ----
+    # ---- Pure-state geometry supervision (six selected frames) ----
     if lambda_rgb > 0.0:
-        L_rgb = loss_rgb_recon(rgb_T3HW, inp.wan_video_target_T3HW_01, lpips_module)
+        L_rgb = loss_six_state_recon(
+            rgb_T3HW,
+            inp.pure_state_targets_K3HW_01,
+            lpips_module,
+        )
         total = total + lambda_rgb * L_rgb
         log["L_rgb"] = float(L_rgb.detach().item())
     else:
         log["L_rgb"] = 0.0
 
-    # ---- L_first (frame 0 vs no-carpet s_0_pure; ALWAYS on, fixed weight) ----
-    L_first = loss_first_frame_anchor(rgb_T3HW, inp.s_0_pure_3HW_01, lpips_module)
-    total = total + cfg_lambdas_first * L_first
-    log["L_first"] = float(L_first.detach().item())
+    # ---- L_first (frame 0 vs no-carpet s_0_pure; pixel anchor, gated) ----
+    if cfg_lambdas_first > 0.0:
+        L_first = loss_first_frame_anchor(rgb_T3HW, inp.s_0_pure_3HW_01, lpips_module)
+        total = total + cfg_lambdas_first * L_first
+        log["L_first"] = float(L_first.detach().item())
+    else:
+        log["L_first"] = 0.0
 
     # ---- L_last (frame F-1 vs no-carpet s_5_pure; used by InP only) ----
     if cfg_lambdas_last > 0.0:
@@ -439,6 +636,22 @@ def aggregate_loss(
     total = total + cfg_lambdas_gate * L_gate
     log["L_gate"] = float(L_gate.detach().item())
 
+    # ---- L_move_floor (anti-collapse: keep soft move mass above a floor) ----
+    if cfg_lambda_move_floor > 0.0 and move_floor_frac > 0.0:
+        L_move_floor = loss_move_floor(inp.b, move_floor_frac)
+        total = total + cfg_lambda_move_floor * L_move_floor
+        log["L_move_floor"] = float(L_move_floor.detach().item())
+    else:
+        log["L_move_floor"] = 0.0
+
+    # ---- L_move_ceiling (anti-escape: prevent whole-object-as-move) ----
+    if cfg_lambda_move_ceiling > 0.0 and move_ceiling_frac < 1.0:
+        L_move_ceiling = loss_move_ceiling(inp.b, move_ceiling_frac)
+        total = total + cfg_lambda_move_ceiling * L_move_ceiling
+        log["L_move_ceiling"] = float(L_move_ceiling.detach().item())
+    else:
+        log["L_move_ceiling"] = 0.0
+
     # ---- L_shell (sparsity on uncertain shell) ----
     if sched_lambda_shell > 0.0:
         L_shell = loss_shell_sparsity(inp.r, inp.shell_mask)
@@ -449,7 +662,7 @@ def aggregate_loss(
 
     # ---- L_m_prior (warmup BCE) ----
     if sched_lambda_m_prior > 0.0:
-        L_mp = loss_m_prior(inp.alpha_m, inp.m_attn_at_U)
+        L_mp = loss_m_prior(inp.b, inp.m_attn_at_U)
         total = total + sched_lambda_m_prior * L_mp
         log["L_m_prior"] = float(L_mp.detach().item())
     else:
@@ -466,9 +679,11 @@ def aggregate_loss(
 
 __all__ = [
     "LPIPSModule",
-    "loss_rgb_recon", "loss_first_frame_anchor", "loss_last_frame_anchor",
+    "loss_six_state_recon", "loss_first_frame_anchor", "loss_last_frame_anchor",
     "loss_contact_anchor",
     "loss_gate_sharpening", "loss_shell_sparsity", "loss_m_prior",
+    "loss_move_floor", "loss_move_ceiling",
+    "dynamic_mask", "loss_motion_ownership",
     "loss_delta_z_stability",
     "LossInputs", "aggregate_loss",
 ]

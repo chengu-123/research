@@ -1175,6 +1175,12 @@ def run_scar(
     if "steps" in cfg_scar:
         sampler_params["steps"] = int(cfg_scar["steps"])
     sampler = pipe.sparse_structure_sampler
+    if sampler.__class__.__name__ != "SCARSampler":
+        raise TypeError(
+            "run_scar requires pipe.sparse_structure_sampler to be SCARSampler; "
+            f"got {sampler.__class__.__name__}. Attach it with "
+            "pipelines.stage_b_sampler.attach_stage_b_sampler before calling run_scar."
+        )
     out = sampler.sample(
         flow_model, noise,
         cond=cond["cond"], neg_cond=cond["neg_cond"],

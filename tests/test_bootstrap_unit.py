@@ -302,6 +302,7 @@ def test_save_bootstrap_artifacts_smoke():
         z_wan_target=None,
         trellis_cond_can=torch.randn(1, 1374, 1024),
         wan_video_target_3FHW=torch.zeros((3, 21, 464, 832), dtype=torch.uint8),
+        pure_state_targets_K3HW=torch.zeros((K, 3, 464, 832), dtype=torch.float32),
         s_0_clean=torch.zeros((3, 464, 832), dtype=torch.float32),
         s_0_pure=torch.zeros((3, 464, 832), dtype=torch.float32),
         s_5_pure=torch.ones((3, 464, 832), dtype=torch.float32),
@@ -320,7 +321,8 @@ def test_save_bootstrap_artifacts_smoke():
         # Check key artifacts exist
         boot_dir = os.path.join(tmp, "bootstrap")
         for name in ["z_s0.pt", "z_final.pt", "O_init.npy", "psi_0.json",
-                     "U_object.npy", "phi_0.npy", "s_0_pure.pt", "s_5_pure.pt",
+                     "U_object.npy", "phi_0.npy", "pure_state_targets_K3HW.pt",
+                     "s_0_pure.pt", "s_5_pure.pt",
                      "bootstrap_meta.json"]:
             p = os.path.join(boot_dir, name)
             assert os.path.isfile(p), f"missing {name}"

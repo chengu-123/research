@@ -99,6 +99,9 @@ class BootstrapConfig:
     stage_image_dir: Optional[str] = None
     stage_image_pattern: str = "rendering_joint_00_state_{i:02d}.png"
     stage_image_paths: Tuple[str, ...] = ()
+    stage_pure_image_dir: Optional[str] = None
+    stage_pure_image_pattern: str = "{i:02d}_pure.png"
+    stage_pure_image_paths: Tuple[str, ...] = ()
     s_0_pure_path: Optional[str] = None
     s_5_pure_path: Optional[str] = None
     wan_condition_backend: str = "i2v"
@@ -195,6 +198,7 @@ class BootstrapResult:
 
     # B8
     z_slat0: Optional[torch.Tensor]                   # (N_obj, 8) post-norm
+    z_slat_coords: Optional[torch.Tensor]             # (N_obj, 4) int32
     slat_mean: Optional[torch.Tensor]                 # (8,)
     slat_std: Optional[torch.Tensor]                  # (8,)
     slat_shell_mask: torch.Tensor                     # (N_obj,) bool
@@ -209,6 +213,7 @@ class BootstrapResult:
     # Inputs preserved + passthrough
     trellis_cond_can: torch.Tensor                    # (1, N_dino, 1024) DINOv2(s_0_carpet)
     wan_video_target_3FHW: torch.Tensor               # (3, F, H, W) uint8
+    pure_state_targets_K3HW: torch.Tensor             # (K, 3, H, W) float [0,1]
     s_0_clean: torch.Tensor                           # (3, H, W) float [0,1]
     s_0_pure: torch.Tensor                            # (3, H, W) float [0,1], no carpet
     s_5_pure: Optional[torch.Tensor]                  # (3, H, W) float [0,1], no carpet
@@ -371,6 +376,52 @@ def _load_s0_pure_reference(
     return s0.contiguous()
 
 
+def _load_pure_state_targets(
+    cfg: BootstrapConfig,
+    target_hw: Tuple[int, int],
+    state_images: Optional[Sequence[Image.Image]],
+) -> torch.Tensor:
+    K = len(cfg.state_indices)
+    paths: List[str] = []
+    if len(cfg.stage_pure_image_paths) > 0:
+        paths = [os.path.abspath(os.fspath(p)) for p in cfg.stage_pure_image_paths]
+        if len(paths) != K:
+            raise ValueError(
+                f"stage_pure_image_paths length {len(paths)} must equal K={K}"
+            )
+    elif cfg.stage_pure_image_dir is not None:
+        pure_dir = os.path.abspath(os.fspath(cfg.stage_pure_image_dir))
+        paths = [
+            os.path.join(pure_dir, cfg.stage_pure_image_pattern.format(i=i))
+            for i in range(K)
+        ]
+    elif str(cfg.bootstrap_input_mode) == "six_images" and state_images is not None:
+        frames = []
+        for image in state_images:
+            frame = _pil_to_rgb_uint8_chw(image).float() / 255.0
+            if tuple(frame.shape[-2:]) != tuple(target_hw):
+                frame = F.interpolate(
+                    frame.unsqueeze(0),
+                    size=target_hw,
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze(0).clamp(0.0, 1.0)
+            frames.append(frame.contiguous())
+        return torch.stack(frames, dim=0).contiguous()
+    else:
+        raise ValueError(
+            "Bootstrap requires six pure observed states for Stage D. Provide "
+            "stage_pure_image_paths or stage_pure_image_dir; do not use the "
+            "Wan 21-frame video as the reconstruction target."
+        )
+
+    frames = [
+        _load_s0_pure_reference(path, target_hw=target_hw)
+        for path in paths
+    ]
+    return torch.stack(frames, dim=0).contiguous()
+
+
 def _tensor_frame_to_rgb_pil(frame_3hw_uint8: torch.Tensor) -> Image.Image:
     if frame_3hw_uint8.dtype != torch.uint8:
         raise TypeError(f"frame dtype must be uint8; got {frame_3hw_uint8.dtype}")
@@ -380,6 +431,34 @@ def _tensor_frame_to_rgb_pil(frame_3hw_uint8: torch.Tensor) -> Image.Image:
         )
     arr = frame_3hw_uint8.cpu().numpy()
     return Image.fromarray(np.transpose(arr, (1, 2, 0)), mode="RGB")
+
+
+def _float_frame_to_rgb_pil(frame_3hw_01: torch.Tensor) -> Image.Image:
+    frame = frame_3hw_01.detach().cpu().float().clamp(0.0, 1.0)
+    if frame.ndim != 3 or int(frame.shape[0]) != 3:
+        raise ValueError(f"frame must be [3, H, W]; got {tuple(frame.shape)}")
+    arr = (frame.numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _build_trellis_cond_from_float_states(
+    pipe: Any,
+    states_K3HW_01: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    if states_K3HW_01.ndim != 4 or int(states_K3HW_01.shape[1]) != 3:
+        raise ValueError(
+            f"states_K3HW_01 must be [K, 3, H, W]; got {tuple(states_K3HW_01.shape)}"
+        )
+    if not hasattr(pipe, "preprocess_image"):
+        raise AttributeError("pipe must expose preprocess_image()")
+    if not hasattr(pipe, "get_cond"):
+        raise AttributeError("pipe must expose get_cond(images)")
+    images = [_float_frame_to_rgb_pil(frame) for frame in states_K3HW_01]
+    cond_list = [pipe.preprocess_image(img) for img in images]
+    cond = pipe.get_cond(cond_list)
+    if not isinstance(cond, dict) or "cond" not in cond:
+        raise TypeError("pipe.get_cond must return a dict containing 'cond'")
+    return cond
 
 
 def _validate_state_indices_for_video(
@@ -441,6 +520,15 @@ def _sample_state_images_from_video(
     return [_tensor_frame_to_rgb_pil(video_3FHW[:, idx]) for idx in indices]
 
 
+def _resolve_observed_state_images(
+    cfg: BootstrapConfig,
+) -> Tuple[Optional[List[Image.Image]], List[str]]:
+    if len(cfg.stage_image_paths) > 0 or cfg.stage_image_dir is not None:
+        images, paths = _load_state_images_from_config(cfg)
+        return list(images), paths
+    return None, []
+
+
 def _run_b1_stage_a(
     s_0_with_carpet: Any,
     user_motion_prompt: str,
@@ -459,7 +547,12 @@ def _run_b1_stage_a(
             video = _load_stage_a_video_tensor(loaded_path, cfg.stage_a_frame_num)
             cfg.stage_a_resolution_hw = (int(video.shape[2]), int(video.shape[3]))
             s_0_clean = video[:, 0].float() / 255.0
-            state_images = _sample_state_images_from_video(video, cfg.state_indices)
+            state_images, observed_paths = _resolve_observed_state_images(cfg)
+            if state_images is None:
+                state_images = _sample_state_images_from_video(video, cfg.state_indices)
+                observed_source = "sampled_from_stagea_video"
+            else:
+                observed_source = "provided_state_images"
             return BootstrapInputBundle(
                 wan_video_target_3FHW=video,
                 s_0_clean=s_0_clean,
@@ -467,6 +560,8 @@ def _run_b1_stage_a(
                 source_meta={
                     "mode": mode,
                     "path": loaded_path,
+                    "observed_state_source": observed_source,
+                    "observed_state_paths": observed_paths,
                     "constructed_video": False,
                 },
             )
@@ -563,6 +658,7 @@ def _run_b3_b4_stage_b(
         dit_hidden_cache: {block: (K, L, 1024)} fp16 if cfg.scar.capture_dit_hidden
     """
     # Import here to avoid heavy TRELLIS load for stub runs
+    from pipelines.stage_b_sampler import attach_stage_b_sampler
     from pipelines.stage_b_scar import run_scar
 
     K = len(cfg.state_indices)
@@ -600,6 +696,36 @@ def _run_b3_b4_stage_b(
     stage_b_dir = os.path.join(out_dir, "stage_b")
     cfg_scar = dict(cfg.cfg_scar)
     cfg_sdedit = dict(cfg.cfg_sdedit)
+    sampler_cfg = {
+        "stage_b": {"sampler": "scar"},
+        "scar": cfg_scar,
+    }
+    sampler_params = dict(pipe.sparse_structure_sampler_params)
+    sampler_choice = attach_stage_b_sampler(
+        pipe=pipe,
+        cfg=sampler_cfg,
+        total_steps=int(sampler_params.get("steps", 25)),
+    )
+    if sampler_choice != "scar":
+        raise ValueError(f"Bootstrap Stage B requires SCAR sampler, got {sampler_choice!r}")
+    os.makedirs(stage_b_dir, exist_ok=True)
+    with open(os.path.join(stage_b_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "stage": "B",
+                "entrypoint": "bootstrap",
+                "K": K,
+                "state_indices": list(cfg.state_indices),
+                "sampler": sampler_choice,
+                "sampler_params": sampler_params,
+                "scar": cfg_scar,
+                "sdedit": cfg_sdedit,
+                "remove_disk": bool(cfg.stage_b_remove_disk),
+            },
+            f,
+            indent=2,
+            ensure_ascii=True,
+        )
     scar_result = run_scar(
         pipe=pipe,
         cond=cond,
@@ -989,14 +1115,20 @@ def _run_b8_slat_sampler(
     U_object: torch.Tensor,
     cond: Dict[str, torch.Tensor],
     cfg: BootstrapConfig,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """Sample SLAT on the constructed U_object.
 
-    Returns (z_slat0, slat_mean, slat_std). All None if cfg.skip_b8_slat.
+    Returns (z_slat0, z_slat_coords, slat_mean, slat_std). All None if
+    cfg.skip_b8_slat except slat_mean/slat_std.
 
     Implements method.md section 6 B8: build a (N_obj, 4) int32 batched coord
     tensor for U_object, wrap as SparseTensor noise, call pipe.sample_slat
-    with cond on state 0 (s_0_carpet). pipe.sample_slat returns sparse
+    with the canonical pure-state condition. pipe.sample_slat returns sparse
     samples that are ALREADY post-norm (`samples * std + mean` applied
     inside, see TRELLIS/trellis/pipelines/trellis_image_to_3d.py:410-412).
     We expose slat_mean / slat_std separately for Stage D's tanh
@@ -1021,7 +1153,7 @@ def _run_b8_slat_sampler(
         slat_std = torch.tensor(
             pipe.slat_normalization["std"], device=cfg.device, dtype=torch.float32,
         )
-        return None, slat_mean, slat_std
+        return None, None, slat_mean, slat_std
     if not hasattr(pipe, "slat_sampler") or not hasattr(pipe, "models"):
         raise AttributeError(
             "B8 SLAT sampler requires pipe.slat_sampler + pipe.models["
@@ -1052,7 +1184,7 @@ def _run_b8_slat_sampler(
         )
 
     # Build (N_obj, 4) int32 coords with batch col 0 first (TRELLIS convention).
-    import torchsparse as _ts  # noqa: F401  (force kernel load before SparseTensor)
+    # sp.SparseTensor uses TRELLIS' configured sparse backend.
     from trellis.modules import sparse as sp
 
     N = int(U_object.shape[0])
@@ -1078,6 +1210,28 @@ def _run_b8_slat_sampler(
         sampler_params=sampler_params,
         noise=noise,
     )
+    z_slat_coords = z_slat_sparse.coords.detach().to(dtype=torch.int32)
+    if tuple(z_slat_coords.shape) != tuple(coords_4.shape):
+        raise RuntimeError(
+            f"B8 SLAT coord shape mismatch: requested {tuple(coords_4.shape)}, "
+            f"got {tuple(z_slat_coords.shape)}"
+        )
+    R = int(cfg.resolution)
+    req_key = (
+        coords_4[:, 0].long() * R * R * R
+        + coords_4[:, 1].long() * R * R
+        + coords_4[:, 2].long() * R
+        + coords_4[:, 3].long()
+    )
+    got_key = (
+        z_slat_coords[:, 0].long() * R * R * R
+        + z_slat_coords[:, 1].long() * R * R
+        + z_slat_coords[:, 2].long() * R
+        + z_slat_coords[:, 3].long()
+    )
+    if not torch.equal(torch.sort(req_key).values, torch.sort(got_key).values):
+        raise RuntimeError("B8 SLAT returned a different sparse coordinate set.")
+
     # pipe.sample_slat applied post-norm internally; extract dense
     # per-voxel feats (N_obj, 8). The returned object's `.feats` is what
     # method.md calls `z_slat0`.
@@ -1096,7 +1250,7 @@ def _run_b8_slat_sampler(
     slat_std = torch.tensor(
         pipe.slat_normalization["std"], device=cfg.device, dtype=torch.float32,
     )
-    return z_slat0, slat_mean, slat_std
+    return z_slat0, z_slat_coords, slat_mean, slat_std
 
 
 # ---------------------------------------------------------------------------
@@ -1340,6 +1494,7 @@ def _save_bootstrap_artifacts(result: BootstrapResult, out_dir: str, cfg: Bootst
     _save_tensor("z_s0", result.z_s0)
     _save_tensor("z_final", result.z_final)
     _save_tensor("z_slat0", result.z_slat0)
+    _save_tensor("z_slat_coords", result.z_slat_coords, pt=False)
     _save_tensor("slat_mean", result.slat_mean)
     _save_tensor("slat_std", result.slat_std)
     _save_tensor("slat_shell_mask", result.slat_shell_mask)
@@ -1366,6 +1521,7 @@ def _save_bootstrap_artifacts(result: BootstrapResult, out_dir: str, cfg: Bootst
     # Inputs / passthroughs
     _save_tensor("trellis_cond_can", result.trellis_cond_can)
     _save_tensor("wan_video_target_3FHW", result.wan_video_target_3FHW)
+    _save_tensor("pure_state_targets_K3HW", result.pure_state_targets_K3HW)
     _save_tensor("s_0_clean", result.s_0_clean)
     _save_tensor("s_0_pure", result.s_0_pure)
     _save_tensor("s_5_pure", result.s_5_pure)
@@ -1453,8 +1609,8 @@ def run_bootstrap(
         cfg = BootstrapConfig()
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---- B1: Stage A -----------------------------------------------------
-    print("[bootstrap] B1 Stage A Wan I2V")
+    # ---- B1: Bootstrap input --------------------------------------------
+    print(f"[bootstrap] B1 input resolve ({cfg.bootstrap_input_mode})")
     input_bundle = _run_b1_stage_a(
         s_0_with_carpet=s_0_with_carpet,
         user_motion_prompt=user_motion_prompt,
@@ -1481,6 +1637,23 @@ def run_bootstrap(
         )
     else:
         s_5_pure = None
+    pure_state_targets_K3HW = _load_pure_state_targets(
+        cfg,
+        target_hw=(int(wan_video_target_3FHW.shape[2]), int(wan_video_target_3FHW.shape[3])),
+        state_images=input_bundle.state_images,
+    )
+    if not torch.allclose(pure_state_targets_K3HW[0], s_0_pure, atol=1.0 / 255.0):
+        raise ValueError(
+            "six pure state target 0 does not match s_0_pure_path. Use the "
+            "same no-background source images for Stage D supervision."
+        )
+    if s_5_pure is not None and not torch.allclose(
+        pure_state_targets_K3HW[-1], s_5_pure, atol=1.0 / 255.0
+    ):
+        raise ValueError(
+            "six pure state target 5 does not match s_5_pure_path. Use the "
+            "same no-background source images for Stage D supervision."
+        )
 
     # ---- B3 + B4: Stage B Pass-1 + Pass-2 --------------------------------
     print("[bootstrap] B3-B4 Stage B (SCAR + BMCSA)")
@@ -1604,7 +1777,14 @@ def run_bootstrap(
 
     # ---- B8: SLAT sampler on U_object ----------------------------------
     print("[bootstrap] B8 SLAT sampling on U_object")
-    z_slat0, slat_mean, slat_std = _run_b8_slat_sampler(pipe, U_object, cond, cfg)
+    pure_cond = _build_trellis_cond_from_float_states(pipe, pure_state_targets_K3HW)
+    z_slat0, z_slat_coords, slat_mean, slat_std = _run_b8_slat_sampler(
+        pipe, U_object, pure_cond, cfg
+    )
+    if z_slat_coords is not None:
+        U_object_with_batch = z_slat_coords.to(dtype=torch.int32, device=cfg.device)
+        U_object = U_object_with_batch[:, 1:].to(dtype=torch.int32, device=cfg.device)
+        N_obj = int(U_object.shape[0])
 
     # ---- B9: gaussian_parent_idx ---------------------------------------
     gaussian_parent_idx = torch.arange(
@@ -1631,8 +1811,8 @@ def run_bootstrap(
     # contract (canonical geom = s_c per NEW.1, phi[c]=0).
     c_idx = int(cfg.stage_c.canonical_state_idx)
     trellis_cond_can = (
-        cond["cond"][c_idx:c_idx + 1].detach() if "cond" in cond
-        else cond[c_idx:c_idx + 1].detach()
+        pure_cond["cond"][c_idx:c_idx + 1].detach() if "cond" in pure_cond
+        else pure_cond[c_idx:c_idx + 1].detach()
     )
 
     # ---- Assemble result -----------------------------------------------
@@ -1647,6 +1827,7 @@ def run_bootstrap(
         U_object=U_object,
         U_object_with_batch=U_object_with_batch,
         z_slat0=z_slat0,
+        z_slat_coords=z_slat_coords,
         slat_mean=slat_mean,
         slat_std=slat_std,
         slat_shell_mask=slat_shell_mask,
@@ -1655,6 +1836,7 @@ def run_bootstrap(
         z_wan_target=z_wan_target,
         trellis_cond_can=trellis_cond_can,
         wan_video_target_3FHW=wan_video_target_3FHW,
+        pure_state_targets_K3HW=pure_state_targets_K3HW,
         s_0_clean=s_0_clean,
         s_0_pure=s_0_pure,
         s_5_pure=s_5_pure,
@@ -1677,11 +1859,21 @@ def run_bootstrap(
                 os.path.abspath(os.fspath(cfg.s_5_pure_path))
                 if cfg.s_5_pure_path is not None else None
             ),
+            "stage_pure_image_dir": (
+                os.path.abspath(os.fspath(cfg.stage_pure_image_dir))
+                if cfg.stage_pure_image_dir is not None else None
+            ),
+            "stage_pure_image_paths": [
+                os.path.abspath(os.fspath(p)) for p in cfg.stage_pure_image_paths
+            ],
             "wan_condition_backend": str(cfg.wan_condition_backend),
             "wan_condition_source": (
                 "s_0_pure+s_5_pure" if str(cfg.wan_condition_backend) == "fun_inp"
                 else "s_0_pure"
             ),
+            "stage_b_condition_source": "seg_observed_states",
+            "stage_d_condition_source": "pure_observed_states",
+            "stage_d_slat_condition_state": int(c_idx),
             "slat_skipped": cfg.skip_b8_slat,
             "wan_cond_skipped": cfg.skip_b10_wan_cond,
             "wan_vae_skipped": cfg.skip_b11_wan_vae,
